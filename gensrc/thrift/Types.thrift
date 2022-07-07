@@ -49,7 +49,7 @@ enum TStorageType {
 
 enum TStorageMedium {
     HDD,
-    SSD,
+    SSD
 }
 
 enum TVarType {
@@ -82,7 +82,8 @@ enum TPrimitiveType {
   PERCENTILE,
   DECIMAL32,
   DECIMAL64,
-  DECIMAL128
+  DECIMAL128,
+  JSON
 }
 
 enum TTypeNodeType {
@@ -149,13 +150,14 @@ enum TPushType {
     DELETE,
     LOAD_DELETE,
     // for spark load push request
-    LOAD_V2
+    LOAD_V2,
+    CANCEL_DELETE
 }
 
 enum TTaskType {
     CREATE,
     DROP,
-    PUSH,
+    PUSH, // Deprecated
     CLONE,
     STORAGE_MEDIUM_MIGRATE,
     ROLLUP, // Deprecated
@@ -178,7 +180,9 @@ enum TTaskType {
     // this type of task will replace both ROLLUP and SCHEMA_CHANGE
     ALTER,
     INSTALL_PLUGIN,
-    UNINSTALL_PLUGIN
+    UNINSTALL_PLUGIN,
+    // this use for calculate enum count
+    NUM_TASK_TYPE
 }
 
 enum TStmtType {
@@ -246,6 +250,9 @@ enum TFunctionBinaryType {
 
   // Native-interface, precompiled to IR; loaded from *.ll
   IR,
+
+  // StarRocks customized UDF in jar.
+  SRJAR
 }
 
 // Represents a fully qualified function name.
@@ -275,10 +282,12 @@ struct TAggregateFunction {
   8: optional string get_value_fn_symbol
   9: optional string remove_fn_symbol
   10: optional bool is_analytic_only_fn = false
+  11: optional string symbol
 }
 
 struct TTableFunction {
   1: required list<TTypeDesc> ret_types
+  2: optional string symbol
 }
 
 // Represents a function in the Catalog.
@@ -319,6 +328,7 @@ struct TFunction {
   // UDF function.
   30: optional i64 fid
   31: optional TTableFunction table_fn
+  32: optional bool could_apply_dict_optimize
 }
 
 enum TLoadJobState {
@@ -344,7 +354,11 @@ enum TTableType {
     BROKER_TABLE,
     ES_TABLE,
     HDFS_TABLE,
-    VIEW = 20
+    ICEBERG_TABLE,
+    HUDI_TABLE,
+    JDBC_TABLE,
+    VIEW = 20,
+    MATERIALIZED_VIEW
 }
 
 enum TKeysType {
@@ -386,6 +400,8 @@ enum TFileType {
 struct TTabletCommitInfo {
     1: required i64 tabletId
     2: required i64 backendId
+    3: optional list<string> invalid_dict_cache_columns
+    4: optional list<string> valid_dict_cache_columns
 }
 
 enum TLoadType {
@@ -430,4 +446,3 @@ enum TCompressionType {
     BZIP2 = 10;
     LZO = 11; // Deprecated
 }
-

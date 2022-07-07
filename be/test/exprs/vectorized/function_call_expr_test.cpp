@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/function_call_expr.h"
 
@@ -51,9 +51,8 @@ TEST_F(VectorizedFunctionCallExprTest, mathPiExprTest) {
 
     ExprContext exprContext(&expr);
     exprContext._is_clone = true;
-    starrocks::RowDescriptor rd;
 
-    WARN_IF_ERROR(expr.prepare(nullptr, rd, &exprContext), "");
+    WARN_IF_ERROR(expr.prepare(nullptr, &exprContext), "");
     WARN_IF_ERROR(expr.open(nullptr, &exprContext, FunctionContext::FunctionStateScope::THREAD_LOCAL), "");
 
     ColumnPtr result = expr.evaluate(&exprContext, nullptr);
@@ -95,9 +94,8 @@ TEST_F(VectorizedFunctionCallExprTest, mathModExprTest) {
 
     ExprContext exprContext(&expr);
     exprContext._is_clone = true;
-    starrocks::RowDescriptor rd;
 
-    WARN_IF_ERROR(expr.prepare(nullptr, rd, &exprContext), "");
+    WARN_IF_ERROR(expr.prepare(nullptr, &exprContext), "");
     WARN_IF_ERROR(expr.open(nullptr, &exprContext, FunctionContext::FunctionStateScope::THREAD_LOCAL), "");
 
     ColumnPtr result = expr.evaluate(&exprContext, nullptr);
@@ -153,9 +151,8 @@ TEST_F(VectorizedFunctionCallExprTest, mathLeastExprTest) {
 
     ExprContext exprContext(&expr);
     exprContext._is_clone = true;
-    starrocks::RowDescriptor rd;
 
-    WARN_IF_ERROR(expr.prepare(nullptr, rd, &exprContext), "");
+    WARN_IF_ERROR(expr.prepare(nullptr, &exprContext), "");
     WARN_IF_ERROR(expr.open(nullptr, &exprContext, FunctionContext::FunctionStateScope::THREAD_LOCAL), "");
 
     ColumnPtr result = expr.evaluate(&exprContext, nullptr);
@@ -211,9 +208,8 @@ TEST_F(VectorizedFunctionCallExprTest, mathNullGreatestExprTest) {
 
     ExprContext exprContext(&expr);
     exprContext._is_clone = true;
-    starrocks::RowDescriptor rd;
 
-    WARN_IF_ERROR(expr.prepare(nullptr, rd, &exprContext), "");
+    WARN_IF_ERROR(expr.prepare(nullptr, &exprContext), "");
     WARN_IF_ERROR(expr.open(nullptr, &exprContext, FunctionContext::FunctionStateScope::THREAD_LOCAL), "");
 
     ColumnPtr result = expr.evaluate(&exprContext, nullptr);
@@ -264,9 +260,8 @@ TEST_F(VectorizedFunctionCallExprTest, prepareFaileCase) {
 
     ExprContext exprContext(&expr);
     exprContext._is_clone = true;
-    starrocks::RowDescriptor rd;
 
-    ASSERT_FALSE(expr.prepare(nullptr, rd, &exprContext).ok());
+    ASSERT_FALSE(expr.prepare(nullptr, &exprContext).ok());
     exprContext.close(nullptr);
 }
 

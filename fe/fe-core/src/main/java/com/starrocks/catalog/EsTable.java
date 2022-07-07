@@ -30,6 +30,7 @@ import com.starrocks.external.elasticsearch.EsMajorVersion;
 import com.starrocks.external.elasticsearch.EsMetaStateTracker;
 import com.starrocks.external.elasticsearch.EsRestClient;
 import com.starrocks.external.elasticsearch.EsTablePartitions;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TEsTable;
 import com.starrocks.thrift.TTableDescriptor;
 import com.starrocks.thrift.TTableType;
@@ -68,6 +69,9 @@ public class EsTable extends Table {
     public static final String KEYWORD_SNIFF = "enable_keyword_sniff";
     public static final String MAX_DOCVALUE_FIELDS = "max_docvalue_fields";
 
+    public static final String WAN_ONLY = "es.nodes.wan.only";
+    public static final String ES_NET_SSL = "es.net.ssl";
+
     private String hosts;
     private String[] seeds;
     private String userName = "";
@@ -75,8 +79,8 @@ public class EsTable extends Table {
     // index name can be specific index, wildcard matched or alias.
     private String indexName;
 
-    // which type used for `indexName`, default to `_doc`
-    private String mappingType = "_doc";
+    // which type used for `indexName`
+    private String mappingType = null;
     private String transport = "http";
     // only save the partition definition, save the partition key,
     // partition list is got from es cluster dynamically and is saved in esTableState
@@ -100,6 +104,9 @@ public class EsTable extends Table {
     // Here we have a slightly conservative value of 20, but at the same time we also provide configurable parameters for expert-using
     // @see `MAX_DOCVALUE_FIELDS`
     private static final int DEFAULT_MAX_DOCVALUE_FIELDS = 20;
+
+    private boolean wanOnly = false;
+    private boolean sslEnabled = false;
 
     // version would be used to be compatible with different ES Cluster
     public EsMajorVersion majorVersion = null;
@@ -139,6 +146,14 @@ public class EsTable extends Table {
 
     public boolean isKeywordSniffEnable() {
         return enableKeywordSniff;
+    }
+
+    public boolean wanOnly() {
+        return wanOnly;
+    }
+
+    public boolean sslEnabled() {
+        return sslEnabled;
     }
 
     private void validate(Map<String, String> properties) throws DdlException {
@@ -211,6 +226,8 @@ public class EsTable extends Table {
         if (!Strings.isNullOrEmpty(properties.get(TYPE))
                 && !Strings.isNullOrEmpty(properties.get(TYPE).trim())) {
             mappingType = properties.get(TYPE).trim();
+        } else {
+            mappingType = null;
         }
         if (!Strings.isNullOrEmpty(properties.get(TRANSPORT))
                 && !Strings.isNullOrEmpty(properties.get(TRANSPORT).trim())) {
@@ -231,11 +248,33 @@ public class EsTable extends Table {
                 maxDocValueFields = DEFAULT_MAX_DOCVALUE_FIELDS;
             }
         }
+
+        if (properties.containsKey(WAN_ONLY)) {
+            try {
+                wanOnly = Boolean.parseBoolean(properties.get(WAN_ONLY).trim());
+            } catch (Exception e) {
+                wanOnly = false;
+            }
+        }
+        if (properties.containsKey(ES_NET_SSL)) {
+            try {
+                sslEnabled = Boolean.parseBoolean(properties.get(ES_NET_SSL).trim());
+            } catch (Exception e) {
+                sslEnabled = false;
+            }
+        }
+        Column idColumn = getColumn("_id");
+        if (idColumn != null && !(idColumn.getPrimitiveType() == PrimitiveType.VARCHAR
+                || idColumn.getPrimitiveType() == PrimitiveType.CHAR)) {
+            throw new DdlException("Type of _id (ES Primary-Key) Column must be Char/Varchar");
+        }
         tableContext.put("hosts", hosts);
         tableContext.put("userName", userName);
         tableContext.put("passwd", passwd);
         tableContext.put("indexName", indexName);
-        tableContext.put("mappingType", mappingType);
+        if (mappingType != null) {
+            tableContext.put("mappingType", mappingType);
+        }
         tableContext.put("transport", transport);
         if (majorVersion != null) {
             tableContext.put("majorVersion", majorVersion.toString());
@@ -243,6 +282,8 @@ public class EsTable extends Table {
         tableContext.put("enableDocValueScan", String.valueOf(enableDocValueScan));
         tableContext.put("enableKeywordSniff", String.valueOf(enableKeywordSniff));
         tableContext.put("maxDocValueFields", String.valueOf(maxDocValueFields));
+        tableContext.put("es.nodes.wan.only", String.valueOf(wanOnly));
+        tableContext.put(ES_NET_SSL, String.valueOf(sslEnabled));
     }
 
     @Override
@@ -265,7 +306,7 @@ public class EsTable extends Table {
             adler32.update(name.getBytes(charsetName));
             // type
             adler32.update(type.name().getBytes(charsetName));
-            if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_68) {
+            if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_68) {
                 for (Map.Entry<String, String> entry : tableContext.entrySet()) {
                     adler32.update(entry.getValue().getBytes(charsetName));
                 }
@@ -279,7 +320,9 @@ public class EsTable extends Table {
                 // index name
                 adler32.update(indexName.getBytes(charsetName));
                 // mappingType
-                adler32.update(mappingType.getBytes(charsetName));
+                if (mappingType != null) {
+                    adler32.update(mappingType.getBytes(charsetName));
+                }
                 // transport
                 adler32.update(transport.getBytes(charsetName));
             }
@@ -305,7 +348,7 @@ public class EsTable extends Table {
 
     public void readFields(DataInput in) throws IOException {
         super.readFields(in);
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_68) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_68) {
             int size = in.readInt();
             for (int i = 0; i < size; ++i) {
                 String key = Text.readString(in);
@@ -339,6 +382,16 @@ public class EsTable extends Table {
                 } catch (Exception e) {
                     maxDocValueFields = DEFAULT_MAX_DOCVALUE_FIELDS;
                 }
+            }
+            if (tableContext.containsKey(WAN_ONLY)) {
+                wanOnly = Boolean.parseBoolean(tableContext.get(WAN_ONLY));
+            } else {
+                wanOnly = false;
+            }
+            if (tableContext.containsKey(ES_NET_SSL)) {
+                sslEnabled = Boolean.parseBoolean(tableContext.get(ES_NET_SSL));
+            } else {
+                sslEnabled = false;
             }
 
             PartitionType partType = PartitionType.valueOf(Text.readString(in));
@@ -374,6 +427,8 @@ public class EsTable extends Table {
             tableContext.put("transport", transport);
             tableContext.put("enableDocValueScan", "false");
             tableContext.put(KEYWORD_SNIFF, "true");
+            tableContext.put(WAN_ONLY, "false");
+            tableContext.put(ES_NET_SSL, "false");
         }
     }
 
@@ -452,11 +507,16 @@ public class EsTable extends Table {
 
     @Override
     public void onDrop() {
-        Catalog.getCurrentCatalog().getEsRepository().deRegisterTable(this.id);
+        GlobalStateMgr.getCurrentState().getEsRepository().deRegisterTable(this.id);
     }
 
     @Override
     public void onCreate() {
-        Catalog.getCurrentCatalog().getEsRepository().registerTable(this);
+        GlobalStateMgr.getCurrentState().getEsRepository().registerTable(this);
+    }
+
+    @Override
+    public boolean isSupported() {
+        return true;
     }
 }

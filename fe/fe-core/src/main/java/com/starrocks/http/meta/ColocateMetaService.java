@@ -25,7 +25,6 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.ColocateGroupSchema;
 import com.starrocks.catalog.ColocateTableIndex;
 import com.starrocks.catalog.ColocateTableIndex.GroupId;
@@ -40,6 +39,7 @@ import com.starrocks.http.rest.RestResult;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.persist.ColocatePersistInfo;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import org.apache.logging.log4j.LogManager;
@@ -60,8 +60,8 @@ import java.util.List;
  *          {"colocate_meta":{"groupName2Id":{...},"group2Tables":{}, ...},"status":"OK"}
  *
  *      eg:
- *          POST    /api/colocate/group_stable?db_id=123&group_id=456  (mark group[123.456] as unstable)
- *          DELETE  /api/colocate/group_stable?db_id=123&group_id=456  (mark group[123.456] as stable)
+ *          POST    /api/colocate/group_stable?db_id=123&group_id=456   (mark group[123.456] as stable)
+ *          POST    /api/colocate/group_unstable?db_id=123&group_id=456 (mark group[123.456] as unstable)
  *
  * BucketSeqAction:
  *  change the backends per bucket sequence of a group
@@ -69,12 +69,10 @@ import java.util.List;
  *          POST    /api/colocate/bucketseq?db_id=123&group_id=456
  */
 public class ColocateMetaService {
-    private static final Logger LOG = LogManager.getLogger(ColocateMetaService.class);
     private static final String GROUP_ID = "group_id";
-    private static final String TABLE_ID = "table_id";
     private static final String DB_ID = "db_id";
 
-    private static ColocateTableIndex colocateIndex = Catalog.getCurrentColocateIndex();
+    private static ColocateTableIndex colocateIndex = GlobalStateMgr.getCurrentColocateIndex();
 
     private static GroupId checkAndGetGroupId(BaseRequest request) throws DdlException {
         long grpId = Long.valueOf(request.getSingleParameter(GROUP_ID).trim());
@@ -125,12 +123,12 @@ public class ColocateMetaService {
                 throws DdlException {
             response.setContentType("application/json");
             RestResult result = new RestResult();
-            result.addResultEntry("colocate_meta", Catalog.getCurrentColocateIndex());
+            result.addResultEntry("colocate_meta", GlobalStateMgr.getCurrentColocateIndex());
             sendResult(request, response, result);
         }
     }
 
-    // mark a colocate group as stable or unstable
+    // mark a colocate group as stable
     public static class MarkGroupStableAction extends ColocateMetaBaseAction {
         MarkGroupStableAction(ActionController controller) {
             super(controller);
@@ -139,7 +137,34 @@ public class ColocateMetaService {
         public static void registerAction(ActionController controller) throws IllegalArgException {
             MarkGroupStableAction action = new MarkGroupStableAction(controller);
             controller.registerHandler(HttpMethod.POST, "/api/colocate/group_stable", action);
-            controller.registerHandler(HttpMethod.DELETE, "/api/colocate/group_stable", action);
+        }
+
+        @Override
+        public void executeInMasterWithAdmin(BaseRequest request, BaseResponse response)
+                throws DdlException {
+            GroupId groupId = checkAndGetGroupId(request);
+
+            HttpMethod method = request.getRequest().method();
+            if (method.equals(HttpMethod.POST)) {
+                colocateIndex.markGroupStable(groupId, true);
+            } else {
+                response.appendContent(new RestBaseResult("HTTP method is not allowed.").toJson());
+                writeResponse(request, response, HttpResponseStatus.METHOD_NOT_ALLOWED);
+            }
+
+            sendResult(request, response);
+        }
+    }
+
+    // mark a colocate group as unstable
+    public static class MarkGroupUnstableAction extends ColocateMetaBaseAction {
+        MarkGroupUnstableAction(ActionController controller) {
+            super(controller);
+        }
+
+        public static void registerAction(ActionController controller) throws IllegalArgException {
+            MarkGroupUnstableAction action = new MarkGroupUnstableAction(controller);
+            controller.registerHandler(HttpMethod.POST, "/api/colocate/group_unstable", action);
         }
 
         @Override
@@ -150,8 +175,6 @@ public class ColocateMetaService {
             HttpMethod method = request.getRequest().method();
             if (method.equals(HttpMethod.POST)) {
                 colocateIndex.markGroupUnstable(groupId, true);
-            } else if (method.equals(HttpMethod.DELETE)) {
-                colocateIndex.markGroupStable(groupId, true);
             } else {
                 response.appendContent(new RestBaseResult("HTTP method is not allowed.").toJson());
                 writeResponse(request, response, HttpResponseStatus.METHOD_NOT_ALLOWED);
@@ -189,13 +212,14 @@ public class ColocateMetaService {
             List<List<Long>> backendsPerBucketSeq = new Gson().fromJson(meta, type);
             LOG.info("get buckets sequence: {}", backendsPerBucketSeq);
 
-            ColocateGroupSchema groupSchema = Catalog.getCurrentColocateIndex().getGroupSchema(groupId);
+            ColocateGroupSchema groupSchema = GlobalStateMgr.getCurrentColocateIndex().getGroupSchema(groupId);
             if (backendsPerBucketSeq.size() != groupSchema.getBucketsNum()) {
                 throw new DdlException("Invalid bucket num. expected: " + groupSchema.getBucketsNum() + ", actual: "
                         + backendsPerBucketSeq.size());
             }
 
-            List<Long> clusterBackendIds = Catalog.getCurrentSystemInfo().getClusterBackendIds(clusterName, true);
+            List<Long> clusterBackendIds =
+                    GlobalStateMgr.getCurrentSystemInfo().getBackendIds(true);
             //check the Backend id
             for (List<Long> backendIds : backendsPerBucketSeq) {
                 if (backendIds.size() != groupSchema.getReplicationNum()) {
@@ -222,7 +246,7 @@ public class ColocateMetaService {
             colocateIndex.addBackendsPerBucketSeq(groupId, backendsPerBucketSeq);
             ColocatePersistInfo info2 =
                     ColocatePersistInfo.createForBackendsPerBucketSeq(groupId, backendsPerBucketSeq);
-            Catalog.getCurrentCatalog().getEditLog().logColocateBackendsPerBucketSeq(info2);
+            GlobalStateMgr.getCurrentState().getEditLog().logColocateBackendsPerBucketSeq(info2);
         }
     }
 

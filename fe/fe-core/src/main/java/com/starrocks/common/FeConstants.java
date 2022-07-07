@@ -37,7 +37,6 @@ public class FeConstants {
     public static long default_db_data_quota_bytes = Long.MAX_VALUE;
     public static long default_db_replica_quota_size = Long.MAX_VALUE;
 
-    public static int heartbeat_interval_second = 5;
     public static int checkpoint_interval_second = 60; // 1 minutes
 
     // dpp version
@@ -62,4 +61,8 @@ public class FeConstants {
 
     // use \N to indicate NULL
     public static String null_string = "\\N";
+
+    public static boolean USE_MOCK_DICT_MANAGER = false;
+
+    public static final int default_tablet_number = 128;
 }

@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_UTIL_MONOTIME_H
-#define STARROCKS_BE_SRC_UTIL_MONOTIME_H
+#pragma once
 
 #include <cstdint>
 #include <string>
@@ -227,10 +226,10 @@ public:
     /// @return Reference to the modified object.
     MonoTime& operator+=(const MonoDelta& delta);
 
-    /// Substract a delta from the point in time represented by the object.
+    /// Subtract a delta from the point in time represented by the object.
     ///
     /// @param [in] delta
-    ///   The delta to substract.
+    ///   The delta to subtract.
     /// @return Reference to the modified object.
     MonoTime& operator-=(const MonoDelta& delta);
     ///@}
@@ -241,7 +240,7 @@ private:
     explicit MonoTime(const struct timespec& ts);
     explicit MonoTime(int64_t nanos);
     double ToSeconds() const;
-    int64_t nanos_;
+    int64_t nanos_{0};
 };
 
 /// Sleep for an interval specified by a MonoDelta instance.
@@ -406,5 +405,3 @@ MonoDelta operator-(const MonoTime& t_end, const MonoTime& t_begin);
 ///@}
 
 } // namespace starrocks
-
-#endif //STARROCKS_BE_SRC_UTIL_MONOTIME_H

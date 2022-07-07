@@ -39,18 +39,20 @@ import com.starrocks.analysis.StringLiteral;
 import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.catalog.AggregateType;
 import com.starrocks.catalog.BrokerTable;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.FsBroker;
+import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
+import com.starrocks.common.Pair;
 import com.starrocks.common.UserException;
 import com.starrocks.common.util.BrokerUtil;
 import com.starrocks.load.BrokerFileGroup;
 import com.starrocks.load.Load;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.thrift.TBrokerFileStatus;
 import com.starrocks.thrift.TBrokerRangeDesc;
@@ -74,6 +76,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Random;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -96,14 +99,17 @@ public class FileScanNode extends LoadScanNode {
         }
     }
 
+    private static final Comparator SCAN_RANGE_LOCATIONS_COMPARATOR =
+            Comparator.comparingLong(
+                    (Pair<TScanRangeLocations, Long> o) -> o.second);
+
     private final Random random = new Random(System.currentTimeMillis());
 
     // File groups need to
     private List<TScanRangeLocations> locationsList;
+    private PriorityQueue<Pair<TScanRangeLocations, Long>> locationsHeap;
 
     // used both for load statement and select statement
-    private long totalBytes;
-    private int numInstances;
     private int parallelInstanceNum;
     private long bytesPerInstance;
 
@@ -180,9 +186,6 @@ public class FileScanNode extends LoadScanNode {
             // if Config::enable_vectorized_file_load is set true,
             // vectorized load will been enabled
             TFileFormatType format = formatType(context.fileGroup.getFileFormat(), "");
-            if (format != TFileFormatType.FORMAT_ORC && !Config.enable_vectorized_file_load) {
-                useVectorizedLoad = false;
-            }
             initParams(context);
             paramCreateContexts.add(context);
         }
@@ -237,8 +240,10 @@ public class FileScanNode extends LoadScanNode {
             params.setMulti_column_separator(fileGroup.getColumnSeparator());
         }
         if (row_delimiter.length != 1) {
-            throw new UserException(
-                    "invalid row delimiter '" + fileGroup.getRowDelimiter() + "': must be a single character");
+            if (row_delimiter.length > 50) {
+                throw new UserException("the row delimiter is limited to a maximum of 50 bytes");
+            }
+            params.setMulti_row_delimiter(fileGroup.getRowDelimiter());
         }
 
         params.setColumn_separator(column_separator[0]);
@@ -298,12 +303,18 @@ public class FileScanNode extends LoadScanNode {
                 SlotDescriptor srcSlotDesc = slotDescByName.get(destSlotDesc.getColumn().getName());
                 if (srcSlotDesc != null) {
                     destSidToSrcSidWithoutTrans.put(destSlotDesc.getId().asInt(), srcSlotDesc.getId().asInt());
-                    expr = new SlotRef(srcSlotDesc);
+                    SlotRef slotRef = new SlotRef(srcSlotDesc);
+                    slotRef.setColumnName(destSlotDesc.getColumn().getName());
+                    expr = slotRef;
                 } else {
                     Column column = destSlotDesc.getColumn();
-                    if (column.getDefaultValue() != null) {
-                        expr = new StringLiteral(destSlotDesc.getColumn().getDefaultValue());
-                    } else {
+                    Column.DefaultValueType defaultValueType = column.getDefaultValueType();
+                    if (defaultValueType == Column.DefaultValueType.CONST) {
+                        expr = new StringLiteral(column.calculatedDefaultValue());
+                    } else if (defaultValueType == Column.DefaultValueType.VARY) {
+                        throw new UserException("Column(" + column + ") has unsupported default value:"
+                                + column.getDefaultExpr().getExpr());
+                    } else if (defaultValueType == Column.DefaultValueType.NULL) {
                         if (column.isAllowNull()) {
                             expr = NullLiteral.create(column.getType());
                         } else {
@@ -321,7 +332,7 @@ public class FileScanNode extends LoadScanNode {
                             + destSlotDesc.getColumn().getName() + "=hll_hash(xxx)");
                 }
                 FunctionCallExpr fn = (FunctionCallExpr) expr;
-                if (!fn.getFnName().getFunction().equalsIgnoreCase("hll_hash") &&
+                if (!fn.getFnName().getFunction().equalsIgnoreCase(FunctionSet.HLL_HASH) &&
                         !fn.getFnName().getFunction().equalsIgnoreCase("hll_empty")) {
                     throw new AnalysisException("HLL column must use hll_hash function, like "
                             + destSlotDesc.getColumn().getName() + "=hll_hash(xxx) or " +
@@ -335,19 +346,9 @@ public class FileScanNode extends LoadScanNode {
             // analyze negative
             if (isNegative && destSlotDesc.getColumn().getAggregationType() == AggregateType.SUM) {
                 expr = new ArithmeticExpr(ArithmeticExpr.Operator.MULTIPLY, expr, new IntLiteral(-1));
-                expr.analyze(analyzer);
+                expr = Expr.analyzeAndCastFold(expr);
             }
             expr = castToSlot(destSlotDesc, expr);
-
-            // check expr is vectorized or not.
-            if (useVectorizedLoad) {
-                if (!expr.isVectorized()) {
-                    useVectorizedLoad = false;
-                } else {
-                    expr.setUseVectorized(true);
-                }
-            }
-
             context.params.putToExpr_of_dest_slot(destSlotDesc.getId().asInt(), expr.treeToThrift());
         }
         context.params.setDest_sid_to_src_sid_without_trans(destSidToSrcSidWithoutTrans);
@@ -369,7 +370,7 @@ public class FileScanNode extends LoadScanNode {
 
         FsBroker broker = null;
         try {
-            broker = Catalog.getCurrentCatalog().getBrokerMgr().getBroker(brokerName, selectedBackend.getHost());
+            broker = GlobalStateMgr.getCurrentState().getBrokerMgr().getBroker(brokerName, selectedBackend.getHost());
         } catch (AnalysisException e) {
             throw new UserException(e.getMessage());
         }
@@ -421,7 +422,7 @@ public class FileScanNode extends LoadScanNode {
             throw new UserException("No source file in this table(" + targetTable.getName() + ").");
         }
 
-        totalBytes = 0;
+        long totalBytes = 0;
         for (List<TBrokerFileStatus> fileStatuses : fileStatusesList) {
             Collections.sort(fileStatuses, T_BROKER_FILE_STATUS_COMPARATOR);
             for (TBrokerFileStatus fileStatus : fileStatuses) {
@@ -438,12 +439,12 @@ public class FileScanNode extends LoadScanNode {
         numInstances = Math.min(numInstances, Config.max_broker_concurrency);
         numInstances = Math.max(1, numInstances);
 
-        bytesPerInstance = totalBytes / numInstances + ((totalBytes % numInstances == 0) ? 0 : 1);
+        bytesPerInstance = (totalBytes + numInstances - 1) / numInstances;
     }
 
     private void assignBackends() throws UserException {
         backends = Lists.newArrayList();
-        for (Backend be : Catalog.getCurrentSystemInfo().getIdToBackend().values()) {
+        for (Backend be : GlobalStateMgr.getCurrentSystemInfo().getIdToBackend().values()) {
             if (be.isAvailable()) {
                 backends.add(be);
             }
@@ -492,56 +493,50 @@ public class FileScanNode extends LoadScanNode {
             return;
         }
 
-        TScanRangeLocations curLocations = newLocations(context.params, brokerDesc.getName());
-        long curInstanceBytes = 0;
+        // Create locations for file group
+        createScanRangeLocations(context, fileStatuses);
+
+        // Add files to locations with less allocated data
+        Pair<TScanRangeLocations, Long> smallestLocations = null;
         long curFileOffset = 0;
         for (int i = 0; i < fileStatuses.size(); ) {
             TBrokerFileStatus fileStatus = fileStatuses.get(i);
-            long leftBytes = fileStatus.size - curFileOffset;
-            long tmpBytes = curInstanceBytes + leftBytes;
             TFileFormatType formatType = formatType(context.fileGroup.getFileFormat(), fileStatus.path);
             List<String> columnsFromPath = BrokerUtil.parseColumnsFromPath(fileStatus.path,
                     context.fileGroup.getColumnsFromPath());
             int numberOfColumnsFromFile = context.slotDescByName.size() - columnsFromPath.size();
-            if (tmpBytes >= bytesPerInstance) {
-                // Now only support split plain text
-                if (formatType == TFileFormatType.FORMAT_CSV_PLAIN && fileStatus.isSplitable) {
-                    long rangeBytes = bytesPerInstance - curInstanceBytes;
-                    TBrokerRangeDesc rangeDesc = createBrokerRangeDesc(curFileOffset, fileStatus, formatType,
-                            rangeBytes, columnsFromPath, numberOfColumnsFromFile);
-                    brokerScanRange(curLocations).addToRanges(rangeDesc);
-                    // This csv file reach end of file
-                    if (tmpBytes == bytesPerInstance) {
-                        curFileOffset = 0;
-                        i++;
-                    } else {
-                        curFileOffset += rangeBytes;
-                    }
-                } else {
-                    TBrokerRangeDesc rangeDesc = createBrokerRangeDesc(curFileOffset, fileStatus, formatType,
-                            leftBytes, columnsFromPath, numberOfColumnsFromFile);
-                    brokerScanRange(curLocations).addToRanges(rangeDesc);
-                    curFileOffset = 0;
-                    i++;
-                }
 
-                // New one scan
-                locationsList.add(curLocations);
-                curLocations = newLocations(context.params, brokerDesc.getName());
-                curInstanceBytes = 0;
+            smallestLocations = locationsHeap.poll();
+            long leftBytes = fileStatus.size - curFileOffset;
+            long rangeBytes = 0;
+            // The rest of the file belongs to one range
+            boolean isEndOfFile = false;
+            if (smallestLocations.second + leftBytes > bytesPerInstance &&
+                    ((formatType == TFileFormatType.FORMAT_CSV_PLAIN || formatType == TFileFormatType.FORMAT_PARQUET)
+                            && fileStatus.isSplitable)) {
+                rangeBytes = bytesPerInstance - smallestLocations.second;
             } else {
-                TBrokerRangeDesc rangeDesc = createBrokerRangeDesc(curFileOffset, fileStatus, formatType,
-                        leftBytes, columnsFromPath, numberOfColumnsFromFile);
-                brokerScanRange(curLocations).addToRanges(rangeDesc);
-                curFileOffset = 0;
-                curInstanceBytes += leftBytes;
+                rangeBytes = leftBytes;
+                isEndOfFile = true;
                 i++;
             }
+
+            TBrokerRangeDesc rangeDesc =
+                    createBrokerRangeDesc(curFileOffset, fileStatus, formatType, rangeBytes, columnsFromPath,
+                            numberOfColumnsFromFile);
+            brokerScanRange(smallestLocations.first).addToRanges(rangeDesc);
+            smallestLocations.second += rangeBytes;
+            locationsHeap.add(smallestLocations);
+
+            curFileOffset = isEndOfFile ? 0 : curFileOffset + rangeBytes;
         }
 
-        // Put the last file
-        if (brokerScanRange(curLocations).isSetRanges()) {
-            locationsList.add(curLocations);
+        // Put locations with valid scan ranges to locationsList
+        while (!locationsHeap.isEmpty()) {
+            TScanRangeLocations locations = locationsHeap.poll().first;
+            if (brokerScanRange(locations).isSetRanges()) {
+                locationsList.add(locations);
+            }
         }
     }
 
@@ -561,9 +556,25 @@ public class FileScanNode extends LoadScanNode {
         return rangeDesc;
     }
 
+    private void createScanRangeLocations(ParamCreateContext context, List<TBrokerFileStatus> fileStatuses)
+            throws UserException {
+        Preconditions.checkState(locationsHeap.isEmpty(), "Locations heap is not empty");
+
+        long totalBytes = 0;
+        for (TBrokerFileStatus fileStatus : fileStatuses) {
+            totalBytes += fileStatus.size;
+        }
+        long numInstances = bytesPerInstance == 0 ? 1 : (totalBytes + bytesPerInstance - 1) / bytesPerInstance;
+
+        for (int i = 0; i < numInstances; ++i) {
+            locationsHeap.add(Pair.create(newLocations(context.params, brokerDesc.getName()), 0L));
+        }
+    }
+
     @Override
-    public void finalize(Analyzer analyzer) throws UserException {
+    public void finalizeStats(Analyzer analyzer) throws UserException {
         locationsList = Lists.newArrayList();
+        locationsHeap = new PriorityQueue<>(SCAN_RANGE_LOCATIONS_COMPARATOR);
 
         for (int i = 0; i < fileGroups.size(); ++i) {
             List<TBrokerFileStatus> fileStatuses = fileStatusesList.get(i);
@@ -578,12 +589,15 @@ public class FileScanNode extends LoadScanNode {
             }
             processFileGroup(context, fileStatuses);
         }
+
+        // update numInstances
+        numInstances = locationsList.size();
+
         if (LOG.isDebugEnabled()) {
             for (TScanRangeLocations locations : locationsList) {
                 LOG.debug("Scan range is {}", locations);
             }
         }
-
         if (loadJobId != -1) {
             LOG.info("broker load job {} with txn {} has {} scan range: {}",
                     loadJobId, txnId, locationsList.size(),
@@ -595,6 +609,7 @@ public class FileScanNode extends LoadScanNode {
     protected void toThrift(TPlanNode msg) {
         msg.node_type = TPlanNodeType.FILE_SCAN_NODE;
         TFileScanNode fileScanNode = new TFileScanNode(desc.getId().asInt());
+        fileScanNode.setEnable_pipeline_load(Config.enable_pipeline_load);
         msg.setFile_scan_node(fileScanNode);
     }
 
@@ -621,7 +636,7 @@ public class FileScanNode extends LoadScanNode {
             TScanRangeLocation scanRangeLocation = locations.getLocations().get(0);
             TBrokerScanRange brokerScanRange = locations.getScan_range().getBroker_scan_range();
             TNetworkAddress address = brokerScanRange.getBroker_addresses().get(0);
-            FsBroker fsBroker = Catalog.getCurrentCatalog().getBrokerMgr().getBroker(brokerDesc.getName(),
+            FsBroker fsBroker = GlobalStateMgr.getCurrentState().getBrokerMgr().getBroker(brokerDesc.getName(),
                     address.hostname, address.port);
             if (aliveBes.contains(scanRangeLocation.getBackend_id()) && (fsBroker != null && fsBroker.isAlive)) {
                 continue;
@@ -670,22 +685,9 @@ public class FileScanNode extends LoadScanNode {
     }
 
     @Override
-    public boolean isVectorized() {
-        // Column mapping expr already checked in finalizeParams function
-        for (Expr expr : conjuncts) {
-            if (!expr.isVectorized()) {
-                return false;
-            }
-        }
-
-        return useVectorizedLoad;
+    public boolean canUsePipeLine() {
+        return Config.enable_pipeline_load;
     }
 
-    @Override
-    public void setUseVectorized(boolean flag) {
-        this.useVectorized = flag;
-        for (Expr expr : conjuncts) {
-            expr.setUseVectorized(flag);
-        }
-    }
+
 }

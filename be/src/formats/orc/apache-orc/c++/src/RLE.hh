@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/orc/tree/main/c++/src/RLE.hh
-
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
@@ -20,8 +16,7 @@
  * limitations under the License.
  */
 
-#ifndef ORC_RLE_HH
-#define ORC_RLE_HH
+#pragma once
 
 #include <memory>
 
@@ -143,5 +138,3 @@ std::unique_ptr<RleDecoder> createRleDecoder(std::unique_ptr<SeekableInputStream
                                              DataBuffer<char>* sharedBufferPtr = nullptr);
 
 } // namespace orc
-
-#endif // ORC_RLE_HH

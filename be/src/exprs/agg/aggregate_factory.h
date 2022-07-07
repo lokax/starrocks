@@ -1,23 +1,4 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/exprs/agg/aggregate_factory.h
-
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -34,6 +15,9 @@ public:
     static AggregateFunctionPtr MakeAvgAggregateFunction();
 
     template <PrimitiveType PT>
+    static AggregateFunctionPtr MakeDecimalAvgAggregateFunction();
+
+    template <PrimitiveType PT>
     static AggregateFunctionPtr MakeBitmapUnionIntAggregateFunction();
 
     static AggregateFunctionPtr MakeBitmapUnionAggregateFunction();
@@ -43,12 +27,17 @@ public:
     static AggregateFunctionPtr MakeBitmapUnionCountAggregateFunction();
 
     template <PrimitiveType PT>
+    static AggregateFunctionPtr MakeWindowfunnelAggregateFunction();
+
+    template <PrimitiveType PT>
     static AggregateFunctionPtr MakeIntersectCountAggregateFunction();
 
     static AggregateFunctionPtr MakeCountAggregateFunction();
 
     template <PrimitiveType PT>
     static AggregateFunctionPtr MakeCountDistinctAggregateFunction();
+    template <PrimitiveType PT>
+    static AggregateFunctionPtr MakeCountDistinctAggregateFunctionV2();
 
     template <PrimitiveType PT>
     static AggregateFunctionPtr MakeGroupConcatAggregateFunction();
@@ -61,14 +50,20 @@ public:
     template <PrimitiveType PT>
     static AggregateFunctionPtr MakeMinAggregateFunction();
 
-    template <typename NestedState>
+    template <PrimitiveType PT>
+    static AggregateFunctionPtr MakeAnyValueAggregateFunction();
+
+    template <typename NestedState, bool IgnoreNull = true>
     static AggregateFunctionPtr MakeNullableAggregateFunctionUnary(AggregateFunctionPtr nested_function);
 
     template <typename NestedState>
     static AggregateFunctionPtr MakeNullableAggregateFunctionVariadic(AggregateFunctionPtr nested_function);
 
-    template <PrimitiveType T>
+    template <PrimitiveType PT>
     static AggregateFunctionPtr MakeSumAggregateFunction();
+
+    template <PrimitiveType PT>
+    static AggregateFunctionPtr MakeDecimalSumAggregateFunction();
 
     template <PrimitiveType PT, bool is_sample>
     static AggregateFunctionPtr MakeVarianceAggregateFunction();
@@ -78,6 +73,13 @@ public:
 
     template <PrimitiveType PT>
     static AggregateFunctionPtr MakeSumDistinctAggregateFunction();
+    template <PrimitiveType PT>
+    static AggregateFunctionPtr MakeSumDistinctAggregateFunctionV2();
+    template <PrimitiveType PT>
+    static AggregateFunctionPtr MakeDecimalSumDistinctAggregateFunction();
+
+    static AggregateFunctionPtr MakeDictMergeAggregateFunction();
+    static AggregateFunctionPtr MakeRetentionAggregateFunction();
 
     // Hyperloglog functions:
     static AggregateFunctionPtr MakeHllUnionAggregateFunction();
@@ -91,12 +93,20 @@ public:
 
     static AggregateFunctionPtr MakePercentileUnionAggregateFunction();
 
+    template <PrimitiveType PT>
+    static AggregateFunctionPtr MakePercentileContAggregateFunction();
+
+    template <PrimitiveType PT>
+    static AggregateFunctionPtr MakeArrayAggAggregateFunction();
+
     // Windows functions:
     static AggregateFunctionPtr MakeDenseRankWindowFunction();
 
     static AggregateFunctionPtr MakeRankWindowFunction();
 
     static AggregateFunctionPtr MakeRowNumberWindowFunction();
+
+    static AggregateFunctionPtr MakeNtileWindowFunction();
 
     template <PrimitiveType PT>
     static AggregateFunctionPtr MakeFirstValueWindowFunction();
@@ -106,10 +116,20 @@ public:
 
     template <PrimitiveType PT>
     static AggregateFunctionPtr MakeLeadLagWindowFunction();
+
+    template <PrimitiveType PT>
+    static AggregateFunctionPtr MakeHistogramAggregationFunction();
 };
 
-extern const AggregateFunction* get_aggregate_function(const std::string& name, PrimitiveType arg_type,
-                                                       PrimitiveType return_type, bool is_null);
+const AggregateFunction* get_aggregate_function(const std::string& name, PrimitiveType arg_type,
+                                                PrimitiveType return_type, bool is_null,
+                                                TFunctionBinaryType::type binary_type = TFunctionBinaryType::BUILTIN,
+                                                int func_version = 1);
+
+const AggregateFunction* get_window_function(const std::string& name, PrimitiveType arg_type, PrimitiveType return_type,
+                                             bool is_null,
+                                             TFunctionBinaryType::type binary_type = TFunctionBinaryType::BUILTIN,
+                                             int func_version = 1);
 
 } // namespace vectorized
 } // namespace starrocks

@@ -24,60 +24,58 @@
 #include <fstream>
 #include <iostream>
 #include <set>
-#include <sstream>
 #include <string>
 
 #include "common/status.h"
-#include "env/env.h"
+#include "fs/fs.h"
+#include "fs/fs_util.h"
 #include "gen_cpp/olap_file.pb.h"
-#include "gen_cpp/segment_v2.pb.h"
+#include "gen_cpp/segment.pb.h"
 #include "gutil/strings/numbers.h"
 #include "gutil/strings/split.h"
 #include "gutil/strings/substitute.h"
 #include "json2pb/pb_to_json.h"
-#include "runtime/mem_tracker.h"
 #include "storage/data_dir.h"
+#include "storage/olap_common.h"
 #include "storage/olap_define.h"
 #include "storage/options.h"
-#include "storage/rowset/segment_v2/binary_plain_page.h"
-#include "storage/rowset/segment_v2/column_reader.h"
+#include "storage/rowset/binary_plain_page.h"
+#include "storage/rowset/column_iterator.h"
+#include "storage/rowset/column_reader.h"
 #include "storage/tablet_meta.h"
 #include "storage/tablet_meta_manager.h"
-#include "storage/utils.h"
+#include "storage/tablet_schema_map.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
-#include "util/file_utils.h"
+#include "util/path_util.h"
 
 using starrocks::DataDir;
-using starrocks::OLAP_SUCCESS;
-using starrocks::OlapMeta;
-using starrocks::OLAPStatus;
+using starrocks::KVStore;
 using starrocks::Status;
 using starrocks::TabletMeta;
 using starrocks::TabletMetaManager;
 using starrocks::MetaStoreStats;
-using starrocks::FileUtils;
 using starrocks::Slice;
 using starrocks::RandomAccessFile;
 using starrocks::MemTracker;
 using strings::Substitute;
-using starrocks::segment_v2::SegmentFooterPB;
-using starrocks::segment_v2::ColumnReader;
-using starrocks::segment_v2::BinaryPlainPageDecoder;
-using starrocks::segment_v2::PageHandle;
-using starrocks::segment_v2::PagePointer;
-using starrocks::segment_v2::ColumnReaderOptions;
-using starrocks::segment_v2::ColumnIteratorOptions;
-using starrocks::segment_v2::PageFooterPB;
+using starrocks::SegmentFooterPB;
+using starrocks::ColumnReader;
+using starrocks::BinaryPlainPageDecoder;
+using starrocks::PageHandle;
+using starrocks::PagePointer;
+using starrocks::ColumnIteratorOptions;
+using starrocks::PageFooterPB;
 
 const std::string HEADER_PREFIX = "tabletmeta_";
 
 DEFINE_string(root_path, "", "storage root path");
 DEFINE_string(operation, "get_meta",
               "valid operation: get_meta, flag, load_meta, delete_meta, delete_rowset_meta, "
-              "show_meta");
+              "show_meta, check_table_meta_consistency");
 DEFINE_int64(tablet_id, 0, "tablet_id for tablet meta");
 DEFINE_string(tablet_uid, "", "tablet_uid for tablet meta");
+DEFINE_int64(table_id, 0, "table id for table meta");
 DEFINE_string(rowset_id, "", "rowset_id");
 DEFINE_int32(schema_hash, 0, "schema_hash for tablet meta");
 DEFINE_string(json_meta_path, "", "absolute json meta file path");
@@ -101,18 +99,20 @@ std::string get_usage(const std::string& progname) {
     ss << "./meta_tool --operation=delete_rowset_meta "
           "--root_path=/path/to/storage/path --tablet_uid=tablet_uid "
           "--rowset_id=rowset_id\n";
+    ss << "./meta_tool --operation=compact_meta --root_path=/path/to/storage/path\n";
     ss << "./meta_tool --operation=get_meta_stats --root_path=/path/to/storage/path\n";
     ss << "./meta_tool --operation=ls --root_path=/path/to/storage/path\n";
     ss << "./meta_tool --operation=show_meta --pb_meta_path=path\n";
     ss << "./meta_tool --operation=show_segment_footer --file=/path/to/segment/file\n";
+    ss << "./meta_tool --operation=check_table_meta_consistency --root_path=/path/to/storage/path "
+          "--table_id=tableid";
     return ss.str();
 }
 
 void show_meta() {
-    auto mem_tracker = std::make_unique<MemTracker>();
-    TabletMeta tablet_meta(mem_tracker.get());
-    OLAPStatus s = tablet_meta.create_from_file(FLAGS_pb_meta_path);
-    if (s != OLAP_SUCCESS) {
+    TabletMeta tablet_meta;
+    Status s = tablet_meta.create_from_file(FLAGS_pb_meta_path);
+    if (!s.ok()) {
         std::cout << "load pb meta file:" << FLAGS_pb_meta_path << " failed"
                   << ", status:" << s << std::endl;
         return;
@@ -191,6 +191,26 @@ void delete_rowset_meta(DataDir* data_dir) {
     std::cout << "delete rowset meta successfully" << std::endl;
 }
 
+void compact_meta(DataDir* data_dir) {
+    uint64_t live_sst_files_size_before = 0;
+    uint64_t live_sst_files_size_after = 0;
+    if (!data_dir->get_meta()->get_live_sst_files_size(&live_sst_files_size_before)) {
+        std::cout << "data dir " << data_dir->path() << " get_live_sst_files_size failed" << std::endl;
+    }
+    auto s = data_dir->get_meta()->compact();
+    if (!s.ok()) {
+        std::cout << "data dir " << data_dir->path() << " compact meta failed: " << s << std::endl;
+        return;
+    }
+    if (!data_dir->get_meta()->get_live_sst_files_size(&live_sst_files_size_after)) {
+        std::cout << "data dir " << data_dir->path() << " get_live_sst_files_size failed" << std::endl;
+    }
+    std::cout << "data dir " << data_dir->path() << " compact meta successfully, "
+              << "live_sst_files_size_before: " << live_sst_files_size_before
+              << " live_sst_files_size_after: " << live_sst_files_size_after << data_dir->get_meta()->get_stats()
+              << std::endl;
+}
+
 void get_meta_stats(DataDir* data_dir) {
     MetaStoreStats stats;
     auto st = TabletMetaManager::get_stats(data_dir, &stats, false);
@@ -231,19 +251,19 @@ void list_meta(DataDir* data_dir) {
 
 Status init_data_dir(const std::string& dir, std::unique_ptr<DataDir>* ret, bool read_only = false) {
     std::string root_path;
-    Status st = FileUtils::canonicalize(dir, &root_path);
+    Status st = starrocks::fs::canonicalize(dir, &root_path);
     if (!st.ok()) {
         std::cout << "invalid root path:" << FLAGS_root_path << ", error: " << st.to_string() << std::endl;
         return Status::InternalError("invalid root path");
     }
     starrocks::StorePath path;
     auto res = parse_root_path(root_path, &path);
-    if (res != OLAP_SUCCESS) {
+    if (!res.ok()) {
         std::cout << "parse root path failed:" << root_path << std::endl;
-        return Status::InternalError("parse root path failed");
+        return res;
     }
 
-    std::unique_ptr<DataDir> p(new (std::nothrow) DataDir(path.path, path.capacity_bytes, path.storage_medium));
+    std::unique_ptr<DataDir> p(new (std::nothrow) DataDir(path.path, path.storage_medium));
     if (p == nullptr) {
         std::cout << "new data dir failed" << std::endl;
         return Status::InternalError("new data dir failed");
@@ -270,7 +290,7 @@ void batch_delete_meta(const std::string& tablet_file) {
     //      /data1/starrocks.HDD,100010
     //      /data2/starrocks.HDD,100010
     std::ifstream infile(tablet_file);
-    std::string line = "";
+    std::string line;
     int err_num = 0;
     int delete_num = 0;
     int total_num = 0;
@@ -285,7 +305,7 @@ void batch_delete_meta(const std::string& tablet_file) {
         }
         // 1. get dir
         std::string dir;
-        Status st = FileUtils::canonicalize(v[0], &dir);
+        Status st = starrocks::fs::canonicalize(v[0], &dir);
         if (!st.ok()) {
             std::cout << "invalid root dir in tablet_file: " << line << std::endl;
             err_num++;
@@ -347,21 +367,19 @@ void batch_delete_meta(const std::string& tablet_file) {
     }
 
     std::cout << "total: " << total_num << ", delete: " << delete_num << ", error: " << err_num << std::endl;
-    return;
 }
 
 Status get_segment_footer(RandomAccessFile* input_file, SegmentFooterPB* footer) {
     // Footer := SegmentFooterPB, FooterPBSize(4), FooterPBChecksum(4), MagicNumber(4)
-    std::string file_name = input_file->file_name();
-    uint64_t file_size;
-    RETURN_IF_ERROR(input_file->size(&file_size));
+    const std::string& file_name = input_file->filename();
+    ASSIGN_OR_RETURN(const uint64_t file_size, input_file->get_size());
 
     if (file_size < 12) {
         return Status::Corruption(strings::Substitute("Bad segment file $0: file size $1 < 12", file_name, file_size));
     }
 
     uint8_t fixed_buf[12];
-    RETURN_IF_ERROR(input_file->read_at(file_size - 12, Slice(fixed_buf, 12)));
+    RETURN_IF_ERROR(input_file->read_at_fully(file_size - 12, fixed_buf, 12));
 
     // validate magic number
     const char* k_segment_magic = "D0R1";
@@ -378,7 +396,7 @@ Status get_segment_footer(RandomAccessFile* input_file, SegmentFooterPB* footer)
     }
     std::string footer_buf;
     footer_buf.resize(footer_length);
-    RETURN_IF_ERROR(input_file->read_at(file_size - 12 - footer_length, footer_buf));
+    RETURN_IF_ERROR(input_file->read_at_fully(file_size - 12 - footer_length, footer_buf.data(), footer_buf.size()));
 
     // validate footer PB's checksum
     uint32_t expect_checksum = starrocks::decode_fixed32_le(fixed_buf + 4);
@@ -398,14 +416,14 @@ Status get_segment_footer(RandomAccessFile* input_file, SegmentFooterPB* footer)
 }
 
 void show_segment_footer(const std::string& file_name) {
-    std::unique_ptr<RandomAccessFile> input_file;
-    Status status = starrocks::Env::Default()->new_random_access_file(file_name, &input_file);
-    if (!status.ok()) {
-        std::cout << "open file failed: " << status.to_string() << std::endl;
+    auto res = starrocks::FileSystem::Default()->new_random_access_file(file_name);
+    if (!res.ok()) {
+        std::cout << "open file failed: " << res.status() << std::endl;
         return;
     }
+    auto input_file = std::move(res).value();
     SegmentFooterPB footer;
-    status = get_segment_footer(input_file.get(), &footer);
+    auto status = get_segment_footer(input_file.get(), &footer);
     if (!status.ok()) {
         std::cout << "get footer failed: " << status.to_string() << std::endl;
         return;
@@ -419,6 +437,89 @@ void show_segment_footer(const std::string& file_name) {
         return;
     }
     std::cout << json_footer << std::endl;
+}
+
+// This function will check the consistency of tablet meta and segment_footer
+// #issue 5415
+void check_meta_consistency(DataDir* data_dir) {
+    std::unique_ptr<MemTracker> mem_tracker = std::make_unique<MemTracker>();
+    starrocks::GlobalTabletSchemaMap::Instance()->set_mem_tracker(mem_tracker.get());
+    std::vector<int64_t> tablet_ids;
+    int64_t table_id = FLAGS_table_id;
+    auto check_meta_func = [data_dir, &tablet_ids, table_id](int64_t tablet_id, int32_t schema_hash,
+                                                             std::string_view value) -> bool {
+        starrocks::TabletMetaSharedPtr tablet_meta(new TabletMeta());
+        // if deserialize failed, skip it
+        if (Status st = tablet_meta->deserialize(value); !st.ok()) {
+            return true;
+        }
+        // tablet is not belong to the table, skip it
+        if (tablet_meta->table_id() != table_id) {
+            return true;
+        }
+        std::string tablet_path = data_dir->path() + starrocks::DATA_PREFIX;
+        tablet_path = starrocks::path_util::join_path_segments(tablet_path, std::to_string(tablet_meta->shard_id()));
+        tablet_path = starrocks::path_util::join_path_segments(tablet_path, std::to_string(tablet_meta->tablet_id()));
+        tablet_path = starrocks::path_util::join_path_segments(tablet_path, std::to_string(tablet_meta->schema_hash()));
+
+        auto& tablet_schema = tablet_meta->tablet_schema();
+        const std::vector<starrocks::TabletColumn>& columns = tablet_schema.columns();
+
+        for (const auto& rs : tablet_meta->all_rs_metas()) {
+            for (int64_t seg_id = 0; seg_id < rs->num_segments(); ++seg_id) {
+                std::string seg_path =
+                        strings::Substitute("$0/$1_$2.dat", tablet_path, rs->rowset_id().to_string(), seg_id);
+                auto res = starrocks::FileSystem::Default()->new_random_access_file(seg_path);
+                if (!res.ok()) {
+                    continue;
+                }
+                auto seg_file = std::move(res).value();
+                starrocks::SegmentFooterPB footer;
+                res = get_segment_footer(seg_file.get(), &footer);
+                if (!res.ok()) {
+                    continue;
+                }
+
+                // unique_id: ordinal: column_type
+                std::unordered_map<uint32_t, std::pair<uint32_t, int32_t>> columns_in_footer;
+                for (uint32_t ordinal = 0; ordinal < footer.columns().size(); ++ordinal) {
+                    const auto& column_pb = footer.columns(ordinal);
+                    columns_in_footer.emplace(column_pb.unique_id(), std::make_pair(ordinal, column_pb.type()));
+                }
+                for (uint32_t col_id = 0; col_id < columns.size(); ++col_id) {
+                    uint32_t unique_id = columns[col_id].unique_id();
+                    starrocks::FieldType type = columns[col_id].type();
+                    auto iter = columns_in_footer.find(unique_id);
+                    if (iter == columns_in_footer.end()) {
+                        continue;
+                    }
+
+                    // find a segment inconsistency, return directly
+                    if (iter->second.second != type) {
+                        tablet_ids.emplace_back(tablet_id);
+                        return true;
+                    }
+
+                    // if type is varchar, check length
+                    if (type == starrocks::FieldType::OLAP_FIELD_TYPE_VARCHAR) {
+                        const auto& column_pb = footer.columns(iter->second.first);
+                        if (columns[col_id].length() != column_pb.length()) {
+                            tablet_ids.emplace_back(tablet_id);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    };
+    Status load_tablet_status = TabletMetaManager::walk(data_dir->get_meta(), check_meta_func);
+    if (tablet_ids.size() > 0) {
+        std::cout << "inconsistency tablet:";
+    }
+    for (size_t i = 0; i < tablet_ids.size(); ++i) {
+        std::cout << "," << tablet_ids[i];
+    }
     return;
 }
 
@@ -431,7 +532,7 @@ int meta_tool_main(int argc, char** argv) {
         show_meta();
     } else if (FLAGS_operation == "batch_delete_meta") {
         std::string tablet_file;
-        Status st = FileUtils::canonicalize(FLAGS_tablet_file, &tablet_file);
+        Status st = starrocks::fs::canonicalize(FLAGS_tablet_file, &tablet_file);
         if (!st.ok()) {
             std::cout << "invalid tablet file: " << FLAGS_tablet_file << ", error: " << st.to_string() << std::endl;
             return -1;
@@ -446,15 +547,17 @@ int meta_tool_main(int argc, char** argv) {
         show_segment_footer(FLAGS_file);
     } else {
         // operations that need root path should be written here
-        std::set<std::string> valid_operations = {"get_meta",           "load_meta",      "delete_meta",
-                                                  "delete_rowset_meta", "get_meta_stats", "ls"};
+        std::set<std::string> valid_operations = {
+                "get_meta",     "load_meta",      "delete_meta", "delete_rowset_meta",
+                "compact_meta", "get_meta_stats", "ls",          "check_table_meta_consistency"};
         if (valid_operations.find(FLAGS_operation) == valid_operations.end()) {
             std::cout << "invalid operation:" << FLAGS_operation << std::endl;
             return -1;
         }
 
         bool read_only = false;
-        if (FLAGS_operation == "get_meta" || FLAGS_operation == "get_meta_stats" || FLAGS_operation == "ls") {
+        if (FLAGS_operation == "get_meta" || FLAGS_operation == "get_meta_stats" || FLAGS_operation == "ls" ||
+            FLAGS_operation == "check_table_meta_consistency") {
             read_only = true;
         }
 
@@ -473,10 +576,14 @@ int meta_tool_main(int argc, char** argv) {
             delete_meta(data_dir.get());
         } else if (FLAGS_operation == "delete_rowset_meta") {
             delete_rowset_meta(data_dir.get());
+        } else if (FLAGS_operation == "compact_meta") {
+            compact_meta(data_dir.get());
         } else if (FLAGS_operation == "get_meta_stats") {
             get_meta_stats(data_dir.get());
         } else if (FLAGS_operation == "ls") {
             list_meta(data_dir.get());
+        } else if (FLAGS_operation == "check_table_meta_consistency") {
+            check_meta_consistency(data_dir.get());
         } else {
             std::cout << "invalid operation: " << FLAGS_operation << "\n" << usage << std::endl;
             return -1;

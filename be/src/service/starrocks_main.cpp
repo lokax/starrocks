@@ -19,12 +19,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <aws/core/Aws.h>
 #include <gperftools/malloc_extension.h>
 #include <sys/file.h>
 #include <unistd.h>
-
-#include <boost/thread/thread.hpp>
-#include <boost/unordered_map.hpp>
 
 #if defined(LEAK_SANITIZER)
 #include <sanitizer/lsan_interface.h>
@@ -39,18 +37,18 @@
 #include "common/config.h"
 #include "common/daemon.h"
 #include "common/logging.h"
-#include "common/resource_tls.h"
 #include "common/status.h"
+#include "exec/pipeline/query_context.h"
+#include "fs/fs_util.h"
 #include "runtime/exec_env.h"
 #include "runtime/heartbeat_flags.h"
+#include "runtime/jdbc_driver_manager.h"
 #include "service/backend_options.h"
-#include "service/backend_service.h"
-#include "service/brpc_service.h"
-#include "service/http_service.h"
+#include "service/service.h"
+#include "service/staros_worker.h"
 #include "storage/options.h"
 #include "storage/storage_engine.h"
 #include "util/debug_util.h"
-#include "util/file_utils.h"
 #include "util/logging.h"
 #include "util/network_util.h"
 #include "util/starrocks_metrics.h"
@@ -58,6 +56,8 @@
 #include "util/thrift_server.h"
 #include "util/thrift_util.h"
 #include "util/uid_util.h"
+
+DECLARE_bool(s2debug);
 
 static void help(const char*);
 
@@ -68,8 +68,6 @@ void __lsan_do_leak_check();
 }
 
 namespace starrocks {
-extern bool k_starrocks_exit;
-
 static void thrift_output(const char* x) {
     LOG(WARNING) << "thrift internal message: " << x;
 }
@@ -82,7 +80,8 @@ int main(int argc, char** argv) {
     if (argc > 1 && strcmp(argv[1], "meta_tool") == 0) {
         return meta_tool_main(argc - 1, argv + 1);
     }
-    // check if print version or help
+    bool as_cn = false;
+    // Check if print version or help or cn.
     if (argc > 1) {
         if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0) {
             puts(starrocks::get_build_version(false).c_str());
@@ -90,19 +89,35 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-?") == 0) {
             help(basename(argv[0]));
             exit(0);
+        } else if (strcmp(argv[1], "--cn") == 0) {
+            as_cn = true;
         }
     }
+    bool without_storage = as_cn;
 
     if (getenv("STARROCKS_HOME") == nullptr) {
         fprintf(stderr, "you need set STARROCKS_HOME environment variable.\n");
         exit(-1);
     }
 
+    if (getenv("TCMALLOC_HEAP_LIMIT_MB") == nullptr) {
+        fprintf(stderr, "you need replace bin dir of be with new version.\n");
+        exit(-1);
+    }
+
+    // S2 will crashes when deserialization fails and FLAGS_s2debug was true.
+    FLAGS_s2debug = false;
+
     using starrocks::Status;
     using std::string;
 
-    // open pid file, obtain file lock and save pid
-    string pid_file = string(getenv("PID_DIR")) + "/be.pid";
+    // Open pid file, obtain file lock and save pid.
+    string pid_file = string(getenv("PID_DIR"));
+    if (as_cn) {
+        pid_file += "/cn.pid";
+    } else {
+        pid_file += "/be.pid";
+    }
     int fd = open(pid_file.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
     if (fd < 0) {
         fprintf(stderr, "fail to create pid file.");
@@ -117,13 +132,18 @@ int main(int argc, char** argv) {
         exit(-1);
     }
 
-    // descriptor will be leaked when failing to close fd
+    // Descriptor will be leaked if failing to close fd.
     if (::close(fd) < 0) {
         fprintf(stderr, "failed to close fd of pidfile.");
         exit(-1);
     }
 
-    string conffile = string(getenv("STARROCKS_HOME")) + "/conf/be.conf";
+    string conffile = string(getenv("STARROCKS_HOME"));
+    if (as_cn) {
+        conffile += "/conf/cn.conf";
+    } else {
+        conffile += "/conf/be.conf";
+    }
     if (!starrocks::config::init(conffile.c_str(), true)) {
         fprintf(stderr, "error read config file. \n");
         return -1;
@@ -145,44 +165,53 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    Aws::SDKOptions aws_sdk_options;
+    Aws::InitAPI(aws_sdk_options);
+
     std::vector<starrocks::StorePath> paths;
-    auto olap_res = starrocks::parse_conf_store_paths(starrocks::config::storage_root_path, &paths);
-    if (olap_res != starrocks::OLAP_SUCCESS) {
-        LOG(FATAL) << "parse config storage path failed, path=" << starrocks::config::storage_root_path;
-        exit(-1);
-    }
-    auto it = paths.begin();
-    for (; it != paths.end();) {
-        if (!starrocks::check_datapath_rw(it->path)) {
-            if (starrocks::config::ignore_broken_disk) {
-                LOG(WARNING) << "read write test file failed, path=" << it->path;
-                it = paths.erase(it);
+    if (!without_storage) {
+        auto olap_res = starrocks::parse_conf_store_paths(starrocks::config::storage_root_path, &paths);
+        if (!olap_res.ok()) {
+            LOG(FATAL) << "parse config storage path failed, path=" << starrocks::config::storage_root_path;
+            exit(-1);
+        }
+        auto it = paths.begin();
+        for (; it != paths.end();) {
+            if (!starrocks::check_datapath_rw(it->path)) {
+                if (starrocks::config::ignore_broken_disk) {
+                    LOG(WARNING) << "read write test file failed, path=" << it->path;
+                    it = paths.erase(it);
+                } else {
+                    LOG(FATAL) << "read write test file failed, path=" << it->path;
+                    exit(-1);
+                }
             } else {
-                LOG(FATAL) << "read write test file failed, path=" << it->path;
-                exit(-1);
+                ++it;
             }
-        } else {
-            ++it;
+        }
+
+        if (paths.empty()) {
+            LOG(FATAL) << "All disks are broken, exit.";
+            exit(-1);
         }
     }
 
-    if (paths.empty()) {
-        LOG(FATAL) << "All disks are broken, exit.";
-        exit(-1);
-    }
-
-    // initilize libcurl here to avoid concurrent initialization
+    // Initilize libcurl here to avoid concurrent initialization.
     auto curl_ret = curl_global_init(CURL_GLOBAL_ALL);
     if (curl_ret != 0) {
         LOG(FATAL) << "fail to initialize libcurl, curl_ret=" << curl_ret;
         exit(-1);
     }
-    // add logger for thrift internal
+    // Add logger for thrift internal.
     apache::thrift::GlobalOutput.setOutputFunction(starrocks::thrift_output);
 
-    starrocks::init_daemon(argc, argv, paths);
+    std::unique_ptr<starrocks::Daemon> daemon(new starrocks::Daemon());
+    daemon->init(argc, argv, paths);
 
-    starrocks::ResourceTls::init();
+    // init jdbc driver manager
+    EXIT_IF_ERROR(starrocks::JDBCDriverManager::getInstance()->init(std::string(getenv("STARROCKS_HOME")) +
+                                                                    "/lib/jdbc_drivers"));
+
     if (!starrocks::BackendOptions::init()) {
         exit(-1);
     }
@@ -190,7 +219,7 @@ int main(int argc, char** argv) {
     auto* exec_env = starrocks::ExecEnv::GetInstance();
     EXIT_IF_ERROR(exec_env->init_mem_tracker());
 
-    // init and open storage engine
+    // Init and open storage engine.
     starrocks::EngineOptions options;
     options.store_paths = paths;
     options.backend_uid = starrocks::UniqueId::gen_uid();
@@ -198,86 +227,75 @@ int main(int argc, char** argv) {
     options.schema_change_mem_tracker = exec_env->schema_change_mem_tracker();
     options.compaction_mem_tracker = exec_env->compaction_mem_tracker();
     options.update_mem_tracker = exec_env->update_mem_tracker();
+    options.conf_path = string(getenv("STARROCKS_HOME")) + "/conf/";
     starrocks::StorageEngine* engine = nullptr;
-    auto st = starrocks::StorageEngine::open(options, &engine);
-    if (!st.ok()) {
-        LOG(FATAL) << "fail to open StorageEngine, res=" << st.get_error_msg();
-        exit(-1);
+
+    if (without_storage) {
+        auto st = starrocks::DummyStorageEngine::open(options, &engine);
+        if (!st.ok()) {
+            LOG(FATAL) << "fail to open StorageEngine, res=" << st.get_error_msg();
+            exit(-1);
+        }
+    } else {
+        auto st = starrocks::StorageEngine::open(options, &engine);
+        if (!st.ok()) {
+            LOG(FATAL) << "fail to open StorageEngine, res=" << st.get_error_msg();
+            exit(-1);
+        }
     }
 
-    // init exec env
-    starrocks::ExecEnv::init(exec_env, paths);
+    // Init exec env.
+    EXIT_IF_ERROR(starrocks::ExecEnv::init(exec_env, paths));
     exec_env->set_storage_engine(engine);
     engine->set_heartbeat_flags(exec_env->heartbeat_flags());
 
-    // start all backgroud threads of storage engine.
+    // Start all background threads of storage engine.
     // SHOULD be called after exec env is initialized.
     EXIT_IF_ERROR(engine->start_bg_threads());
 
-    // begin to start services
+    // Begin to start Heartbeat services
     starrocks::ThriftRpcHelper::setup(exec_env);
-    // 1. thrift server with be_port
-    starrocks::ThriftServer* be_server = nullptr;
-    EXIT_IF_ERROR(starrocks::BackendService::create_service(exec_env, starrocks::config::be_port, &be_server));
-    Status status = be_server->start();
+    auto res = starrocks::create_heartbeat_server(exec_env, starrocks::config::heartbeat_service_port,
+                                                  starrocks::config::heartbeat_service_thread_count);
+    CHECK(res.ok()) << res.status();
+    auto heartbeat_thrift_server = std::move(res).value();
+
+    starrocks::Status status = heartbeat_thrift_server->start();
     if (!status.ok()) {
-        LOG(ERROR) << "StarRocks Be server did not start correctly, exiting";
+        LOG(ERROR) << "StarRocks BE HeartBeat Service did not start correctly. Error=" << status.to_string();
         starrocks::shutdown_logging();
         exit(1);
+    } else {
+        LOG(INFO) << "StarRocks BE HeartBeat Service started correctly.";
     }
 
-    // 2. brpc service
-    starrocks::BRpcService brpc_service(exec_env);
-    status = brpc_service.start(starrocks::config::brpc_port);
-    if (!status.ok()) {
-        LOG(ERROR) << "BRPC service did not start correctly, exiting";
-        starrocks::shutdown_logging();
-        exit(1);
-    }
-
-    // 3. http service
-    starrocks::HttpService http_service(exec_env, starrocks::config::webserver_port,
-                                        starrocks::config::webserver_num_workers);
-    status = http_service.start();
-    if (!status.ok()) {
-        LOG(ERROR) << "Internal Error:" << status.message();
-        LOG(ERROR) << "StarRocks Be http service did not start correctly, exiting";
-        starrocks::shutdown_logging();
-        exit(1);
-    }
-
-    // 4. heart beat server
-    starrocks::TMasterInfo* master_info = exec_env->master_info();
-    starrocks::ThriftServer* heartbeat_thrift_server;
-    starrocks::AgentStatus heartbeat_status = starrocks::create_heartbeat_server(
-            exec_env, starrocks::config::heartbeat_service_port, &heartbeat_thrift_server,
-            starrocks::config::heartbeat_service_thread_count, master_info);
-
-    if (starrocks::AgentStatus::STARROCKS_SUCCESS != heartbeat_status) {
-        LOG(ERROR) << "Heartbeat services did not start correctly, exiting";
-        starrocks::shutdown_logging();
-        exit(1);
-    }
-
-    status = heartbeat_thrift_server->start();
-    if (!status.ok()) {
-        LOG(ERROR) << "StarRocks BE HeartBeat Service did not start correctly, exiting";
-        starrocks::shutdown_logging();
-        exit(1);
-    }
-
-    while (!starrocks::k_starrocks_exit) {
-#if defined(LEAK_SANITIZER)
-        __lsan_do_leak_check();
+#ifdef USE_STAROS
+    starrocks::init_staros_worker();
 #endif
-        sleep(10);
+
+    if (as_cn) {
+        start_cn();
+    } else {
+        start_be();
     }
+
+    daemon->stop();
+    daemon.reset();
+
+#ifdef USE_STAROS
+    starrocks::shutdown_staros_worker();
+#endif
+
+    Aws::ShutdownAPI(aws_sdk_options);
+
     heartbeat_thrift_server->stop();
     heartbeat_thrift_server->join();
-    be_server->stop();
-    be_server->join();
 
-    delete be_server;
+    engine->stop();
+    delete engine;
+    exec_env->set_storage_engine(nullptr);
+    starrocks::ExecEnv::destroy(exec_env);
+
     return 0;
 }
 
@@ -285,6 +303,7 @@ static void help(const char* progname) {
     printf("%s is the StarRocks backend server.\n\n", progname);
     printf("Usage:\n  %s [OPTION]...\n\n", progname);
     printf("Options:\n");
+    printf("      --cn           start as compute node\n");
     printf("  -v, --version      output version information, then exit\n");
     printf("  -?, --help         show this help, then exit\n");
 }

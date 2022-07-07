@@ -20,8 +20,7 @@
  * limitations under the License.
  */
 
-#ifndef ORC_SRC_SEARCHARGUMENT_HH
-#define ORC_SRC_SEARCHARGUMENT_HH
+#pragma once
 
 #include <deque>
 #include <stdexcept>
@@ -45,7 +44,7 @@ namespace orc {
    */
 class SearchArgumentImpl : public SearchArgument {
 public:
-    SearchArgumentImpl(TreeNode root, const std::vector<PredicateLeaf>& leaves);
+    SearchArgumentImpl(TreeNode root, std::vector<PredicateLeaf> leaves);
 
     /**
      * Get the leaf predicates that are required to evaluate the predicate. The
@@ -189,9 +188,9 @@ public:
 
 private:
     SearchArgumentBuilder& start(ExpressionTree::Operator op);
-    size_t addLeaf(PredicateLeaf leaf);
+    size_t addLeaf(const PredicateLeaf& leaf);
     SearchArgumentBuilder& compareOperator(PredicateLeaf::Operator op, const std::string& column,
-                                           PredicateDataType type, Literal literal);
+                                           PredicateDataType type, const Literal& literal);
 
 public:
     static TreeNode pushDownNot(TreeNode root);
@@ -206,5 +205,3 @@ private:
 };
 
 } // namespace orc
-
-#endif //ORC_SRC_SEARCHARGUMENT_HH

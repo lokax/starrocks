@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/descriptor_helper.h
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -114,8 +110,7 @@ public:
         // build slot desc
         _tuple_id = tb->next_tuple_id();
         int num_nullables = 0;
-        for (int i = 0; i < _slot_descs.size(); ++i) {
-            auto& slot_desc = _slot_descs[i];
+        for (auto& slot_desc : _slot_descs) {
             if (slot_desc.nullIndicatorByte >= 0) {
                 num_nullables++;
             }

@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
@@ -64,7 +64,7 @@ public class PushDownApplyFilterRule extends TransformationRule {
 
         LogicalApplyOperator newApply = new LogicalApplyOperator(apply.getOutput(), apply.getSubqueryOperator(),
                 apply.getCorrelationColumnRefs(), correlationPredicate, unCorrelationPredicate,
-                apply.isNeedCheckMaxRows(), apply.isFromAndScope());
+                apply.isNeedCheckMaxRows(), apply.isUseSemiAnti());
 
         OptExpression newApplyOptExpression = new OptExpression(newApply);
         newApplyOptExpression.getInputs().add(input.getInputs().get(0));

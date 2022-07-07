@@ -22,56 +22,24 @@
 package com.starrocks.analysis;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 import com.starrocks.catalog.Function;
-import com.starrocks.catalog.FunctionSet;
-import com.starrocks.catalog.ScalarFunction;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.sql.analyzer.ExprVisitor;
 import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.thrift.TExprNode;
 import com.starrocks.thrift.TExprNodeType;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import com.starrocks.thrift.TFunctionBinaryType;
 
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public class IsNullPredicate extends Predicate {
-    private static final Logger LOG = LogManager.getLogger(IsNullPredicate.class);
-    private static final String IS_NULL = "is_null_pred";
-    private static final String IS_NOT_NULL = "is_not_null_pred";
 
-    public static void initBuiltins(FunctionSet functionSet) {
-        for (Type t : Type.getSupportedTypes()) {
-            if (t.isNull()) {
-                continue;
-            }
-            String isNullSymbol;
-            if (t == Type.BOOLEAN) {
-                isNullSymbol = "_ZN9starrocks15IsNullPredicate7is_nullIN13starrocks_udf10BooleanValE" +
-                        "EES3_PNS2_15FunctionContextERKT_";
-            } else if (!t.isPseudoType()) {
-                String udfType = Function.getUdfType(t.getPrimitiveType());
-                isNullSymbol = "_ZN9starrocks15IsNullPredicate7is_nullIN13starrocks_udf" +
-                        udfType.length() + udfType +
-                        "EEENS2_10BooleanValEPNS2_15FunctionContextERKT_";
-            } else {
-                // Pseudo types support.
-                // NOTE: only the vectorized engine support pseudo types and the vectorized engine will not
-                // use the following registered functions, but we have to register them in order to pass
-                // the analysis.
-                isNullSymbol = "non_exists_symbol_for_pseudo_types";
-            }
-
-            functionSet.addBuiltin(ScalarFunction.createBuiltinOperator(
-                    IS_NULL, isNullSymbol, Lists.newArrayList(t), Type.BOOLEAN));
-
-            String isNotNullSymbol = isNullSymbol.replace("7is_null", "11is_not_null");
-            functionSet.addBuiltin(ScalarFunction.createBuiltinOperator(
-                    IS_NOT_NULL, isNotNullSymbol, Lists.newArrayList(t), Type.BOOLEAN));
-        }
+    static Function isNullFN = new Function(new FunctionName("is_null_pred"),
+            new Type[] {Type.INVALID}, Type.BOOLEAN, false);
+    static Function isNotNullFN = new Function(new FunctionName("is_not_null_pred"),
+            new Type[] {Type.INVALID}, Type.BOOLEAN, false);
+    {
+        isNullFN.setBinaryType(TFunctionBinaryType.BUILTIN);
+        isNotNullFN.setBinaryType(TFunctionBinaryType.BUILTIN);
     }
 
     private final boolean isNotNull;
@@ -110,6 +78,11 @@ public class IsNullPredicate extends Predicate {
         return getChild(0).toSql() + (isNotNull ? " IS NOT NULL" : " IS NULL");
     }
 
+    @Override
+    public String toDigestImpl() {
+        return getChild(0).toDigest() + (isNotNull ? " is not null" : " is null");
+    }
+
     public boolean isSlotRefChildren() {
         return (children.get(0) instanceof SlotRef);
     }
@@ -119,17 +92,13 @@ public class IsNullPredicate extends Predicate {
         super.analyzeImpl(analyzer);
 
         if (isNotNull) {
-            fn = getBuiltinFunction(
-                    analyzer, IS_NOT_NULL, collectChildReturnTypes(), Function.CompareMode.IS_INDISTINGUISHABLE);
+            fn = isNotNullFN;
         } else {
-            fn = getBuiltinFunction(
-                    analyzer, IS_NULL, collectChildReturnTypes(), Function.CompareMode.IS_INDISTINGUISHABLE);
+            fn = isNullFN;
         }
-        Preconditions.checkState(fn != null, "tupleisNull fn == NULL");
 
         // determine selectivity
         selectivity = 0.1;
-        // LOG.debug(toSql() + " selectivity: " + Double.toString(selectivity));
     }
 
     @Override
@@ -145,46 +114,12 @@ public class IsNullPredicate extends Predicate {
         return new IsNullPredicate(getChild(0), !isNotNull);
     }
 
-    @Override
-    public boolean isVectorized() {
-        for (Expr expr : children) {
-            if (!expr.isVectorized()) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    @Override
-    public boolean isStrictPredicate() {
-        Expr child = getChild(0);
-        if (child.unwrapSlotRef() != null) {
-            return isNotNull;
-        } else {
-            return false;
-        }
-    }
-
     public boolean isNullable() {
         return false;
     }
 
     @Override
-    public Expr getResultValue() throws AnalysisException {
-        recursiveResetChildrenResult();
-        final Expr ChildValue = getChild(0);
-
-        if (!(ChildValue instanceof LiteralExpr)) {
-            return this;
-        }
-
-        return ChildValue instanceof NullLiteral ?
-                new BoolLiteral(!isNotNull) : new BoolLiteral(isNotNull);
-    }
-
-    @Override
-    public <R, C> R accept(ExprVisitor<R, C> visitor, C context) throws SemanticException {
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) throws SemanticException {
         return visitor.visitIsNullPredicate(this, context);
     }
 }

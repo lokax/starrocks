@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.statistics;
 
@@ -14,14 +14,19 @@ public class ColumnStatistic {
         ESTIMATE
     }
 
-    private static final ColumnStatistic
-            UNKNOWN = new ColumnStatistic(NEGATIVE_INFINITY, POSITIVE_INFINITY, 0, 1, 1, StatisticType.UNKNOWN);
+    // Used for the column statistics which we could not get from the statistics storage or
+    // can not compute the actual column statistics for now
+    private static final ColumnStatistic UNKNOWN =
+            new ColumnStatistic(NEGATIVE_INFINITY, POSITIVE_INFINITY, 0, 1, 1, null, StatisticType.UNKNOWN);
 
+    // For time types, including Date, DateTime, Timestamp. They all represented as timestamp in ColumnStatistic,
+    // regardless of their different storage format
     private final double minValue;
     private final double maxValue;
     private final double nullsFraction;
     private final double averageRowSize;
     private final double distinctValuesCount;
+    private final Histogram histogram;
     private final StatisticType type;
 
     // TODO deal with string max, min
@@ -31,12 +36,14 @@ public class ColumnStatistic {
             double nullsFraction,
             double averageRowSize,
             double distinctValuesCount,
+            Histogram histogram,
             StatisticType type) {
         this.minValue = minValue;
         this.maxValue = maxValue;
         this.nullsFraction = nullsFraction;
         this.averageRowSize = averageRowSize;
         this.distinctValuesCount = distinctValuesCount;
+        this.histogram = histogram;
         this.type = type;
     }
 
@@ -45,7 +52,7 @@ public class ColumnStatistic {
                            double nullsFraction,
                            double averageRowSize,
                            double distinctValuesCount) {
-        this(minValue, maxValue, nullsFraction, averageRowSize, distinctValuesCount, StatisticType.ESTIMATE);
+        this(minValue, maxValue, nullsFraction, averageRowSize, distinctValuesCount, null, StatisticType.ESTIMATE);
     }
 
     public double getMinValue() {
@@ -68,6 +75,10 @@ public class ColumnStatistic {
         return distinctValuesCount;
     }
 
+    public Histogram getHistogram() {
+        return histogram;
+    }
+
     public static ColumnStatistic unknown() {
         return UNKNOWN;
     }
@@ -76,6 +87,15 @@ public class ColumnStatistic {
         return this.type == StatisticType.UNKNOWN;
     }
 
+    public boolean isInfiniteRange() {
+        return this.minValue == NEGATIVE_INFINITY || this.maxValue == POSITIVE_INFINITY;
+    }
+
+    public boolean hasNaNValue() {
+        return Double.isNaN(minValue) || Double.isNaN(maxValue);
+    }
+
+    // TODO(ywb): remove this after user can dump statistics with type
     public boolean isUnknownValue() {
         return this.minValue == NEGATIVE_INFINITY && this.maxValue == POSITIVE_INFINITY && this.nullsFraction == 0 &&
                 this.averageRowSize == 1 && this.distinctValuesCount == 1;
@@ -92,7 +112,8 @@ public class ColumnStatistic {
                 + maxValue + separator
                 + nullsFraction + separator
                 + averageRowSize + separator
-                + distinctValuesCount + "]";
+                + distinctValuesCount + "] "
+                + type;
     }
 
     public static Builder buildFrom(ColumnStatistic other) {
@@ -101,14 +122,19 @@ public class ColumnStatistic {
     }
 
     public static Builder buildFrom(String columnStatistic) {
-        String valueString = columnStatistic.substring(1, columnStatistic.length() - 1);
+        int endIndex = columnStatistic.indexOf(']');
+        String valueString = columnStatistic.substring(1, endIndex);
+        String typeString = endIndex == columnStatistic.length() - 1 ? "" : columnStatistic.substring(endIndex + 2);
+
         String[] valueArray = valueString.split(",");
         Preconditions.checkState(valueArray.length == 5);
 
         Builder builder = new Builder(Double.parseDouble(valueArray[0]), Double.parseDouble(valueArray[1]),
                 Double.parseDouble(valueArray[2]), Double.parseDouble(valueArray[3]),
                 Double.parseDouble(valueArray[4]));
-        if (builder.build().isUnknownValue()) {
+        if (!typeString.isEmpty()) {
+            builder.setType(StatisticType.valueOf(typeString));
+        } else if (builder.build().isUnknownValue()) {
             builder.setType(StatisticType.UNKNOWN);
         }
         return builder;
@@ -124,13 +150,15 @@ public class ColumnStatistic {
         private double nullsFraction = NaN;
         private double averageRowSize = NaN;
         private double distinctValuesCount = NaN;
+        private Histogram histogram;
         private StatisticType type = StatisticType.ESTIMATE;
 
         private Builder() {
         }
 
         private Builder(double minValue, double maxValue, double nullsFraction, double averageRowSize,
-                        double distinctValuesCount, StatisticType type) {
+                        double distinctValuesCount,
+                        StatisticType type) {
             this.minValue = minValue;
             this.maxValue = maxValue;
             this.nullsFraction = nullsFraction;
@@ -169,13 +197,18 @@ public class ColumnStatistic {
             return this;
         }
 
+        public Builder setHistogram(Histogram histogram) {
+            this.histogram = histogram;
+            return this;
+        }
+
         public Builder setType(StatisticType type) {
             this.type = type;
             return this;
         }
 
         public ColumnStatistic build() {
-            return new ColumnStatistic(minValue, maxValue, nullsFraction, averageRowSize, distinctValuesCount, type);
+            return new ColumnStatistic(minValue, maxValue, nullsFraction, averageRowSize, distinctValuesCount, histogram, type);
         }
     }
 }

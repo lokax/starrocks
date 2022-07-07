@@ -71,6 +71,7 @@
 
 #include "phmap_base.h"
 #include "phmap_fwd_decl.h"
+#include "phmap_hash.h"
 #include "phmap_utils.h"
 
 #if PHMAP_HAVE_STD_STRING_VIEW
@@ -163,8 +164,8 @@ int LeadingZeros(T x) {
 // --------------------------------------------------------------------------
 template <class T, int SignificantBits, int Shift = 0>
 class BitMask {
-    static_assert(std::is_unsigned<T>::value, "");
-    static_assert(Shift == 0 || Shift == 3, "");
+    static_assert(std::is_unsigned<T>::value);
+    static_assert(Shift == 0 || Shift == 3);
 
 public:
     // These are useful for unit tests (gunit).
@@ -563,6 +564,8 @@ static inline HashtablezInfo* SampleSlow(int64_t*) {
 }
 static inline void UnsampleSlow(HashtablezInfo*) {}
 
+// #define PHMAP_USE_CUSTOM_INFO_HANDLE
+#ifndef PHMAP_USE_CUSTOM_INFO_HANDLE
 class HashtablezInfoHandle {
 public:
     inline void RecordStorageChanged(size_t, size_t) {}
@@ -571,6 +574,29 @@ public:
     inline void RecordErase() {}
     friend inline void swap(HashtablezInfoHandle&, HashtablezInfoHandle&) noexcept {}
 };
+
+#else
+
+class HashtablezInfoHandle {
+public:
+    inline void RecordStorageChanged(size_t, size_t) {}
+    inline void RecordRehash(size_t) { rehash_number += 1; }
+    inline void RecordInsert(size_t hash_val, size_t probe_length) {
+        insert_number += 1;
+        insert_probe_length += probe_length;
+    }
+    inline void RecordErase() {}
+    friend inline void swap(HashtablezInfoHandle& x, HashtablezInfoHandle& y) noexcept {
+        std::swap(x.insert_number, y.insert_number);
+        std::swap(x.insert_probe_length, y.insert_probe_length);
+        std::swap(x.rehash_number, y.rehash_number);
+    }
+    size_t insert_number = 0;
+    size_t insert_probe_length = 0;
+    size_t rehash_number = 0;
+};
+
+#endif
 
 static inline HashtablezInfoHandle Sample() {
     return HashtablezInfoHandle();
@@ -814,7 +840,7 @@ public:
         using pointer = phmap::remove_reference_t<reference>*;
         using difference_type = typename raw_hash_set::difference_type;
 
-        iterator() {}
+        iterator() = default;
 
         // PRECONDITION: not an end() iterator.
         reference operator*() const { return PolicyTraits::element(slot_); }
@@ -892,7 +918,7 @@ public:
         using pointer = typename raw_hash_set::const_pointer;
         using difference_type = typename raw_hash_set::difference_type;
 
-        const_iterator() {}
+        const_iterator() = default;
         // Implicit construction from iterator.
         const_iterator(iterator i) : inner_(std::move(i)) {}
 
@@ -1049,8 +1075,7 @@ public:
     raw_hash_set(raw_hash_set&& that, const allocator_type& a)
             : ctrl_(EmptyGroup()),
               slots_(nullptr),
-              size_(0),
-              capacity_(0),
+
               settings_(0, that.hash_ref(), that.eq_ref(), a) {
         if (a == that.alloc_ref()) {
             std::swap(ctrl_, that.ctrl_);
@@ -1265,6 +1290,11 @@ public:
         return PolicyTraits::apply(EmplaceDecomposable{*this}, std::forward<Args>(args)...);
     }
 
+    template <class... Args, typename std::enable_if<IsDecomposable<Args...>::value, int>::type = 0>
+    std::pair<iterator, bool> emplace_with_hash(size_t hashval, Args&&... args) {
+        return PolicyTraits::apply(EmplaceDecomposableHashval{*this, hashval}, std::forward<Args>(args)...);
+    }
+
     // This overload kicks in if we cannot deduce the key from args. It constructs
     // value_type unconditionally and then either moves it into the table or
     // destroys.
@@ -1278,9 +1308,24 @@ public:
         return PolicyTraits::apply(InsertSlot<true>{*this, std::move(*slot)}, elem);
     }
 
+    template <class... Args, typename std::enable_if<!IsDecomposable<Args...>::value, int>::type = 0>
+    std::pair<iterator, bool> emplace_with_hash(size_t hashval, Args&&... args) {
+        typename std::aligned_storage<sizeof(slot_type), alignof(slot_type)>::type raw;
+        slot_type* slot = reinterpret_cast<slot_type*>(&raw);
+
+        PolicyTraits::construct(&alloc_ref(), slot, std::forward<Args>(args)...);
+        const auto& elem = PolicyTraits::element(slot);
+        return PolicyTraits::apply(InsertSlotWithHash<true>{*this, std::move(*slot), hashval}, elem);
+    }
+
     template <class... Args>
     iterator emplace_hint(const_iterator, Args&&... args) {
         return emplace(std::forward<Args>(args)...).first;
+    }
+
+    template <class... Args>
+    iterator emplace_hint_with_hash(size_t hashval, const_iterator, Args&&... args) {
+        return emplace_with_hash(hashval, std::forward<Args>(args)...).first;
     }
 
     // Extension API: support for lazy emplace.
@@ -1326,19 +1371,31 @@ public:
     template <class K = key_type, class F>
     iterator lazy_emplace(const key_arg<K>& key, F&& f) {
         auto res = find_or_prepare_insert(key);
+        auto iter = iterator_at(res.first);
         if (res.second) {
-            lazy_emplace_at(res.first, std::forward<F>(f));
+            try {
+                lazy_emplace_at(res.first, std::forward<F>(f));
+            } catch (std::bad_alloc const& e) {
+                erase(iter);
+                throw e;
+            }
         }
-        return iterator_at(res.first);
+        return iter;
     }
 
     template <class K = key_type, class F>
     iterator lazy_emplace_with_hash(const key_arg<K>& key, size_t& hashval, F&& f) {
         auto res = find_or_prepare_insert(key, hashval);
+        auto iter = iterator_at(res.first);
         if (res.second) {
-            lazy_emplace_at(res.first, std::forward<F>(f));
+            try {
+                lazy_emplace_at(res.first, std::forward<F>(f));
+            } catch (std::bad_alloc const& e) {
+                erase(iter);
+                throw e;
+            }
         }
-        return iterator_at(res.first);
+        return iter;
     }
 
     template <class K = key_type, class F>
@@ -1360,6 +1417,14 @@ public:
     template <class K = key_type>
     size_type erase(const key_arg<K>& key) {
         auto it = find(key);
+        if (it == end()) return 0;
+        _erase(it);
+        return 1;
+    }
+
+    template <class K = key_type>
+    size_type erase_with_hash(const key_arg<K>& key, size_t hashval) {
+        auto it = find(key, hashval);
         if (it == end()) return 0;
         _erase(it);
         return 1;
@@ -1658,7 +1723,7 @@ private:
     };
 
     template <class K, class... Args>
-    std::pair<iterator, bool> emplace_decomposable(const K& key, size_t hashval, Args&&... args) {
+    std::pair<iterator, bool> emplace_decomposable_with_hash(const K& key, size_t hashval, Args&&... args) {
         auto res = find_or_prepare_insert(key, hashval);
         if (res.second) {
             emplace_at(res.first, std::forward<Args>(args)...);
@@ -1669,9 +1734,18 @@ private:
     struct EmplaceDecomposable {
         template <class K, class... Args>
         std::pair<iterator, bool> operator()(const K& key, Args&&... args) const {
-            return s.emplace_decomposable(key, s.hash(key), std::forward<Args>(args)...);
+            return s.emplace_decomposable_with_hash(key, s.hash(key), std::forward<Args>(args)...);
         }
         raw_hash_set& s;
+    };
+
+    struct EmplaceDecomposableHashval {
+        template <class K, class... Args>
+        std::pair<iterator, bool> operator()(const K& key, Args&&... args) const {
+            return s.emplace_decomposable_with_hash(key, hashval, std::forward<Args>(args)...);
+        }
+        raw_hash_set& s;
+        size_t hashval;
     };
 
     template <bool do_destroy>
@@ -1758,8 +1832,10 @@ private:
         auto layout = MakeLayout(capacity_);
         // Unpoison before returning the memory to the allocator.
         SanitizerUnpoisonMemoryRegion(slots_, sizeof(slot_type) * capacity_);
-        Deallocate<Layout::Alignment()>(&alloc_ref(), ctrl_, layout.AllocSize());
-        ctrl_ = EmptyGroup();
+        if (ctrl_ != EmptyGroup()) {
+            Deallocate<Layout::Alignment()>(&alloc_ref(), ctrl_, layout.AllocSize());
+            ctrl_ = EmptyGroup();
+        }
         slots_ = nullptr;
         size_ = 0;
         capacity_ = 0;
@@ -1772,7 +1848,12 @@ private:
         auto* old_slots = slots_;
         const size_t old_capacity = capacity_;
         capacity_ = new_capacity;
-        initialize_slots();
+        try {
+            initialize_slots();
+        } catch (std::bad_alloc const& e) {
+            capacity_ = old_capacity;
+            throw e;
+        }
 
         for (size_t i = 0; i != old_capacity; ++i) {
             if (IsFull(old_ctrl[i])) {
@@ -1788,6 +1869,8 @@ private:
             auto layout = MakeLayout(old_capacity);
             Deallocate<Layout::Alignment()>(&alloc_ref(), old_ctrl, layout.AllocSize());
         }
+
+        infoz_.RecordRehash(new_capacity);
     }
 
     void drop_deletes_without_resize() PHMAP_ATTRIBUTE_NOINLINE {
@@ -1974,6 +2057,9 @@ protected:
     iterator iterator_at(size_t i) { return {ctrl_ + i, slots_ + i}; }
     const_iterator iterator_at(size_t i) const { return {ctrl_ + i, slots_ + i}; }
 
+public:
+    const HashtablezInfoHandle& infoz() const { return infoz_; }
+
 private:
     friend struct RawHashSetTestOnlyAccess;
 
@@ -2075,15 +2161,15 @@ public:
     template <class K>
     using key_arg = typename KeyArgImpl::template type<K, key_type>;
 
-    static_assert(!std::is_reference<key_type>::value, "");
+    static_assert(!std::is_reference<key_type>::value);
     // TODO(alkis): remove this assertion and verify that reference mapped_type is
     // supported.
-    static_assert(!std::is_reference<mapped_type>::value, "");
+    static_assert(!std::is_reference<mapped_type>::value);
 
     using iterator = typename raw_hash_map::raw_hash_set::iterator;
     using const_iterator = typename raw_hash_map::raw_hash_set::const_iterator;
 
-    raw_hash_map() {}
+    raw_hash_map() = default;
     using Base::raw_hash_set; // use raw_hash_set constructor
 
     // The last two template parameters ensure that both arguments are rvalues
@@ -2320,7 +2406,7 @@ public:
         using EmbeddedSet = typename parallel_hash_set::EmbeddedSet;
         using EmbeddedIterator = typename EmbeddedSet::iterator;
 
-        iterator() {}
+        iterator() = default;
 
         reference operator*() const { return *it_; }
         pointer operator->() const { return &operator*(); }
@@ -2381,7 +2467,7 @@ public:
         using difference_type = typename parallel_hash_set::difference_type;
         using Inner = typename parallel_hash_set::Inner;
 
-        const_iterator() {}
+        const_iterator() = default;
         // Implicit construction from iterator.
         const_iterator(iterator i) : iter_(std::move(i)) {}
 
@@ -2530,7 +2616,7 @@ public:
         return *this;
     }
 
-    ~parallel_hash_set() {}
+    ~parallel_hash_set() = default;
 
     iterator begin() {
         auto it = iterator(&sets_[0], &sets_[0] + num_tables, sets_[0].set_.begin());
@@ -2686,7 +2772,7 @@ public:
         Inner& inner = sets_[subidx(hashval)];
         auto& set = inner.set_;
         typename Lockable::UniqueLock m(inner);
-        return make_rv(&inner, set.emplace_decomposable(key, hashval, std::forward<Args>(args)...));
+        return make_rv(&inner, set.emplace_decomposable_with_hash(key, hashval, std::forward<Args>(args)...));
     }
 
     struct EmplaceDecomposableHashval {
@@ -2754,7 +2840,7 @@ public:
         Inner& inner = sets_[subidx(hashval)];
         auto& set = inner.set_;
         typename Lockable::UniqueLock m(inner);
-        return make_rv(&inner, set.emplace_decomposable(key, hashval, std::forward<Args>(args)...));
+        return make_rv(&inner, set.emplace_decomposable_with_hash(key, hashval, std::forward<Args>(args)...));
     }
 
     struct EmplaceDecomposable {
@@ -2849,6 +2935,11 @@ public:
     template <class K = key_type>
     size_type erase(const key_arg<K>& key) {
         auto hashval = this->hash(key);
+        return erase_with_hash(key, hashval);
+    }
+
+    template <class K = key_type>
+    size_type erase_with_hash(const key_arg<K>& key, size_t hashval) {
         Inner& inner = sets_[subidx(hashval)];
         auto& set = inner.set_;
         typename Lockable::UpgradeLock m(inner);
@@ -3281,15 +3372,15 @@ public:
     template <class K>
     using key_arg = typename KeyArgImpl::template type<K, key_type>;
 
-    static_assert(!std::is_reference<key_type>::value, "");
+    static_assert(!std::is_reference<key_type>::value);
     // TODO(alkis): remove this assertion and verify that reference mapped_type is
     // supported.
-    static_assert(!std::is_reference<mapped_type>::value, "");
+    static_assert(!std::is_reference<mapped_type>::value);
 
     using iterator = typename parallel_hash_map::parallel_hash_set::iterator;
     using const_iterator = typename parallel_hash_map::parallel_hash_set::const_iterator;
 
-    parallel_hash_map() {}
+    parallel_hash_map() = default;
 
 #ifdef __INTEL_COMPILER
     using Base::parallel_hash_set;
@@ -3710,7 +3801,7 @@ struct FlatHashMapPolicy {
 
 template <class Reference, class Policy>
 struct node_hash_policy {
-    static_assert(std::is_lvalue_reference<Reference>::value, "");
+    static_assert(std::is_lvalue_reference<Reference>::value);
 
     using slot_type = typename std::remove_cv<typename std::remove_reference<Reference>::type>::type*;
 
@@ -3822,99 +3913,6 @@ public:
     static const Value& value(const value_type* elem) { return elem->second; }
 };
 
-// --------------------------------------------------------------------------
-//  hash_default
-// --------------------------------------------------------------------------
-
-#if PHMAP_HAVE_STD_STRING_VIEW
-
-// support char16_t wchar_t ....
-template <class CharT>
-struct StringHashT {
-    using is_transparent = void;
-
-    size_t operator()(std::basic_string_view<CharT> v) const {
-        std::string_view bv{reinterpret_cast<const char*>(v.data()), v.size() * sizeof(CharT)};
-        return std::hash<std::string_view>()(bv);
-    }
-};
-
-// Supports heterogeneous lookup for basic_string<T>-like elements.
-template <class CharT>
-struct StringHashEqT {
-    using Hash = StringHashT<CharT>;
-
-    struct Eq {
-        using is_transparent = void;
-
-        bool operator()(std::basic_string_view<CharT> lhs, std::basic_string_view<CharT> rhs) const {
-            return lhs == rhs;
-        }
-    };
-};
-
-template <>
-struct HashEq<std::string> : StringHashEqT<char> {};
-
-template <>
-struct HashEq<std::string_view> : StringHashEqT<char> {};
-
-// char16_t
-template <>
-struct HashEq<std::u16string> : StringHashEqT<char16_t> {};
-
-template <>
-struct HashEq<std::u16string_view> : StringHashEqT<char16_t> {};
-
-// wchar_t
-template <>
-struct HashEq<std::wstring> : StringHashEqT<wchar_t> {};
-
-template <>
-struct HashEq<std::wstring_view> : StringHashEqT<wchar_t> {};
-
-#endif
-
-// Supports heterogeneous lookup for pointers and smart pointers.
-// -------------------------------------------------------------
-template <class T>
-struct HashEq<T*> {
-    struct Hash {
-        using is_transparent = void;
-        template <class U>
-        size_t operator()(const U& ptr) const {
-            return phmap::Hash<const T*>{}(HashEq::ToPtr(ptr));
-        }
-    };
-
-    struct Eq {
-        using is_transparent = void;
-        template <class A, class B>
-        bool operator()(const A& a, const B& b) const {
-            return HashEq::ToPtr(a) == HashEq::ToPtr(b);
-        }
-    };
-
-private:
-    static const T* ToPtr(const T* ptr) { return ptr; }
-
-    template <class U, class D>
-    static const T* ToPtr(const std::unique_ptr<U, D>& ptr) {
-        return ptr.get();
-    }
-
-    template <class U>
-    static const T* ToPtr(const std::shared_ptr<U>& ptr) {
-        return ptr.get();
-    }
-};
-
-template <class T, class D>
-struct HashEq<std::unique_ptr<T, D>> : HashEq<T*> {};
-
-template <class T>
-struct HashEq<std::shared_ptr<T>> : HashEq<T*> {};
-
 namespace hashtable_debug_internal {
 
 // --------------------------------------------------------------------------
@@ -3999,7 +3997,7 @@ class flat_hash_set : public phmap::priv::raw_hash_set<phmap::priv::FlatHashSetP
     using Base = typename flat_hash_set::raw_hash_set;
 
 public:
-    flat_hash_set() {}
+    flat_hash_set() = default;
 #ifdef __INTEL_COMPILER
     using Base::raw_hash_set;
 #else
@@ -4015,9 +4013,12 @@ public:
     using Base::size;
     using Base::clear; // may shrink - To avoid shrinking `erase(begin(), end())`
     using Base::erase;
+    using Base::erase_with_hash;
     using Base::insert;
     using Base::emplace;
     using Base::emplace_hint;
+    using Base::emplace_with_hash;
+    using Base::emplace_hint_with_hash;
     using Base::extract;
     using Base::merge;
     using Base::swap;
@@ -4059,7 +4060,7 @@ class flat_hash_map : public phmap::priv::raw_hash_map<phmap::priv::FlatHashMapP
     using Base = typename flat_hash_map::raw_hash_map;
 
 public:
-    flat_hash_map() {}
+    flat_hash_map() = default;
 #ifdef __INTEL_COMPILER
     using Base::raw_hash_map;
 #else
@@ -4120,7 +4121,7 @@ class node_hash_set : public phmap::priv::raw_hash_set<phmap::priv::NodeHashSetP
     using Base = typename node_hash_set::raw_hash_set;
 
 public:
-    node_hash_set() {}
+    node_hash_set() = default;
 #ifdef __INTEL_COMPILER
     using Base::raw_hash_set;
 #else
@@ -4181,7 +4182,7 @@ class node_hash_map : public phmap::priv::raw_hash_map<phmap::priv::NodeHashMapP
     using Base = typename node_hash_map::raw_hash_map;
 
 public:
-    node_hash_map() {}
+    node_hash_map() = default;
 #ifdef __INTEL_COMPILER
     using Base::raw_hash_map;
 #else
@@ -4235,7 +4236,7 @@ class parallel_flat_hash_set
     using Base = typename parallel_flat_hash_set::parallel_hash_set;
 
 public:
-    parallel_flat_hash_set() {}
+    parallel_flat_hash_set() = default;
 #ifdef __INTEL_COMPILER
     using Base::parallel_hash_set;
 #else
@@ -4254,6 +4255,7 @@ public:
     using Base::size;
     using Base::clear;
     using Base::erase;
+    using Base::erase_with_hash;
     using Base::insert;
     using Base::emplace;
     using Base::emplace_hint;
@@ -4286,7 +4288,7 @@ class parallel_flat_hash_map
     using Base = typename parallel_flat_hash_map::parallel_hash_map;
 
 public:
-    parallel_flat_hash_map() {}
+    parallel_flat_hash_map() = default;
 #ifdef __INTEL_COMPILER
     using Base::parallel_hash_map;
 #else
@@ -4342,7 +4344,7 @@ class parallel_node_hash_set
     using Base = typename parallel_node_hash_set::parallel_hash_set;
 
 public:
-    parallel_node_hash_set() {}
+    parallel_node_hash_set() = default;
 #ifdef __INTEL_COMPILER
     using Base::parallel_hash_set;
 #else
@@ -4395,7 +4397,7 @@ class parallel_node_hash_map
     using Base = typename parallel_node_hash_map::parallel_hash_map;
 
 public:
-    parallel_node_hash_map() {}
+    parallel_node_hash_map() = default;
 #ifdef __INTEL_COMPILER
     using Base::parallel_hash_map;
 #else

@@ -1,10 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "column/decimalv3_column.h"
 
 #include "column/fixed_length_column.h"
 
 namespace starrocks::vectorized {
+
+template <typename T>
+DecimalV3Column<T>::DecimalV3Column(size_t num_rows) {
+    this->resize(num_rows);
+}
+
 template <typename T>
 DecimalV3Column<T>::DecimalV3Column(int precision, int scale) : _precision(precision), _scale(scale) {
     DCHECK(0 <= _scale && _scale <= _precision && _precision <= decimal_precision_limit<T>);
@@ -58,7 +64,7 @@ std::string DecimalV3Column<T>::debug_item(uint32_t idx) const {
 }
 
 template <typename T>
-void DecimalV3Column<T>::crc32_hash(uint32_t* hash, uint16_t from, uint16_t to) const {
+void DecimalV3Column<T>::crc32_hash(uint32_t* hash, uint32_t from, uint32_t to) const {
     const auto& data = this->get_data();
     // When decimal-v2 columns are used as distribution keys and users try to upgrade
     // decimal-v2 column to decimal-v3 by schema change, decimal128(27,9) shall be the
@@ -66,7 +72,7 @@ void DecimalV3Column<T>::crc32_hash(uint32_t* hash, uint16_t from, uint16_t to) 
     // compatible with type decimal-v2 is required in order to keep data layout consistency.
     if constexpr (std::is_same_v<T, int128_t>) {
         if (_precision == 27 && _scale == 9) {
-            for (uint16_t i = from; i < to; ++i) {
+            for (uint32_t i = from; i < to; ++i) {
                 auto& decimal_v2_value = (DecimalV2Value&)(data[i]);
                 int64_t int_val = decimal_v2_value.int_value();
                 int32_t frac_val = decimal_v2_value.frac_value();
@@ -76,9 +82,29 @@ void DecimalV3Column<T>::crc32_hash(uint32_t* hash, uint16_t from, uint16_t to) 
             return;
         }
     }
-    for (uint16_t i = from; i < to; ++i) {
+    for (uint32_t i = from; i < to; ++i) {
         hash[i] = HashUtil::zlib_crc_hash(&data[i], sizeof(T), hash[i]);
     }
+}
+
+template <typename T>
+int64_t DecimalV3Column<T>::xor_checksum(uint32_t from, uint32_t to) const {
+    // The XOR of DecimalV3Column
+    // XOR all the decimals one by one
+    auto& data = this->get_data();
+    int64_t xor_checksum = 0;
+    const T* src = reinterpret_cast<const T*>(data.data());
+
+    for (size_t i = from; i < to; ++i) {
+        if constexpr (std::is_same_v<T, int128_t>) {
+            xor_checksum ^= (src[i] >> 64);
+            xor_checksum ^= (src[i] & ULLONG_MAX);
+        } else {
+            xor_checksum ^= src[i];
+        }
+    }
+
+    return xor_checksum;
 }
 
 template class DecimalV3Column<int32_t>;

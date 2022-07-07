@@ -1,20 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.transformer;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.starrocks.analysis.AnalyticExpr;
 import com.starrocks.analysis.ArithmeticExpr;
 import com.starrocks.analysis.ArrayElementExpr;
 import com.starrocks.analysis.ArrayExpr;
+import com.starrocks.analysis.ArraySliceExpr;
+import com.starrocks.analysis.ArrowExpr;
 import com.starrocks.analysis.BetweenPredicate;
 import com.starrocks.analysis.BinaryPredicate;
 import com.starrocks.analysis.CaseExpr;
 import com.starrocks.analysis.CastExpr;
+import com.starrocks.analysis.CloneExpr;
 import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.DateLiteral;
 import com.starrocks.analysis.ExistsPredicate;
 import com.starrocks.analysis.Expr;
-import com.starrocks.analysis.FieldReference;
 import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.GroupingFunctionCallExpr;
 import com.starrocks.analysis.InPredicate;
@@ -23,24 +26,35 @@ import com.starrocks.analysis.IsNullPredicate;
 import com.starrocks.analysis.LikePredicate;
 import com.starrocks.analysis.LiteralExpr;
 import com.starrocks.analysis.NullLiteral;
+import com.starrocks.analysis.ParseNode;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.Subquery;
 import com.starrocks.analysis.SysVariableDesc;
 import com.starrocks.analysis.TimestampArithmeticExpr;
+import com.starrocks.catalog.Function;
+import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.Type;
-import com.starrocks.sql.analyzer.ExprVisitor;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.AST2SQL;
+import com.starrocks.sql.analyzer.RelationFields;
+import com.starrocks.sql.analyzer.RelationId;
 import com.starrocks.sql.analyzer.ResolvedField;
+import com.starrocks.sql.analyzer.Scope;
 import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.ast.FieldReference;
 import com.starrocks.sql.common.ErrorType;
 import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.operator.scalar.ArrayElementOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ArrayOperator;
+import com.starrocks.sql.optimizer.operator.scalar.ArraySliceOperator;
 import com.starrocks.sql.optimizer.operator.scalar.BetweenPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CaseWhenOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CastOperator;
+import com.starrocks.sql.optimizer.operator.scalar.CloneOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CompoundPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
@@ -55,9 +69,9 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static com.starrocks.sql.common.UnsupportedException.unsupportedException;
@@ -75,28 +89,36 @@ public final class SqlToScalarOperatorTranslator {
                                                                  ColumnRefFactory columnRefFactory) {
         ColumnRefOperator columnRef;
         ScalarOperator scalarOperator = SqlToScalarOperatorTranslator.translate(expression, expressionMapping);
-        if (expressionMapping.hasExpression(expression) || scalarOperator.isColumnRef()) {
+        if (scalarOperator.isColumnRef()) {
             columnRef = (ColumnRefOperator) scalarOperator;
+        } else if (scalarOperator.isVariable() && projections.containsValue(scalarOperator)) {
+            columnRef = projections.entrySet().stream().filter(e -> scalarOperator.equals(e.getValue())).findAny().map(
+                    Map.Entry::getKey).orElse(null);
+            Preconditions.checkNotNull(columnRef);
         } else {
-            columnRef = columnRefFactory.create(expression, expression.getType(), expression.isNullable());
+            columnRef = columnRefFactory.create(expression, expression.getType(), scalarOperator.isNullable());
         }
         projections.put(columnRef, scalarOperator);
         return columnRef;
     }
 
     public static ScalarOperator translate(Expr expression, ExpressionMapping expressionMapping) {
-        return translate(expression, expressionMapping, null, null);
+        List<ColumnRefOperator> correlation = new ArrayList<>();
+        ScalarOperator rewriteScalarOp = translate(expression, expressionMapping, correlation);
+        if (!correlation.isEmpty()) {
+            throw unsupportedException("Only support use correlated columns in the where clause of subqueries");
+        }
+        return rewriteScalarOp;
     }
 
     public static ScalarOperator translate(Expr expression, ExpressionMapping expressionMapping,
-                                           ExpressionMapping outer,
                                            List<ColumnRefOperator> correlation) {
         ColumnRefOperator columnRefOperator = expressionMapping.get(expression);
         if (columnRefOperator != null) {
             return columnRefOperator;
         }
 
-        Visitor visitor = new Visitor(expressionMapping, outer, correlation);
+        Visitor visitor = new Visitor(expressionMapping, correlation);
         ScalarOperator result = visitor.visit(expression, null);
 
         ScalarOperatorRewriter scalarRewriter = new ScalarOperatorRewriter();
@@ -106,15 +128,18 @@ public final class SqlToScalarOperatorTranslator {
         return result;
     }
 
-    public static ScalarOperator translateWithoutRewrite(Expr expression, ExpressionMapping expressionMapping,
-                                                         ExpressionMapping outer,
-                                                         List<ColumnRefOperator> correlation) {
+    public static ScalarOperator translate(Expr expression) {
+        IgnoreSlotVisitor visitor = new IgnoreSlotVisitor();
+        return visitor.visit(expression, null);
+    }
+
+    public static ScalarOperator translateWithoutRewrite(Expr expression, ExpressionMapping expressionMapping) {
         ColumnRefOperator columnRefOperator = expressionMapping.get(expression);
         if (columnRefOperator != null) {
             return columnRefOperator;
         }
 
-        Visitor visitor = new Visitor(expressionMapping, outer, correlation);
+        Visitor visitor = new Visitor(expressionMapping, new ArrayList<>());
         ScalarOperator result = visitor.visit(expression, null);
 
         ScalarOperatorRewriter scalarRewriter = new ScalarOperatorRewriter();
@@ -124,15 +149,12 @@ public final class SqlToScalarOperatorTranslator {
         return result;
     }
 
-    private static class Visitor extends ExprVisitor<ScalarOperator, Void> {
+    static class Visitor extends AstVisitor<ScalarOperator, Void> {
         private final ExpressionMapping expressionMapping;
-        private final ExpressionMapping outer;
         private final List<ColumnRefOperator> correlation;
 
-        private Visitor(ExpressionMapping expressionMapping, ExpressionMapping outer,
-                        List<ColumnRefOperator> correlation) {
+        private Visitor(ExpressionMapping expressionMapping, List<ColumnRefOperator> correlation) {
             this.expressionMapping = expressionMapping;
-            this.outer = outer;
             this.correlation = correlation;
         }
 
@@ -143,27 +165,26 @@ public final class SqlToScalarOperatorTranslator {
         }
 
         @Override
-        public ScalarOperator visit(Expr node) {
-            if (expressionMapping.get(node) != null && !(node.isConstant())) {
-                return expressionMapping.get(node);
+        public ScalarOperator visit(ParseNode node) {
+            Expr expr = (Expr) node;
+            if (expressionMapping.get(expr) != null && !(expr.isConstant())) {
+                return expressionMapping.get(expr);
             }
             return super.visit(node);
         }
 
         @Override
         public ScalarOperator visitSlot(SlotRef node, Void context) {
-            Optional<ResolvedField> resolvedField = expressionMapping.getScope().tryResolveFeild(node);
-            if (resolvedField.isPresent()) {
-                return expressionMapping.getColumnRefWithIndex(resolvedField.get().getRelationFieldIndex());
-            } else {
-                if (outer == null) {
-                    throw new SemanticException("Column '%s' cannot be resolved", node.toSql());
-                }
-                ColumnRefOperator correlatedColumnRef = outer.getColumnRefWithIndex(
-                        outer.getScope().resolveField(node).getRelationFieldIndex());
-                correlation.add(correlatedColumnRef);
-                return correlatedColumnRef;
+            ResolvedField resolvedField =
+                    expressionMapping.getScope().resolveField(node, expressionMapping.getOuterScopeRelationId());
+
+            ColumnRefOperator columnRefOperator =
+                    expressionMapping.getColumnRefWithIndex(resolvedField.getRelationFieldIndex());
+
+            if (resolvedField.getScope().getRelationId().equals(expressionMapping.getOuterScopeRelationId())) {
+                correlation.add(columnRefOperator);
             }
+            return columnRefOperator;
         }
 
         @Override
@@ -187,6 +208,31 @@ public final class SqlToScalarOperatorTranslator {
             ScalarOperator arrayOperator = visit(node.getChild(0));
             ScalarOperator subscriptOperator = visit(node.getChild(1));
             return new ArrayElementOperator(node.getType(), arrayOperator, subscriptOperator);
+        }
+
+        @Override
+        public ScalarOperator visitArraySliceExpr(ArraySliceExpr node, Void context) {
+            ScalarOperator arrayOperator = visit(node.getChild(0));
+            ScalarOperator lowerBound = visit(node.getChild(1));
+            ScalarOperator upperBound = visit(node.getChild(2));
+            return new ArraySliceOperator(node.getType(), Lists.newArrayList(arrayOperator, lowerBound, upperBound));
+        }
+
+        @Override
+        public ScalarOperator visitArrowExpr(ArrowExpr node, Void context) {
+            Preconditions.checkArgument(node.getChildren().size() == 2);
+
+            // TODO(mofei) make it more elegant
+            Function func = GlobalStateMgr.getCurrentState().getFunction(FunctionSet.JSON_QUERY_FUNC,
+                    Function.CompareMode.IS_IDENTICAL);
+            Preconditions.checkNotNull(func, "json_query function not exists");
+
+            List<ScalarOperator> arguments = node.getChildren().stream().map(this::visit).collect(Collectors.toList());
+            return new CallOperator(
+                    FunctionSet.JSON_QUERY,
+                    Type.JSON,
+                    arguments,
+                    func);
         }
 
         @Override
@@ -356,6 +402,20 @@ public final class SqlToScalarOperatorTranslator {
         }
 
         @Override
+        public ScalarOperator visitAnalyticExpr(AnalyticExpr expr, Void context) {
+            FunctionCallExpr functionCallExpr = expr.getFnCall();
+
+            List<ScalarOperator> arguments =
+                    functionCallExpr.getChildren().stream().map(this::visit).collect(Collectors.toList());
+            return new CallOperator(
+                    functionCallExpr.getFnName().getFunction(),
+                    functionCallExpr.getType(),
+                    arguments,
+                    functionCallExpr.getFn(),
+                    functionCallExpr.getParams().isDistinct());
+        }
+
+        @Override
         public ScalarOperator visitCastExpr(CastExpr node, Void context) {
             return new CastOperator(node.getType(), visit(node.getChild(0)), node.isImplicit());
         }
@@ -431,7 +491,25 @@ public final class SqlToScalarOperatorTranslator {
 
         @Override
         public ScalarOperator visitSubquery(Subquery node, Void context) {
-            throw unsupportedException("complex subquery on " + node.toSql());
+            throw unsupportedException("complex subquery on " + AST2SQL.toString(node));
+        }
+
+        @Override
+        public ScalarOperator visitCloneExpr(CloneExpr node, Void context) {
+            return new CloneOperator(visit(node.getChild(0)));
+        }
+    }
+
+    static class IgnoreSlotVisitor extends Visitor {
+        public IgnoreSlotVisitor() {
+            super(new ExpressionMapping(new Scope(RelationId.anonymous(), new RelationFields())),
+                    Collections.EMPTY_LIST);
+        }
+
+        @Override
+        public ScalarOperator visitSlot(SlotRef node, Void context) {
+            return new ColumnRefOperator(node.getSlotId().asInt(),
+                    node.getType(), node.getColumnName(), node.isNullable());
         }
     }
 }

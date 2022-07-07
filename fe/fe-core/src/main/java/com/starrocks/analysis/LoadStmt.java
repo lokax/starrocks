@@ -25,7 +25,7 @@ import com.google.common.base.Function;
 import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
-import com.starrocks.catalog.Catalog;
+import com.starrocks.catalog.CatalogUtils;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.UserException;
@@ -35,6 +35,7 @@ import com.starrocks.load.EtlJobType;
 import com.starrocks.load.Load;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
 
 import java.util.List;
 import java.util.Map;
@@ -78,6 +79,7 @@ public class LoadStmt extends DdlStmt {
     private static final String VERSION = "version";
     public static final String STRICT_MODE = "strict_mode";
     public static final String TIMEZONE = "timezone";
+    public static final String PARTIAL_UPDATE = "partial_update";
 
     // for load data from Baidu Object Store(BOS)
     public static final String BOS_ENDPOINT = "bos_endpoint";
@@ -113,6 +115,7 @@ public class LoadStmt extends DdlStmt {
             .add(STRICT_MODE)
             .add(VERSION)
             .add(TIMEZONE)
+            .add(PARTIAL_UPDATE)
             .build();
 
     public LoadStmt(LabelName label, List<DataDescription> dataDescriptions,
@@ -287,7 +290,7 @@ public class LoadStmt extends DdlStmt {
             resourceDesc.analyze();
             etlJobType = resourceDesc.getEtlJobType();
             // check resource usage privilege
-            if (!Catalog.getCurrentCatalog().getAuth().checkResourcePriv(ConnectContext.get(),
+            if (!GlobalStateMgr.getCurrentState().getAuth().checkResourcePriv(ConnectContext.get(),
                     resourceDesc.getName(),
                     PrivPredicate.USAGE)) {
                 throw new AnalysisException("USAGE denied to user '" + ConnectContext.get().getQualifiedUser()
@@ -300,6 +303,12 @@ public class LoadStmt extends DdlStmt {
             // if cluster is null, use default hadoop cluster
             // if cluster is not null, use this hadoop cluster
             etlJobType = EtlJobType.HADOOP;
+        }
+
+        if (etlJobType == EtlJobType.SPARK) {
+            for (DataDescription dataDescription : dataDescriptions) {
+                CatalogUtils.checkOlapTableHasStarOSPartition(label.getDbName(), dataDescription.getTableName());
+            }
         }
 
         try {

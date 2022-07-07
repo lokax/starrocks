@@ -24,7 +24,7 @@
 #include <functional>
 
 #include "common/config.h"
-#include "env/env.h"
+#include "fs/fs.h"
 #include "gutil/stl_util.h"
 #include "gutil/strings/substitute.h"
 #include "http/ev_http_server.h"
@@ -83,8 +83,6 @@ void WebPageHandler::register_page(const std::string& path, const string& alias,
 }
 
 void WebPageHandler::handle(HttpRequest* req) {
-    LOG(INFO) << req->debug_string();
-
     PathHandler* handler = nullptr;
     {
         std::unique_lock lock(_map_lock);
@@ -130,7 +128,7 @@ static const std::string kMainTemplate = R"(
     <meta charset='utf-8'/>
     <link href='/bootstrap/css/bootstrap.min.css' rel='stylesheet' media='screen' />
     <link href='/bootstrap/css/bootstrap-table.min.css' rel='stylesheet' media='screen' />
-    <script src='/jquery-3.2.1.min.js' defer></script>
+    <script src='/jquery-3.5.0.min.js' defer></script>
     <script src='/bootstrap/js/bootstrap.min.js' defer></script>
     <script src='/bootstrap/js/bootstrap-table.min.js' defer></script>
     <script src='/starrocks.js' defer></script>
@@ -174,15 +172,15 @@ std::string WebPageHandler::mustache_partial_tag(const std::string& path) const 
 }
 
 bool WebPageHandler::static_pages_available() const {
-    bool is_dir = false;
-    return Env::Default()->is_directory(_www_path, &is_dir).ok() && is_dir;
+    const StatusOr<bool> status_or = FileSystem::Default()->is_directory(_www_path);
+    return status_or.ok() && status_or.value();
 }
 
 bool WebPageHandler::mustache_template_available(const std::string& path) const {
     if (!static_pages_available()) {
         return false;
     }
-    return Env::Default()->path_exists(strings::Substitute("$0/$1.mustache", _www_path, path)).ok();
+    return FileSystem::Default()->path_exists(strings::Substitute("$0/$1.mustache", _www_path, path)).ok();
 }
 
 void WebPageHandler::render_main_template(const std::string& content, std::stringstream* output) {

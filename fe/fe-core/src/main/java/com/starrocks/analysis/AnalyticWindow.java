@@ -29,16 +29,21 @@ import com.starrocks.thrift.TAnalyticWindowBoundaryType;
 import com.starrocks.thrift.TAnalyticWindowType;
 
 import java.math.BigDecimal;
+import java.util.Objects;
 
 /**
  * Windowing clause of an analytic expr
  * Both left and right boundaries are always non-null after analyze().
  */
-public class AnalyticWindow {
+public class AnalyticWindow implements ParseNode {
     // default window used when an analytic expr was given an order by but no window
     public static final AnalyticWindow DEFAULT_WINDOW = new AnalyticWindow(Type.RANGE,
             new Boundary(BoundaryType.UNBOUNDED_PRECEDING, null),
             new Boundary(BoundaryType.CURRENT_ROW, null));
+
+    public static final AnalyticWindow DEFAULT_ROWS_WINDOW = new AnalyticWindow(AnalyticWindow.Type.ROWS,
+            new AnalyticWindow.Boundary(AnalyticWindow.BoundaryType.UNBOUNDED_PRECEDING, null),
+            new AnalyticWindow.Boundary(AnalyticWindow.BoundaryType.CURRENT_ROW, null));
 
     public enum Type {
         ROWS("ROWS"),
@@ -128,7 +133,7 @@ public class AnalyticWindow {
         }
     }
 
-    public static class Boundary {
+    public static class Boundary implements ParseNode {
         private BoundaryType type;
 
         // Offset expr. Only set for PRECEDING/FOLLOWING. Needed for toSql().
@@ -171,6 +176,17 @@ public class AnalyticWindow {
             return sb.toString();
         }
 
+        public String toDigest() {
+            StringBuilder sb = new StringBuilder();
+
+            if (expr != null) {
+                sb.append(expr.toDigest()).append(" ");
+            }
+
+            sb.append(type.toString());
+            return sb.toString();
+        }
+
         public TAnalyticWindowBoundary toThrift(Type windowType) {
             TAnalyticWindowBoundary result = new TAnalyticWindowBoundary(type.toThrift());
 
@@ -200,6 +216,11 @@ public class AnalyticWindow {
             }
 
             return type == o.type && exprEqual;
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(type, expr, offsetValue);
         }
 
         public Boundary converse() {
@@ -307,6 +328,20 @@ public class AnalyticWindow {
         return sb.toString();
     }
 
+    public String toDigest() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(type_.toString().toLowerCase()).append(" ");
+
+        if (rightBoundary_ == null) {
+            sb.append(leftBoundary_.toDigest());
+        } else {
+            sb.append("between ").append(leftBoundary_.toDigest()).append(" and ");
+            sb.append(rightBoundary_.toDigest());
+        }
+
+        return sb.toString();
+    }
+
     public TAnalyticWindow toThrift() {
         TAnalyticWindow result = new TAnalyticWindow(type_.toThrift());
 
@@ -344,6 +379,11 @@ public class AnalyticWindow {
         return type_ == o.type_
                 && leftBoundary_.equals(o.leftBoundary_)
                 && rightBoundaryEqual;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(type_, leftBoundary_, rightBoundary_);
     }
 
     @Override
@@ -390,7 +430,7 @@ public class AnalyticWindow {
                                 + "constant positive number: " + boundary.toSql());
             }
 
-            boundary.offsetValue = new BigDecimal(val);
+            boundary.offsetValue = BigDecimal.valueOf(val);
         }
     }
 

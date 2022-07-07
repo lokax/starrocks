@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -101,6 +101,11 @@ inline int clz128(unsigned __int128 v) {
 }
 
 inline bool int128_mul_overflow(int128_t a, int128_t b, int128_t* c) {
+    if (a == 0 || b == 0) {
+        *c = 0;
+        return false;
+    }
+
     // sgn(x)
     auto sa = a >> 127;
     // sgn(y)
@@ -113,7 +118,7 @@ inline bool int128_mul_overflow(int128_t a, int128_t b, int128_t* c) {
     *c = a * b;
     // sgn(x * y) and abs(x) * abs(y) produces x * y;
     *c = (*c ^ sa) - sa;
-    static constexpr auto int128_max = get_min<int128_t>();
+    static constexpr auto int128_max = get_max<int128_t>();
     return clz128(a) + clz128(b) < sizeof(int128_t) || int128_max / a < b;
 }
 

@@ -49,11 +49,15 @@ Status KafkaDataConsumer::init(StreamLoadContext* ctx) {
 
     // conf has to be deleted finally
     auto conf_deleter = [conf]() { delete conf; };
-    DeferOp delete_conf(std::bind<void>(conf_deleter));
+    DeferOp delete_conf([conf_deleter] { return conf_deleter(); });
 
-    std::stringstream ss;
-    ss << BackendOptions::get_localhost() << "_";
-    std::string group_id = ss.str() + UniqueId::gen_uid().to_string();
+    std::string group_id;
+    auto it = ctx->kafka_info->properties.find("group.id");
+    if (it == ctx->kafka_info->properties.end()) {
+        group_id = BackendOptions::get_localhost() + "_" + UniqueId::gen_uid().to_string();
+    } else {
+        group_id = it->second;
+    }
     LOG(INFO) << "init kafka consumer with group id: " << group_id;
 
     std::string errstr;
@@ -148,7 +152,7 @@ Status KafkaDataConsumer::assign_topic_partitions(const std::map<int32_t, int64_
         std::for_each(topic_partitions.begin(), topic_partitions.end(),
                       [](RdKafka::TopicPartition* tp1) { delete tp1; });
     };
-    DeferOp delete_tp(std::bind<void>(tp_deleter));
+    DeferOp delete_tp([tp_deleter] { return tp_deleter(); });
 
     // assign partition
     RdKafka::ErrorCode err = _k_consumer->assign(topic_partitions);
@@ -186,7 +190,8 @@ Status KafkaDataConsumer::group_consume(TimedBlockingQueue<RdKafka::Message*>* q
         bool done = false;
         // consume 1 message at a time
         consumer_watch.start();
-        std::unique_ptr<RdKafka::Message> msg(_k_consumer->consume(1000 /* timeout, ms */));
+        int64_t consume_timeout = std::min<int64_t>(left_time, config::routine_load_kafka_timeout_second * 1000);
+        std::unique_ptr<RdKafka::Message> msg(_k_consumer->consume(consume_timeout /* timeout, ms */));
         consumer_watch.stop();
         switch (msg->err()) {
         case RdKafka::ERR_NO_ERROR:
@@ -199,11 +204,14 @@ Status KafkaDataConsumer::group_consume(TimedBlockingQueue<RdKafka::Message*>* q
             }
             ++received_rows;
             break;
-        case RdKafka::ERR__TIMED_OUT:
-            // leave the status as OK, because this may happend
+        case RdKafka::ERR__TIMED_OUT: {
+            // leave the status as OK, because this may happened
             // if there is no data in kafka.
-            LOG(INFO) << "kafka consume timeout: " << _id;
+            std::stringstream ss;
+            ss << msg->errstr() << ", timeout " << consume_timeout;
+            LOG(INFO) << "kafka consume timeout: " << _id << " msg " << ss.str();
             break;
+        }
         case RdKafka::ERR_OFFSET_OUT_OF_RANGE: {
             done = true;
             std::stringstream ss;
@@ -236,17 +244,18 @@ Status KafkaDataConsumer::group_consume(TimedBlockingQueue<RdKafka::Message*>* q
 Status KafkaDataConsumer::get_partition_offset(std::vector<int32_t>* partition_ids,
                                                std::vector<int64_t>* beginning_offsets,
                                                std::vector<int64_t>* latest_offsets) {
+    _last_visit_time = time(nullptr);
     beginning_offsets->reserve(partition_ids->size());
     latest_offsets->reserve(partition_ids->size());
     for (auto p_id : *partition_ids) {
         int64_t beginning_offset;
         int64_t latest_offset;
-        RdKafka::ErrorCode err =
-                _k_consumer->query_watermark_offsets(_topic, p_id, &beginning_offset, &latest_offset, 5000);
+        RdKafka::ErrorCode err = _k_consumer->query_watermark_offsets(_topic, p_id, &beginning_offset, &latest_offset,
+                                                                      config::routine_load_kafka_timeout_second * 1000);
         if (err != RdKafka::ERR_NO_ERROR) {
-            LOG(WARNING) << "failed to query wartermark offset of topic: " << _topic << " partition: " << p_id
+            LOG(WARNING) << "failed to query watermark offset of topic: " << _topic << " partition: " << p_id
                          << ", err: " << RdKafka::err2str(err);
-            return Status::InternalError("failed to query wartermark offset, err: " + RdKafka::err2str(err));
+            return Status::InternalError("failed to query watermark offset, err: " + RdKafka::err2str(err));
         }
         beginning_offsets->push_back(beginning_offset);
         latest_offsets->push_back(latest_offset);
@@ -256,10 +265,11 @@ Status KafkaDataConsumer::get_partition_offset(std::vector<int32_t>* partition_i
 }
 
 Status KafkaDataConsumer::get_partition_meta(std::vector<int32_t>* partition_ids) {
+    _last_visit_time = time(nullptr);
     // create topic conf
     RdKafka::Conf* tconf = RdKafka::Conf::create(RdKafka::Conf::CONF_TOPIC);
     auto conf_deleter = [tconf]() { delete tconf; };
-    DeferOp delete_conf(std::bind<void>(conf_deleter));
+    DeferOp delete_conf([conf_deleter] { return conf_deleter(); });
 
     // create topic
     std::string errstr;
@@ -271,11 +281,12 @@ Status KafkaDataConsumer::get_partition_meta(std::vector<int32_t>* partition_ids
         return Status::InternalError(ss.str());
     }
     auto topic_deleter = [topic]() { delete topic; };
-    DeferOp delete_topic(std::bind<void>(topic_deleter));
+    DeferOp delete_topic([topic_deleter] { return topic_deleter(); });
 
     // get topic metadata
     RdKafka::Metadata* metadata = nullptr;
-    RdKafka::ErrorCode err = _k_consumer->metadata(true /* for this topic */, topic, &metadata, 5000);
+    RdKafka::ErrorCode err = _k_consumer->metadata(true /* for this topic */, topic, &metadata,
+                                                   config::routine_load_kafka_timeout_second * 1000);
     if (err != RdKafka::ERR_NO_ERROR) {
         std::stringstream ss;
         ss << "failed to get partition meta: " << RdKafka::err2str(err);
@@ -283,7 +294,7 @@ Status KafkaDataConsumer::get_partition_meta(std::vector<int32_t>* partition_ids
         return Status::InternalError(ss.str());
     }
     auto meta_deleter = [metadata]() { delete metadata; };
-    DeferOp delete_meta(std::bind<void>(meta_deleter));
+    DeferOp delete_meta([meta_deleter] { return meta_deleter(); });
 
     // get partition ids
     RdKafka::Metadata::TopicMetadataIterator it;
@@ -329,6 +340,7 @@ Status KafkaDataConsumer::cancel(StreamLoadContext* ctx) {
 Status KafkaDataConsumer::reset() {
     std::unique_lock<std::mutex> l(_lock);
     _cancelled = false;
+    _k_consumer->unassign();
     return Status::OK();
 }
 

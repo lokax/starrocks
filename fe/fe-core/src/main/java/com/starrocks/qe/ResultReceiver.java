@@ -22,10 +22,11 @@
 package com.starrocks.qe;
 
 import com.starrocks.common.Status;
+import com.starrocks.common.util.DebugUtil;
 import com.starrocks.metric.MetricRepo;
 import com.starrocks.proto.PFetchDataResult;
 import com.starrocks.proto.PUniqueId;
-import com.starrocks.rpc.BackendServiceProxy;
+import com.starrocks.rpc.BackendServiceClient;
 import com.starrocks.rpc.PFetchDataRequest;
 import com.starrocks.rpc.RpcException;
 import com.starrocks.thrift.TNetworkAddress;
@@ -72,7 +73,7 @@ public class ResultReceiver {
                 PFetchDataRequest request = new PFetchDataRequest(finstId);
 
                 currentThread = Thread.currentThread();
-                Future<PFetchDataResult> future = BackendServiceProxy.getInstance().fetchDataAsync(address, request);
+                Future<PFetchDataResult> future = BackendServiceClient.getInstance().fetchDataAsync(address, request);
                 PFetchDataResult pResult = null;
                 while (pResult == null) {
                     long currentTs = System.currentTimeMillis();
@@ -90,16 +91,16 @@ public class ResultReceiver {
                         }
                     }
                 }
-                TStatusCode code = TStatusCode.findByValue(pResult.status.status_code);
+                TStatusCode code = TStatusCode.findByValue(pResult.status.statusCode);
                 if (code != TStatusCode.OK) {
                     status.setPstatus(pResult.status);
                     return null;
                 }
 
-                rowBatch.setQueryStatistics(pResult.query_statistics);
+                rowBatch.setQueryStatistics(pResult.queryStatistics);
 
-                if (packetIdx != pResult.packet_seq) {
-                    LOG.warn("receive packet failed, expect={}, receive={}", packetIdx, pResult.packet_seq);
+                if (packetIdx != pResult.packetSeq) {
+                    LOG.warn("receive packet failed, expect={}, receive={}", packetIdx, pResult.packetSeq);
                     status.setRpcStatus("receive error packet");
                     return null;
                 }
@@ -118,21 +119,24 @@ public class ResultReceiver {
                 }
             }
         } catch (RpcException e) {
-            LOG.warn("fetch result rpc exception, finstId={}", finstId, e);
+            LOG.warn("fetch result rpc exception, finstId={}", DebugUtil.printId(finstId), e);
             status.setRpcStatus(e.getMessage());
             SimpleScheduler.addToBlacklist(backendId);
         } catch (ExecutionException e) {
-            LOG.warn("fetch result execution exception, finstId={}", finstId, e);
+            LOG.warn("fetch result execution exception, finstId={}", DebugUtil.printId(finstId), e);
             if (e.getMessage().contains("time out")) {
                 // if timeout, we set error code to TIMEOUT, and it will not retry querying.
-                status.setStatus(new Status(TStatusCode.TIMEOUT, e.getMessage()));
+                status.setStatus(new Status(TStatusCode.TIMEOUT,
+                        String.format("Query exceeded time limit of %d seconds",
+                                ConnectContext.get().getSessionVariable().getQueryTimeoutS())));
             } else {
                 status.setRpcStatus(e.getMessage());
                 SimpleScheduler.addToBlacklist(backendId);
             }
         } catch (TimeoutException e) {
-            LOG.warn("fetch result timeout, finstId={}", finstId, e);
-            status.setStatus("query timeout");
+            LOG.warn("fetch result timeout, finstId={}", DebugUtil.printId(finstId), e);
+            status.setStatus(String.format("Query exceeded time limit of %d seconds",
+                    ConnectContext.get().getSessionVariable().getQueryTimeoutS()));
             if (MetricRepo.isInit) {
                 MetricRepo.COUNTER_QUERY_TIMEOUT.increase(1L);
             }

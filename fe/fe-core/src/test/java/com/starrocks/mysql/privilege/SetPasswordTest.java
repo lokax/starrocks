@@ -26,13 +26,14 @@ import com.starrocks.analysis.CreateUserStmt;
 import com.starrocks.analysis.SetPassVar;
 import com.starrocks.analysis.UserDesc;
 import com.starrocks.analysis.UserIdentity;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.mysql.MysqlPassword;
 import com.starrocks.persist.EditLog;
 import com.starrocks.persist.PrivInfo;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.system.SystemInfoService;
 import mockit.Expectations;
 import mockit.Mocked;
@@ -44,7 +45,7 @@ public class SetPasswordTest {
 
     private Auth auth;
     @Mocked
-    public Catalog catalog;
+    public GlobalStateMgr globalStateMgr;
     @Mocked
     private Analyzer analyzer;
     @Mocked
@@ -59,15 +60,15 @@ public class SetPasswordTest {
                 minTimes = 0;
                 result = SystemInfoService.DEFAULT_CLUSTER;
 
-                Catalog.getCurrentCatalog();
+                GlobalStateMgr.getCurrentState();
                 minTimes = 0;
-                result = catalog;
+                result = globalStateMgr;
 
-                catalog.getAuth();
+                globalStateMgr.getAuth();
                 minTimes = 0;
                 result = auth;
 
-                catalog.getEditLog();
+                globalStateMgr.getEditLog();
                 minTimes = 0;
                 result = editLog;
 
@@ -99,8 +100,8 @@ public class SetPasswordTest {
         user1.setIsAnalyzed();
         SetPassVar setPassVar = new SetPassVar(user1, null);
         try {
-            setPassVar.analyze(analyzer);
-        } catch (AnalysisException e) {
+            setPassVar.analyze();
+        } catch (SemanticException e) {
             e.printStackTrace();
             Assert.fail();
         }
@@ -108,8 +109,8 @@ public class SetPasswordTest {
         // set password without for
         SetPassVar setPassVar2 = new SetPassVar(null, null);
         try {
-            setPassVar2.analyze(analyzer);
-        } catch (AnalysisException e) {
+            setPassVar2.analyze();
+        } catch (SemanticException e) {
             e.printStackTrace();
             Assert.fail();
         }
@@ -128,8 +129,8 @@ public class SetPasswordTest {
         // set password without for
         SetPassVar setPassVar3 = new SetPassVar(null, null);
         try {
-            setPassVar3.analyze(analyzer);
-        } catch (AnalysisException e) {
+            setPassVar3.analyze();
+        } catch (SemanticException e) {
             e.printStackTrace();
             Assert.fail();
         }
@@ -139,8 +140,8 @@ public class SetPasswordTest {
         user2.setIsAnalyzed();
         SetPassVar setPassVar4 = new SetPassVar(user2, null);
         try {
-            setPassVar4.analyze(analyzer);
-        } catch (AnalysisException e) {
+            setPassVar4.analyze();
+        } catch (SemanticException e) {
             e.printStackTrace();
             Assert.fail();
         }

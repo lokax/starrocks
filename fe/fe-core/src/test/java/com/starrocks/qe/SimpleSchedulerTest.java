@@ -23,10 +23,10 @@ package com.starrocks.qe;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
-import com.starrocks.catalog.Catalog;
-import com.starrocks.common.FeConstants;
+import com.starrocks.common.Config;
 import com.starrocks.common.Reference;
 import com.starrocks.persist.EditLog;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TScanRangeLocation;
@@ -43,7 +43,7 @@ public class SimpleSchedulerTest {
     static Reference<Long> ref = new Reference<Long>();
 
     @Mocked
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
     @Mocked
     private EditLog editLog;
 
@@ -60,17 +60,17 @@ public class SimpleSchedulerTest {
                 editLog.logBackendStateChange((Backend) any);
                 minTimes = 0;
 
-                catalog.getEditLog();
+                globalStateMgr.getEditLog();
                 minTimes = 0;
                 result = editLog;
             }
         };
 
-        new Expectations(catalog) {
+        new Expectations(globalStateMgr) {
             {
-                Catalog.getCurrentCatalog();
+                GlobalStateMgr.getCurrentState();
                 minTimes = 0;
-                result = catalog;
+                result = globalStateMgr;
             }
         };
     }
@@ -78,7 +78,7 @@ public class SimpleSchedulerTest {
     // Comment out these code temporatily.
     // @Test
     public void testGetHostWithBackendId() {
-        FeConstants.heartbeat_interval_second = Integer.MAX_VALUE;
+        Config.heartbeat_timeout_second = Integer.MAX_VALUE;
         TNetworkAddress address;
         // three locations
         List<TScanRangeLocation> nullLocations = null;
@@ -141,7 +141,7 @@ public class SimpleSchedulerTest {
     // Comment out these code temporatily.
     // @Test
     public void testGetHostWithNoParams() {
-        FeConstants.heartbeat_interval_second = Integer.MAX_VALUE;
+        Config.heartbeat_timeout_second = Integer.MAX_VALUE;
         ImmutableMap<Long, Backend> nullBackends = null;
         ImmutableMap<Long, Backend> emptyBackends = ImmutableMap.of();
 
@@ -158,17 +158,17 @@ public class SimpleSchedulerTest {
         ImmutableMap<Long, Backend> immutableThreeBackends = ImmutableMap.copyOf(threeBackends);
 
         {   // abmormal
-            Assert.assertNull(SimpleScheduler.getHost(nullBackends, ref));
-            Assert.assertNull(SimpleScheduler.getHost(emptyBackends, ref));
+            Assert.assertNull(SimpleScheduler.getBackendHost(nullBackends, ref));
+            Assert.assertNull(SimpleScheduler.getBackendHost(emptyBackends, ref));
         }   // normal
         {
-            String a = SimpleScheduler.getHost(immutableThreeBackends, ref).hostname;
-            String b = SimpleScheduler.getHost(immutableThreeBackends, ref).hostname;
-            String c = SimpleScheduler.getHost(immutableThreeBackends, ref).hostname;
+            String a = SimpleScheduler.getBackendHost(immutableThreeBackends, ref).hostname;
+            String b = SimpleScheduler.getBackendHost(immutableThreeBackends, ref).hostname;
+            String c = SimpleScheduler.getBackendHost(immutableThreeBackends, ref).hostname;
             Assert.assertTrue(!a.equals(b) && !a.equals(c) && !b.equals(c));
-            a = SimpleScheduler.getHost(immutableThreeBackends, ref).hostname;
-            b = SimpleScheduler.getHost(immutableThreeBackends, ref).hostname;
-            c = SimpleScheduler.getHost(immutableThreeBackends, ref).hostname;
+            a = SimpleScheduler.getBackendHost(immutableThreeBackends, ref).hostname;
+            b = SimpleScheduler.getBackendHost(immutableThreeBackends, ref).hostname;
+            c = SimpleScheduler.getBackendHost(immutableThreeBackends, ref).hostname;
             Assert.assertTrue(!a.equals(b) && !a.equals(c) && !b.equals(c));
         }
     }
@@ -176,7 +176,7 @@ public class SimpleSchedulerTest {
     // Comment out these code temporatily.
     // @Test
     public void testBlackList() {
-        FeConstants.heartbeat_interval_second = Integer.MAX_VALUE;
+        Config.heartbeat_timeout_second = Integer.MAX_VALUE;
         TNetworkAddress address = null;
 
         Backend backendA = new Backend(0, "addressA", 0);
@@ -193,12 +193,12 @@ public class SimpleSchedulerTest {
 
         SimpleScheduler.addToBlacklist(Long.valueOf(100));
         SimpleScheduler.addToBlacklist(Long.valueOf(101));
-        address = SimpleScheduler.getHost(immutableThreeBackends, ref);
+        address = SimpleScheduler.getBackendHost(immutableThreeBackends, ref);
         // only backendc can work
         Assert.assertEquals(address.hostname, "addressC");
         SimpleScheduler.addToBlacklist(Long.valueOf(102));
         // no backend can work
-        address = SimpleScheduler.getHost(immutableThreeBackends, ref);
+        address = SimpleScheduler.getBackendHost(immutableThreeBackends, ref);
         Assert.assertNull(address);
     }
 }

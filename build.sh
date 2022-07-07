@@ -18,9 +18,14 @@
 
 ##############################################################
 # This script is used to compile StarRocks
-# Usage:
-#    sh build.sh        build both Backend and Frontend.
-#    sh build.sh -clean clean previous output and build.
+# Usage: 
+#    sh build.sh --help
+# Eg:
+#    sh build.sh                            build all
+#    sh build.sh  --be                      build Backend without clean
+#    sh build.sh  --fe --clean              clean and build Frontend and Spark Dpp application
+#    sh build.sh  --fe --be --clean         clean and build Frontend, Spark Dpp application and Backend
+#    sh build.sh  --spark-dpp               build Spark DPP application alone
 #
 # You need to make sure all thirdparty libraries have been
 # compiled and installed correctly.
@@ -30,13 +35,14 @@ set -eo pipefail
 
 ROOT=`dirname "$0"`
 ROOT=`cd "$ROOT"; pwd`
+MACHINE_TYPE=$(uname -m)
 
 export STARROCKS_HOME=${ROOT}
 
 . ${STARROCKS_HOME}/env.sh
 
 #build thirdparty libraries if necessary
-if [[ ! -f ${STARROCKS_THIRDPARTY}/installed/lib64/libbenchmark.a ]]; then
+if [[ ! -f ${STARROCKS_THIRDPARTY}/installed/lib/mariadb/libmariadbclient.a ]]; then
     echo "Thirdparty libraries need to be build ..."
     ${STARROCKS_THIRDPARTY}/build-thirdparty.sh
 fi
@@ -52,20 +58,14 @@ Usage: $0 <options>
      --fe               build Frontend and Spark Dpp application
      --spark-dpp        build Spark DPP application
      --clean            clean and build target
+     --use-staros       build Backend with staros
      --with-gcov        build Backend with gcov, has an impact on performance
      --without-gcov     build Backend without gcov(default)
-     --with-mysql       enable MySQL support(default)
-     --without-mysql    disable MySQL support
-     --with-lzo         enable LZO compress support(default)
-     --without-lzo      disable LZO compress  support
-     --with-hdfs        enable hdfs support
-     --without-hdfs     disable hdfs support
+     -j                 build Backend parallel
 
   Eg.
     $0                                      build all
     $0 --be                                 build Backend without clean
-    $0 --be --without-mysql                 build Backend with MySQL disable
-    $0 --be --without-mysql --without-lzo   build Backend with both MySQL and LZO disable
     $0 --fe --clean                         clean and build Frontend and Spark Dpp application
     $0 --fe --be --clean                    clean and build Frontend, Spark Dpp application and Backend
     $0 --spark-dpp                          build Spark DPP application alone
@@ -83,12 +83,8 @@ OPTS=$(getopt \
   -l 'clean' \
   -l 'with-gcov' \
   -l 'without-gcov' \
-  -l 'with-mysql' \
-  -l 'without-mysql' \
-  -l 'with-lzo' \
-  -l 'without-lzo' \
-  -l 'with-hdfs' \
-  -l 'without-hdfs' \
+  -l 'use-staros' \
+  -o 'j:' \
   -l 'help' \
   -- "$@")
 
@@ -103,11 +99,15 @@ BUILD_FE=
 BUILD_SPARK_DPP=
 CLEAN=
 RUN_UT=
-WITH_MYSQL=ON
-WITH_LZO=ON
 WITH_GCOV=OFF
-WITH_HDFS=ON
-WITH_BENCHMARK=ON
+USE_STAROS=OFF
+if [[ -z ${USE_AVX2} ]]; then
+    USE_AVX2=ON
+fi
+if [[ -z ${USE_SSE4_2} ]]; then
+    USE_SSE4_2=ON
+fi
+
 
 HELP=0
 if [ $# == 1 ] ; then
@@ -130,16 +130,12 @@ else
             --spark-dpp) BUILD_SPARK_DPP=1 ; shift ;;
             --clean) CLEAN=1 ; shift ;;
             --ut) RUN_UT=1   ; shift ;;
-            --with-mysql) WITH_MYSQL=ON; shift ;;
-            --without-mysql) WITH_MYSQL=OFF; shift ;;
             --with-gcov) WITH_GCOV=ON; shift ;;
             --without-gcov) WITH_GCOV=OFF; shift ;;
-            --with-lzo) WITH_LZO=ON; shift ;;
-            --without-lzo) WITH_LZO=OFF; shift ;;
-            --with-hdfs) WITH_HDFS=ON; shift ;;
-            --without-hdfs) WITH_HDFS=OFF; shift ;;
+            --use-staros) USE_STAROS=ON; shift ;;
             -h) HELP=1; shift ;;
             --help) HELP=1; shift ;;
+            -j) PARALLEL=$2; shift 2 ;;
             --) shift ;  break ;;
             *) echo "Internal error" ; exit 1 ;;
         esac
@@ -162,11 +158,10 @@ echo "Get params:
     BUILD_SPARK_DPP     -- $BUILD_SPARK_DPP
     CLEAN               -- $CLEAN
     RUN_UT              -- $RUN_UT
-    WITH_MYSQL          -- $WITH_MYSQL
-    WITH_LZO            -- $WITH_LZO
     WITH_GCOV           -- $WITH_GCOV
-    WITH_HDFS           -- $WITH_HDFS
-    WITH_BENCHMARK      -- $WITH_BENCHMARK
+    USE_STAROS          -- $USE_STAROS
+    USE_AVX2            -- $USE_AVX2
+    PARALLEL            -- $PARALLEL
 "
 
 # Clean and build generated code
@@ -180,8 +175,11 @@ fi
 make
 cd ${STARROCKS_HOME}
 
-if [ "${WITH_HDFS}" == "ON" ]; then
-   export LIBRARY_PATH=${JAVA_HOME}/jre/lib/amd64/server/
+
+if [[ "${MACHINE_TYPE}" == "aarch64" ]]; then
+    export LIBRARY_PATH=${JAVA_HOME}/jre/lib/aarch64/server/
+else
+    export LIBRARY_PATH=${JAVA_HOME}/jre/lib/amd64/server/
 fi
 
 # Clean and build Backend
@@ -198,10 +196,44 @@ if [ ${BUILD_BE} -eq 1 ] ; then
     fi
     mkdir -p ${CMAKE_BUILD_DIR}
     cd ${CMAKE_BUILD_DIR}
-    ${CMAKE_CMD} .. -DSTARROCKS_THIRDPARTY=${STARROCKS_THIRDPARTY} -DSTARROCKS_HOME=${STARROCKS_HOME} -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} -DMAKE_TEST=OFF -DWITH_MYSQL=${WITH_MYSQL} -DWITH_HDFS=${WITH_HDFS} -DWITH_LZO=${WITH_LZO} -DWITH_GCOV=${WITH_GCOV} \
-        -DWITH_BENCHMARK=${WITH_BENCHMARK}
-    time make -j${PARALLEL}
-    make install
+    if [ "${USE_STAROS}" == "ON"  ]; then
+      if [ -z "$STARLET_INSTALL_DIR" ] ; then
+        # assume starlet_thirdparty is installed to ${STARROCKS_THIRDPARTY}/installed/starlet/
+        STARLET_INSTALL_DIR=${STARROCKS_THIRDPARTY}/installed/starlet
+      fi
+      ${CMAKE_CMD} -G "${CMAKE_GENERATOR}" \
+                    -DSTARROCKS_THIRDPARTY=${STARROCKS_THIRDPARTY} \
+                    -DSTARROCKS_HOME=${STARROCKS_HOME} \
+                    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                    -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+                    -DMAKE_TEST=OFF -DWITH_GCOV=${WITH_GCOV}\
+                    -DUSE_AVX2=$USE_AVX2 -DUSE_SSE4_2=$USE_SSE4_2 \
+                    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+                    -DUSE_STAROS=${USE_STAROS} \
+                    -Dprotobuf_DIR=${STARLET_INSTALL_DIR}/third_party/lib/cmake/protobuf \
+                    -Dabsl_DIR=${STARLET_INSTALL_DIR}/third_party/lib/cmake/absl \
+                    -DgRPC_DIR=${STARLET_INSTALL_DIR}/third_party/lib/cmake/grpc \
+                    -Dstarlet_DIR=${STARLET_INSTALL_DIR}/starlet_install/lib64/cmake ..
+    else
+      ${CMAKE_CMD} -G "${CMAKE_GENERATOR}" \
+                    -DSTARROCKS_THIRDPARTY=${STARROCKS_THIRDPARTY} \
+                    -DSTARROCKS_HOME=${STARROCKS_HOME} \
+                    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                    -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+                    -DMAKE_TEST=OFF -DWITH_GCOV=${WITH_GCOV}\
+                    -DUSE_AVX2=$USE_AVX2 -DUSE_SSE4_2=$USE_SSE4_2 \
+                    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON  ..
+    fi
+    time ${BUILD_SYSTEM} -j${PARALLEL}
+    ${BUILD_SYSTEM} install
+
+    # Build JDBC Bridge
+    echo "Build Java Extensions"
+    cd ${STARROCKS_HOME}/java-extensions
+    if [ ${CLEAN} -eq 1 ]; then
+        ${MVN_CMD} clean
+    fi
+    ${MVN_CMD} package -DskipTests
     cd ${STARROCKS_HOME}
 fi
 
@@ -229,6 +261,7 @@ if [ ${FE_MODULES}x != ""x ]; then
     cd ${STARROCKS_HOME}
 fi
 
+
 # Clean and prepare output dir
 STARROCKS_OUTPUT=${STARROCKS_HOME}/output/
 mkdir -p ${STARROCKS_OUTPUT}
@@ -250,6 +283,7 @@ if [ ${BUILD_FE} -eq 1 -o ${BUILD_SPARK_DPP} -eq 1 ]; then
         cp -r -p ${STARROCKS_HOME}/fe/fe-core/target/starrocks-fe.jar ${STARROCKS_OUTPUT}/fe/lib/
         cp -r -p ${STARROCKS_HOME}/webroot/* ${STARROCKS_OUTPUT}/fe/webroot/
         cp -r -p ${STARROCKS_HOME}/fe/spark-dpp/target/spark-dpp-*-jar-with-dependencies.jar ${STARROCKS_OUTPUT}/fe/spark-dpp/
+        cp -r -p ${STARROCKS_THIRDPARTY}/installed/aliyun_oss_jars/* ${STARROCKS_OUTPUT}/fe/lib/
 
     elif [ ${BUILD_SPARK_DPP} -eq 1 ]; then
         install -d ${STARROCKS_OUTPUT}/fe/spark-dpp/
@@ -259,6 +293,8 @@ if [ ${BUILD_FE} -eq 1 -o ${BUILD_SPARK_DPP} -eq 1 ]; then
 fi
 
 if [ ${BUILD_BE} -eq 1 ]; then
+    rm -rf ${STARROCKS_OUTPUT}/be/lib/*
+
     install -d ${STARROCKS_OUTPUT}/be/bin  \
                ${STARROCKS_OUTPUT}/be/conf \
                ${STARROCKS_OUTPUT}/be/lib/hadoop \
@@ -269,17 +305,30 @@ if [ ${BUILD_BE} -eq 1 ]; then
 
     cp -r -p ${STARROCKS_HOME}/be/output/bin/* ${STARROCKS_OUTPUT}/be/bin/
     cp -r -p ${STARROCKS_HOME}/be/output/conf/be.conf ${STARROCKS_OUTPUT}/be/conf/
+    cp -r -p ${STARROCKS_HOME}/be/output/conf/cn.conf ${STARROCKS_OUTPUT}/be/conf/
     cp -r -p ${STARROCKS_HOME}/be/output/conf/hadoop_env.sh ${STARROCKS_OUTPUT}/be/conf/
     cp -r -p ${STARROCKS_HOME}/be/output/lib/* ${STARROCKS_OUTPUT}/be/lib/
     cp -r -p ${STARROCKS_HOME}/be/output/www/* ${STARROCKS_OUTPUT}/be/www/
     cp -r -p ${STARROCKS_HOME}/be/output/udf/*.a ${STARROCKS_OUTPUT}/udf/lib/
     cp -r -p ${STARROCKS_HOME}/be/output/udf/include/* ${STARROCKS_OUTPUT}/udf/include/
-    cp -r -p ${STARROCKS_THIRDPARTY}/installed/hadoop-3.3.0/share/hadoop/common ${STARROCKS_OUTPUT}/be/lib/hadoop/
-    cp -r -p ${STARROCKS_THIRDPARTY}/installed/hadoop-3.3.0/share/hadoop/hdfs ${STARROCKS_OUTPUT}/be/lib/hadoop/
-    cp -r -p ${STARROCKS_THIRDPARTY}/installed/hadoop-3.3.0/lib/native ${STARROCKS_OUTPUT}/be/lib/hadoop/
+    cp -r -p ${STARROCKS_HOME}/java-extensions/jdbc-bridge/target/starrocks-jdbc-bridge-jar-with-dependencies.jar ${STARROCKS_OUTPUT}/be/lib
+    cp -r -p ${STARROCKS_HOME}/java-extensions/udf-extensions/target/udf-extensions-jar-with-dependencies.jar ${STARROCKS_OUTPUT}/be/lib
+    cp -r -p ${STARROCKS_THIRDPARTY}/installed/hadoop/share/hadoop/common ${STARROCKS_OUTPUT}/be/lib/hadoop/
+    cp -r -p ${STARROCKS_THIRDPARTY}/installed/hadoop/share/hadoop/hdfs ${STARROCKS_OUTPUT}/be/lib/hadoop/
+    cp -r -p ${STARROCKS_THIRDPARTY}/installed/hadoop/lib/native ${STARROCKS_OUTPUT}/be/lib/hadoop/
     # note: do not use oracle jdk to avoid commercial dispute
-    cp -r -p ${STARROCKS_THIRDPARTY}/installed/java-se-8u41-ri/jre/lib/amd64 ${STARROCKS_OUTPUT}/be/lib/jvm/
+    if [[ "${MACHINE_TYPE}" == "aarch64" ]]; then
+        cp -r -p ${STARROCKS_THIRDPARTY}/installed/open_jdk/jre/lib/aarch64 ${STARROCKS_OUTPUT}/be/lib/jvm/
+    else
+        cp -r -p ${STARROCKS_THIRDPARTY}/installed/open_jdk/jre/lib/amd64 ${STARROCKS_OUTPUT}/be/lib/jvm/
+    fi
+    cp -r -p ${STARROCKS_THIRDPARTY}/installed/aliyun_oss_jars/* ${STARROCKS_OUTPUT}/be/lib/hadoop/hdfs/
 fi
+
+
+
+cp -r -p "${STARROCKS_HOME}/LICENSE.txt" "${STARROCKS_OUTPUT}/LICENSE.txt"
+build-support/gen_notice.py "${STARROCKS_HOME}/licenses,${STARROCKS_HOME}/licenses-binary" "${STARROCKS_OUTPUT}/NOTICE.txt" all
 
 echo "***************************************"
 echo "Successfully build StarRocks"

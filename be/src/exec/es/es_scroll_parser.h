@@ -1,73 +1,74 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/exec/es/es_scroll_parser.h
-
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
-
 #include <string>
 
 #include "common/compiler_util.h"
 DIAGNOSTIC_PUSH
 DIAGNOSTIC_IGNORE("-Wclass-memaccess")
 #include <rapidjson/document.h>
+#include <rapidjson/stringbuffer.h>
+#include <rapidjson/writer.h>
 DIAGNOSTIC_POP
 
+#include "column/chunk.h"
+#include "column/type_traits.h"
+#include "column/vectorized_fwd.h"
+#include "http/http_client.h"
 #include "runtime/descriptors.h"
-#include "runtime/tuple.h"
+#include "runtime/primitive_type.h"
 
-namespace starrocks {
-
-class Status;
-
+namespace starrocks::vectorized {
 class ScrollParser {
 public:
     ScrollParser(bool doc_value_mode);
-    ~ScrollParser();
+    ~ScrollParser() = default;
 
     Status parse(const std::string& scroll_result, bool exactly_once = false);
-    Status fill_tuple(const TupleDescriptor* _tuple_desc, Tuple* tuple, MemPool* mem_pool, bool* line_eof,
-                      const std::map<std::string, std::string>& docvalue_context);
+    Status fill_chunk(RuntimeState* state, ChunkPtr* chunk, bool* line_eos);
 
-    const std::string& get_scroll_id();
-    int get_size();
+    const std::string& get_scroll_id() { return _scroll_id; }
+    int get_size() { return _size; }
+    bool current_eos() { return _cur_line == _size; }
 
-private:
-    // helper method for processing date/datetime cols with rapidjson::Value
-    // type is used for distinguish date and datetime
-    // fill date slot with string format date
-    Status fill_date_slot_with_strval(void* slot, const rapidjson::Value& col, PrimitiveType type);
-    // fill date slot with timestamp
-    Status fill_date_slot_with_timestamp(void* slot, const rapidjson::Value& col, PrimitiveType type);
+    void set_params(const TupleDescriptor* descs, const std::map<std::string, std::string>* docvalue_context);
 
 private:
+    static bool _pure_doc_value(const rapidjson::Value& obj);
+
+    template <PrimitiveType type, class CppType = RunTimeCppType<type>>
+    static void _append_data(Column* column, CppType& value);
+
+    static void _append_null(Column* column);
+
+    Status _append_value_from_json_val(Column* column, PrimitiveType type, const rapidjson::Value& col,
+                                       bool pure_doc_value);
+
+    Slice _json_val_to_slice(const rapidjson::Value& val);
+
+    template <PrimitiveType type, typename T = RunTimeCppType<type>>
+    Status _append_int_val(const rapidjson::Value& col, Column* column, bool pure_doc_value);
+
+    template <PrimitiveType type, typename T = RunTimeCppType<type>>
+    Status _append_float_val(const rapidjson::Value& col, Column* column, bool pure_doc_value);
+
+    Status _append_bool_val(const rapidjson::Value& col, Column* column, bool pure_doc_value);
+
+    template <PrimitiveType type, typename T = RunTimeCppType<type>>
+    Status _append_date_val(const rapidjson::Value& col, Column* column, bool pure_doc_value);
+
+private:
+    const TupleDescriptor* _tuple_desc;
+    const std::map<std::string, std::string>* _docvalue_context;
+
     std::string _scroll_id;
-    int _size;
-    rapidjson::SizeType _line_index;
-
+    size_t _size;
+    rapidjson::SizeType _cur_line;
     rapidjson::Document _document_node;
     rapidjson::Value _inner_hits_node;
-
-    // todo(milimin): ScrollParser should be divided into two classes: SourceParser and DocValueParser,
-    // including remove some variables in the current implementation, e.g. pure_doc_value.
-    // All above will be done in the DOE refactoring projects.
-    // Current bug fixes minimize the scope of changes to avoid introducing other new bugs.
     bool _doc_value_mode;
+
+    rapidjson::StringBuffer _scratch_buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> _temp_writer;
 };
-} // namespace starrocks
+} // namespace starrocks::vectorized

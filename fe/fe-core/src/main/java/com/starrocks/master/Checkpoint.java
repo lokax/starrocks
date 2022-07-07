@@ -21,26 +21,22 @@
 
 package com.starrocks.master;
 
-import com.starrocks.catalog.Catalog;
 import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.util.MasterDaemon;
+import com.starrocks.journal.Journal;
 import com.starrocks.metric.MetricRepo;
-import com.starrocks.monitor.jvm.JvmService;
-import com.starrocks.monitor.jvm.JvmStats;
-import com.starrocks.monitor.jvm.JvmStats.MemoryPool;
-import com.starrocks.persist.EditLog;
 import com.starrocks.persist.MetaCleaner;
 import com.starrocks.persist.Storage;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Frontend;
+import org.apache.commons.io.output.NullOutputStream;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
-import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.util.Iterator;
 import java.util.List;
 
 /**
@@ -52,22 +48,14 @@ public class Checkpoint extends MasterDaemon {
     private static final int CONNECT_TIMEOUT_SECOND = 1;
     private static final int READ_TIMEOUT_SECOND = 1;
 
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
     private String imageDir;
-    private EditLog editLog;
+    private Journal journal;
 
-    public Checkpoint(EditLog editLog) {
+    public Checkpoint(Journal journal) {
         super("leaderCheckpointer", FeConstants.checkpoint_interval_second * 1000L);
-        this.imageDir = Catalog.getServingCatalog().getImageDir();
-        this.editLog = editLog;
-    }
-
-    public static class NullOutputStream extends OutputStream {
-        public void write(byte[] b, int off, int len) throws IOException {
-        }
-
-        public void write(int b) throws IOException {
-        }
+        this.imageDir = GlobalStateMgr.getServingState().getImageDir();
+        this.journal = journal;
     }
 
     @Override
@@ -78,9 +66,9 @@ public class Checkpoint extends MasterDaemon {
         try {
             storage = new Storage(imageDir);
             // get max image version
-            imageVersion = storage.getImageSeq();
+            imageVersion = storage.getImageJournalId();
             // get max finalized journal id
-            checkPointVersion = editLog.getFinalizedJournalId();
+            checkPointVersion = journal.getFinalizedJournalId();
             LOG.info("checkpoint imageVersion {}, checkPointVersion {}", imageVersion, checkPointVersion);
             if (imageVersion >= checkPointVersion) {
                 return;
@@ -90,50 +78,49 @@ public class Checkpoint extends MasterDaemon {
             return;
         }
 
-        if (!checkMemoryEnoughToDoCheckpoint()) {
-            return;
-        }
-
         long replayedJournalId = -1;
         // generate new image file
         LOG.info("begin to generate new image: image.{}", checkPointVersion);
-        catalog = Catalog.getCurrentCatalog();
-        catalog.setEditLog(editLog);
+        globalStateMgr = GlobalStateMgr.getCurrentState();
+        globalStateMgr.setJournal(journal);
         try {
-            catalog.loadImage(imageDir);
-            catalog.replayJournal(checkPointVersion);
-            if (catalog.getReplayedJournalId() != checkPointVersion) {
+            globalStateMgr.loadImage(imageDir);
+            globalStateMgr.replayJournal(checkPointVersion);
+            if (globalStateMgr.getReplayedJournalId() != checkPointVersion) {
                 LOG.error("checkpoint version should be {}, actual replayed journal id is {}",
-                        checkPointVersion, catalog.getReplayedJournalId());
+                        checkPointVersion, globalStateMgr.getReplayedJournalId());
                 return;
             }
 
-            catalog.saveImage();
-            replayedJournalId = catalog.getReplayedJournalId();
+            globalStateMgr.clearExpiredJobs();
+
+            globalStateMgr.saveImage();
+            replayedJournalId = globalStateMgr.getReplayedJournalId();
             if (MetricRepo.isInit) {
                 MetricRepo.COUNTER_IMAGE_WRITE.increase(1L);
             }
+            GlobalStateMgr.getServingState().setImageJournalId(checkPointVersion);
             LOG.info("checkpoint finished save image.{}", replayedJournalId);
         } catch (Exception e) {
             e.printStackTrace();
             LOG.error("Exception when generate new image file", e);
             return;
         } finally {
-            // destroy checkpoint catalog, reclaim memory
-            catalog = null;
-            Catalog.destroyCheckpoint();
+            // destroy checkpoint globalStateMgr, reclaim memory
+            globalStateMgr = null;
+            GlobalStateMgr.destroyCheckpoint();
         }
 
         // push image file to all the other non master nodes
         // DO NOT get other nodes from HaProtocol, because node may not in bdbje replication group yet.
-        List<Frontend> allFrontends = Catalog.getServingCatalog().getFrontends(null);
+        List<Frontend> allFrontends = GlobalStateMgr.getServingState().getFrontends(null);
         int successPushed = 0;
         int otherNodesCount = 0;
         if (!allFrontends.isEmpty()) {
             otherNodesCount = allFrontends.size() - 1; // skip master itself
             for (Frontend fe : allFrontends) {
                 String host = fe.getHost();
-                if (host.equals(Catalog.getServingCatalog().getMasterIp())) {
+                if (host.equals(GlobalStateMgr.getServingState().getMasterIp())) {
                     // skip master itself
                     continue;
                 }
@@ -162,7 +149,7 @@ public class Checkpoint extends MasterDaemon {
             if (successPushed > 0) {
                 for (Frontend fe : allFrontends) {
                     String host = fe.getHost();
-                    if (host.equals(Catalog.getServingCatalog().getMasterIp())) {
+                    if (host.equals(GlobalStateMgr.getServingState().getMasterIp())) {
                         // skip master itself
                         continue;
                     }
@@ -198,7 +185,7 @@ public class Checkpoint extends MasterDaemon {
                 }
                 deleteVersion = Math.min(minOtherNodesJournalId, checkPointVersion);
             }
-            editLog.deleteJournals(deleteVersion + 1);
+            journal.deleteJournals(deleteVersion + 1);
             if (MetricRepo.isInit) {
                 MetricRepo.COUNTER_IMAGE_PUSH.increase(1L);
             }
@@ -215,50 +202,4 @@ public class Checkpoint extends MasterDaemon {
         }
 
     }
-
-    /*
-     * Check whether can we do the checkpoint due to the memory used percent.
-     */
-    private boolean checkMemoryEnoughToDoCheckpoint() {
-        long memUsedPercent = getMemoryUsedPercent();
-        LOG.info("get jvm memory used percent: {} %", memUsedPercent);
-
-        if (memUsedPercent > Config.metadata_checkopoint_memory_threshold && !Config.force_do_metadata_checkpoint) {
-            LOG.warn("the memory used percent {} exceed the checkpoint memory threshold: {}",
-                    memUsedPercent, Config.metadata_checkopoint_memory_threshold);
-            return false;
-        }
-
-        return true;
-    }
-
-    /*
-     * Get the used percent of jvm memory pool.
-     * If old mem pool does not found(It probably should not happen), use heap mem usage instead.
-     * heap mem is slightly larger than old mem pool usage.
-     */
-    private long getMemoryUsedPercent() {
-        JvmService jvmService = new JvmService();
-        JvmStats jvmStats = jvmService.stats();
-        Iterator<MemoryPool> memIter = jvmStats.getMem().iterator();
-        MemoryPool oldMemPool = null;
-        while (memIter.hasNext()) {
-            MemoryPool memPool = memIter.next();
-            if (memPool.getName().equalsIgnoreCase("old")) {
-                oldMemPool = memPool;
-                break;
-            }
-        }
-        if (oldMemPool != null) {
-            long used = oldMemPool.getUsed().getBytes();
-            long max = oldMemPool.getMax().getBytes();
-            return used * 100 / max;
-        } else {
-            LOG.warn("failed to get jvm old mem pool, use heap usage instead");
-            long used = jvmStats.getMem().getHeapUsed().getBytes();
-            long max = jvmStats.getMem().getHeapMax().getBytes();
-            return used * 100 / max;
-        }
-    }
-
 }

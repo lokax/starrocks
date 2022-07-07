@@ -415,6 +415,50 @@ public class SchemaTable extends Table {
                                             .column("CHARACTER_SET_CLIENT", ScalarType.createVarchar(32))
                                             .column("COLLATION_CONNECTION", ScalarType.createVarchar(32))
                                             .build()))
+                    // for task
+                    .put("tasks",
+                            new SchemaTable(
+                                    SystemIdGenerator.getNextId(),
+                                    "tasks",
+                                    TableType.SCHEMA,
+                                    builder()
+                                            .column("TASK_NAME", ScalarType.createVarchar(64))
+                                            .column("CREATE_TIME", ScalarType.createType(PrimitiveType.DATETIME))
+                                            .column("SCHEDULE", ScalarType.createVarchar(64))
+                                            .column("DATABASE", ScalarType.createVarchar(64))
+                                            .column("DEFINITION", ScalarType.createVarchar(MAX_FIELD_VARCHARLENGTH))
+                                            .column("EXPIRE_TIME", ScalarType.createType(PrimitiveType.DATETIME))
+                                            .build()))
+                    .put("task_runs",
+                            new SchemaTable(
+                                    SystemIdGenerator.getNextId(),
+                                    "task_runs",
+                                    TableType.SCHEMA,
+                                    builder()
+                                            .column("QUERY_ID", ScalarType.createVarchar(64))
+                                            .column("TASK_NAME", ScalarType.createVarchar(64))
+                                            .column("CREATE_TIME", ScalarType.createType(PrimitiveType.DATETIME))
+                                            .column("FINISH_TIME", ScalarType.createType(PrimitiveType.DATETIME))
+                                            .column("STATE", ScalarType.createVarchar(16))
+                                            .column("DATABASE", ScalarType.createVarchar(64))
+                                            .column("DEFINITION", ScalarType.createVarchar(MAX_FIELD_VARCHARLENGTH))
+                                            .column("EXPIRE_TIME", ScalarType.createType(PrimitiveType.DATETIME))
+                                            .column("ERROR_CODE", ScalarType.createType(PrimitiveType.BIGINT))
+                                            .column("ERROR_MESSAGE", ScalarType.createVarchar(MAX_FIELD_VARCHARLENGTH))
+                                            .build()))
+                    .put("materialized_views",
+                            new SchemaTable(
+                                    SystemIdGenerator.getNextId(),
+                                    "materialized_views",
+                                    TableType.SCHEMA,
+                                    builder()
+                                            .column("MATERIALIZED_VIEW_ID", ScalarType.createVarchar(50))
+                                            .column("TABLE_SCHEMA", ScalarType.createVarchar(20))
+                                            .column("TABLE_NAME", ScalarType.createVarchar(50))
+                                            .column("MATERIALIZED_VIEW_DEFINITION",
+                                                    ScalarType.createVarchar(MAX_FIELD_VARCHARLENGTH))
+                                            .column("TABLE_ROWS", ScalarType.createVarchar(50))
+                                            .build()))
                     .build();
 
     public static class Builder {
@@ -442,5 +486,10 @@ public class SchemaTable extends Table {
                         TABLE_MAP.get(this.name).getBaseSchema().size(), 0, this.name, "");
         tTableDescriptor.setSchemaTable(tSchemaTable);
         return tTableDescriptor;
+    }
+
+    @Override
+    public boolean isSupported() {
+        return true;
     }
 }

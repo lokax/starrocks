@@ -27,7 +27,6 @@ import com.starrocks.catalog.Database;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.UserException;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.rewrite.ExprRewriter;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -82,8 +81,6 @@ public class SetOperationStmt extends QueryStmt {
     protected final List<SetOperand> allOperands_ = Lists.newArrayList();
 
     private AggregateInfo distinctAggInfo;  // only set if we have DISTINCT ops
-
-    private boolean hasDistinct = false;
 
     // Single tuple materialized by the set operation. Set in analyze().
     private TupleId tupleId;
@@ -183,10 +180,6 @@ public class SetOperationStmt extends QueryStmt {
         return allOperands_;
     }
 
-    public boolean hasAllOps() {
-        return !allOperands_.isEmpty();
-    }
-
     public AggregateInfo getDistinctAggInfo() {
         return distinctAggInfo;
     }
@@ -221,85 +214,7 @@ public class SetOperationStmt extends QueryStmt {
      * set operands are set compatible, adding implicit casts if necessary.
      */
     @Override
-    public void analyze(Analyzer analyzer) throws AnalysisException, UserException {
-        if (isAnalyzed()) {
-            return;
-        }
-        super.analyze(analyzer);
-        Preconditions.checkState(operands.size() > 0);
-
-        // the first operand's operation usually null
-        if (operands.get(0).operation == null && operands.size() > 1) {
-            operands.get(0).setOperation(operands.get(1).getOperation());
-        }
-
-        // Propagates DISTINCT from left to right,
-        propagateDistinct();
-
-        // Analyze all operands and make sure they return an equal number of exprs.
-        analyzeOperands(analyzer);
-
-        // Remember the SQL string before unnesting operands.
-        if (needToSql) {
-            toSqlString = toSql();
-        }
-
-        // Unnest the operands before casting the result exprs. Unnesting may add
-        // additional entries to operands_ and the result exprs of those unnested
-        // operands must also be cast properly.
-        unnestOperands(analyzer);
-
-        // Compute hasAnalyticExprs_
-        hasAnalyticExprs_ = false;
-        for (SetOperand op : operands) {
-            if (op.hasAnalyticExprs()) {
-                hasAnalyticExprs_ = true;
-                break;
-            }
-        }
-
-        // Collect all result expr lists and cast the exprs as necessary.
-        List<List<Expr>> resultExprLists = Lists.newArrayList();
-        for (SetOperand op : operands) {
-            resultExprLists.add(op.getQueryStmt().getResultExprs());
-        }
-        analyzer.castToSetOpsCompatibleTypes(resultExprLists);
-
-        // Create tuple descriptor materialized by this SetOperationStmt, its resultExprs, and
-        // its sortInfo if necessary.
-        createMetadata(analyzer);
-        createSortInfo(analyzer);
-
-        // Create unnested operands' smaps.
-        for (SetOperand operand : operands) {
-            setOperandSmap(operand, analyzer);
-        }
-
-        // Create distinctAggInfo, if necessary.
-        if (!distinctOperands_.isEmpty()) {
-            // forbidden metric type
-            for (Expr expr : resultExprs) {
-                if (expr.getType().isOnlyMetricType()) {
-                    throw new AnalysisException("Don't support distinct metric type: " + expr.getType());
-                }
-            }
-
-            // Aggregate produces exactly the same tuple as the original setOp stmt.
-            ArrayList<Expr> groupingExprs = Expr.cloneList(resultExprs);
-            try {
-                distinctAggInfo = AggregateInfo.create(
-                        groupingExprs, null, analyzer.getDescTbl().getTupleDesc(tupleId), analyzer);
-            } catch (AnalysisException e) {
-                // Should never happen.
-                throw new IllegalStateException("Error creating agg info in SetOperationStmt.analyze()", e);
-            }
-        }
-
-        setOpsResultExprs_ = Expr.cloneList(resultExprs);
-        if (evaluateOrderBy) {
-            createSortTupleInfo(analyzer);
-        }
-        baseTblResultExprs = resultExprs;
+    public void analyze(Analyzer analyzer) throws UserException {
     }
 
     /**
@@ -474,31 +389,12 @@ public class SetOperationStmt extends QueryStmt {
         // One slot per expr in the select blocks. Use first select block as representative.
         List<Expr> firstSelectExprs = operands.get(0).getQueryStmt().getResultExprs();
 
-        // TODO(zc) Column stats
-        /*
-        // Compute column stats for the materialized slots from the source exprs.
-        List<ColumnStats> columnStats = Lists.newArrayList();
-        for (int i = 0; i < operands_.size(); ++i) {
-            List<Expr> selectExprs = operands_.get(i).getQueryStmt().getResultExprs();
-            for (int j = 0; j < selectExprs.size(); ++j) {
-                ColumnStats statsToAdd = ColumnStats.fromExpr(selectExprs.get(j));
-                if (i == 0) {
-                    columnStats.add(statsToAdd);
-                } else {
-                    columnStats.get(j).add(statsToAdd);
-                }
-            }
-        }
-        */
-
         // Create tuple descriptor and slots.
         for (int i = 0; i < firstSelectExprs.size(); ++i) {
             Expr expr = firstSelectExprs.get(i);
             SlotDescriptor slotDesc = analyzer.addSlotDescriptor(tupleDesc);
             slotDesc.setLabel(getColLabels().get(i));
             slotDesc.setType(expr.getType());
-            // TODO(zc)
-            // slotDesc.setStats(columnStats.get(i));
             SlotRef outputSlotRef = new SlotRef(slotDesc);
             resultExprs.add(outputSlotRef);
 
@@ -542,70 +438,6 @@ public class SetOperationStmt extends QueryStmt {
         baseTblResultExprs = resultExprs;
     }
 
-    /**
-     * Marks the baseTblResultExprs of its operands as materialized, based on
-     * which of the output slots have been marked.
-     * Calls materializeRequiredSlots() on the operands themselves.
-     */
-    @Override
-    public void materializeRequiredSlots(Analyzer analyzer) throws AnalysisException {
-        TupleDescriptor tupleDesc = analyzer.getDescTbl().getTupleDesc(tupleId);
-        // to keep things simple we materialize all grouping exprs = output slots,
-        // regardless of what's being referenced externally
-        if (!distinctOperands_.isEmpty()) {
-            tupleDesc.materializeSlots();
-        }
-
-        if (evaluateOrderBy) {
-            sortInfo.materializeRequiredSlots(analyzer, null);
-        }
-
-        // collect operands' result exprs
-        List<SlotDescriptor> outputSlots = tupleDesc.getSlots();
-        List<Expr> exprs = Lists.newArrayList();
-        for (int i = 0; i < outputSlots.size(); ++i) {
-            SlotDescriptor slotDesc = outputSlots.get(i);
-            if (!slotDesc.isMaterialized()) {
-                continue;
-            }
-            for (SetOperand operand : operands) {
-                exprs.add(operand.getQueryStmt().getBaseTblResultExprs().get(i));
-            }
-            if (distinctAggInfo != null) {
-                // also mark the corresponding slot in the distinct agg tuple as being
-                // materialized
-                distinctAggInfo.getOutputTupleDesc().getSlots().get(i).setIsMaterialized(true);
-            }
-        }
-        materializeSlots(analyzer, exprs);
-
-        for (SetOperand op : operands) {
-            op.getQueryStmt().materializeRequiredSlots(analyzer);
-        }
-    }
-
-    @Override
-    public void rewriteExprs(ExprRewriter rewriter) throws AnalysisException {
-        for (SetOperand op : operands) {
-            op.getQueryStmt().rewriteExprs(rewriter);
-        }
-        if (orderByElements != null) {
-            for (OrderByElement orderByElem : orderByElements) {
-                orderByElem.setExpr(rewriter.rewrite(orderByElem.getExpr(), analyzer));
-            }
-        }
-    }
-
-    @Override
-    public void getMaterializedTupleIds(ArrayList<TupleId> tupleIdList) {
-        // Return the sort tuple if there is an evaluated order by.
-        if (evaluateOrderBy) {
-            tupleIdList.add(sortInfo.getSortTupleDescriptor().getId());
-        } else {
-            tupleIdList.add(tupleId);
-        }
-    }
-
     @Override
     public void collectTableRefs(List<TableRef> tblRefs) {
         for (SetOperand op : operands) {
@@ -627,8 +459,14 @@ public class SetOperationStmt extends QueryStmt {
         if (toSqlString != null) {
             return toSqlString;
         }
-        StringBuilder strBuilder = new StringBuilder();
         Preconditions.checkState(operands.size() > 0);
+
+        StringBuilder strBuilder = new StringBuilder();
+        if (withClause_ != null) {
+            strBuilder.append(withClause_.toSql());
+            strBuilder.append(" ");
+        }
+
         strBuilder.append(operands.get(0).getQueryStmt().toSql());
         for (int i = 1; i < operands.size() - 1; ++i) {
             strBuilder.append(
@@ -673,6 +511,57 @@ public class SetOperationStmt extends QueryStmt {
     }
 
     @Override
+    public String toDigest() {
+        StringBuilder strBuilder = new StringBuilder();
+        if (withClause_ != null) {
+            strBuilder.append(withClause_.toDigest());
+            strBuilder.append(" ");
+        }
+
+        strBuilder.append(operands.get(0).getQueryStmt().toDigest());
+        for (int i = 1; i < operands.size() - 1; ++i) {
+            strBuilder.append(
+                    " " + operands.get(i).getOperation().toString() + " "
+                            + ((operands.get(i).getQualifier() == Qualifier.ALL) ? "all " : ""));
+            if (operands.get(i).getQueryStmt() instanceof SetOperationStmt) {
+                strBuilder.append("(");
+            }
+            strBuilder.append(operands.get(i).getQueryStmt().toDigest());
+            if (operands.get(i).getQueryStmt() instanceof SetOperationStmt) {
+                strBuilder.append(")");
+            }
+        }
+        // Determine whether we need parenthesis around the last Set operand.
+        SetOperand lastOperand = operands.get(operands.size() - 1);
+        QueryStmt lastQueryStmt = lastOperand.getQueryStmt();
+        strBuilder.append(" " + lastOperand.getOperation().toString() + " "
+                + ((lastOperand.getQualifier() == Qualifier.ALL) ? "all " : ""));
+        if (lastQueryStmt instanceof SetOperationStmt || ((hasOrderByClause() || hasLimitClause()) &&
+                !lastQueryStmt.hasLimitClause() &&
+                !lastQueryStmt.hasOrderByClause())) {
+            strBuilder.append("(");
+            strBuilder.append(lastQueryStmt.toDigest());
+            strBuilder.append(")");
+        } else {
+            strBuilder.append(lastQueryStmt.toDigest());
+        }
+        // Order By clause
+        if (hasOrderByClause()) {
+            strBuilder.append(" order by ");
+            for (int i = 0; i < orderByElements.size(); ++i) {
+                strBuilder.append(orderByElements.get(i).getExpr().toDigest());
+                strBuilder.append(orderByElements.get(i).getIsAsc() ? " aec" : " desc");
+                strBuilder.append((i + 1 != orderByElements.size()) ? ", " : "");
+            }
+        }
+        // Limit clause.
+        if (hasLimitClause()) {
+            strBuilder.append(limitElement.toDigest());
+        }
+        return strBuilder.toString();
+    }
+
+    @Override
     public ArrayList<String> getColLabels() {
         Preconditions.checkState(operands.size() > 0);
         return operands.get(0).getQueryStmt().getColLabels();
@@ -697,6 +586,21 @@ public class SetOperationStmt extends QueryStmt {
             orderByElements = OrderByElement.substitute(orderByElements,
                     operands.get(0).getQueryStmt().aliasSMap, analyzer);
         }
+    }
+
+    @Override
+    public void substituteSelectListForCreateView(Analyzer analyzer, List<String> newColLabels)
+            throws UserException {
+        for (SetOperand operand : operands) {
+            operand.getQueryStmt().substituteSelectListForCreateView(analyzer, newColLabels);
+        }
+        // substitute order by
+        if (orderByElements != null) {
+            orderByElements = OrderByElement.substitute(orderByElements,
+                    operands.get(0).getQueryStmt().aliasSMap, analyzer);
+        }
+
+        toSqlString = null;
     }
 
     /**

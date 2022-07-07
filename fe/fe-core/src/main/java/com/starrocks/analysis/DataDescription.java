@@ -29,9 +29,10 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.starrocks.analysis.BinaryPredicate.Operator;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.FunctionSet;
+import com.starrocks.catalog.MaterializedView;
+import com.starrocks.catalog.Table;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
@@ -39,6 +40,8 @@ import com.starrocks.common.ErrorReport;
 import com.starrocks.common.Pair;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.common.MetaUtils;
 import com.starrocks.thrift.TNetworkAddress;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -78,15 +81,18 @@ public class DataDescription {
     private static final Logger LOG = LogManager.getLogger(DataDescription.class);
     // function isn't built-in function, hll_hash is not built-in function in hadoop load.
     private static final List<String> HADOOP_SUPPORT_FUNCTION_NAMES = Arrays.asList(
-            "strftime",
-            "time_format",
-            "alignment_timestamp",
-            "default_value",
-            "md5sum",
-            "replace_value",
-            "now",
+            FunctionSet.STRFTIME,
+            FunctionSet.TIME_FORMAT,
+            FunctionSet.ALIGNMENT_TIMESTAMP,
+            FunctionSet.DEFAULT_VALUE,
+            FunctionSet.MD5_SUM,
+            FunctionSet.REPLACE_VALUE,
+            FunctionSet.NOW,
             FunctionSet.HLL_HASH,
-            "substitute");
+            FunctionSet.SUBSTITUTE,
+            FunctionSet.GET_JSON_INT,
+            FunctionSet.GET_JSON_DOUBLE,
+            FunctionSet.GET_JSON_STRING);
 
     private final String tableName;
     private final PartitionNames partitionNames;
@@ -394,24 +400,28 @@ public class DataDescription {
     public static void validateMappingFunction(String functionName, List<String> args,
                                                Map<String, String> columnNameMap,
                                                Column mappingColumn, boolean isHadoopLoad) throws AnalysisException {
-        if (functionName.equalsIgnoreCase("alignment_timestamp")) {
+        if (functionName.equalsIgnoreCase(FunctionSet.ALIGNMENT_TIMESTAMP)) {
             validateAlignmentTimestamp(args, columnNameMap);
-        } else if (functionName.equalsIgnoreCase("strftime")) {
+        } else if (functionName.equalsIgnoreCase(FunctionSet.STRFTIME)) {
             validateStrftime(args, columnNameMap);
-        } else if (functionName.equalsIgnoreCase("time_format")) {
+        } else if (functionName.equalsIgnoreCase(FunctionSet.TIME_FORMAT)) {
             validateTimeFormat(args, columnNameMap);
-        } else if (functionName.equalsIgnoreCase("default_value")) {
+        } else if (functionName.equalsIgnoreCase(FunctionSet.DEFAULT_VALUE)) {
             validateDefaultValue(args, mappingColumn);
-        } else if (functionName.equalsIgnoreCase("md5sum")) {
+        } else if (functionName.equalsIgnoreCase(FunctionSet.MD5_SUM)) {
             validateMd5sum(args, columnNameMap);
-        } else if (functionName.equalsIgnoreCase("replace_value")) {
+        } else if (functionName.equalsIgnoreCase(FunctionSet.REPLACE_VALUE)) {
             validateReplaceValue(args, mappingColumn);
         } else if (functionName.equalsIgnoreCase(FunctionSet.HLL_HASH)) {
             validateHllHash(args, columnNameMap);
-        } else if (functionName.equalsIgnoreCase("now")) {
+        } else if (functionName.equalsIgnoreCase(FunctionSet.NOW)) {
             validateNowFunction(mappingColumn);
-        } else if (functionName.equalsIgnoreCase("substitute")) {
+        } else if (functionName.equalsIgnoreCase(FunctionSet.SUBSTITUTE)) {
             validateSubstituteFunction(args, columnNameMap);
+        } else if (functionName.equalsIgnoreCase(FunctionSet.GET_JSON_DOUBLE) ||
+                functionName.equalsIgnoreCase(FunctionSet.GET_JSON_INT) ||
+                functionName.equalsIgnoreCase(FunctionSet.GET_JSON_STRING)) {
+            validateGetJsonFunction(args, columnNameMap);
         } else {
             if (isHadoopLoad) {
                 throw new AnalysisException("Unknown function: " + functionName);
@@ -435,6 +445,22 @@ public class DataDescription {
         args.set(0, columnNameMap.get(argColumn));
     }
 
+    // eg: k2 = get_json_string(k1, "$.id")
+    // this is used for creating derivative column from existing column
+    private static void validateGetJsonFunction(List<String> args, Map<String, String> columnNameMap)
+            throws AnalysisException {
+        if (args.size() != 2) {
+            throw new AnalysisException("Should has only two arguments: " + args);
+        }
+
+        String argColumn = args.get(0);
+        if (!columnNameMap.containsKey(argColumn)) {
+            throw new AnalysisException("Column is not in sources, column: " + argColumn);
+        }
+
+        args.set(0, columnNameMap.get(argColumn));
+    }
+
     private static void validateAlignmentTimestamp(List<String> args, Map<String, String> columnNameMap)
             throws AnalysisException {
         if (args.size() != 2) {
@@ -442,7 +468,7 @@ public class DataDescription {
         }
 
         String precision = args.get(0).toLowerCase();
-        String regex = "^year|month|day|hour$";
+        String regex = "^(?:year|month|day|hour)$";
         if (!precision.matches(regex)) {
             throw new AnalysisException("Alignment precision error. regex: " + regex + ", arg: " + precision);
         }
@@ -509,7 +535,7 @@ public class DataDescription {
         }
 
         if (args.get(0) != null) {
-            ColumnDef.validateDefaultValue(column.getType(), args.get(0));
+            ColumnDef.validateDefaultValue(column.getType(), new StringLiteral(args.get(0)));
         }
     }
 
@@ -527,9 +553,14 @@ public class DataDescription {
     private static void validateReplaceValue(List<String> args, Column column) throws AnalysisException {
         String replaceValue = null;
         if (args.size() == 1) {
-            replaceValue = column.getDefaultValue();
-            if (replaceValue == null) {
+            Column.DefaultValueType defaultValueType = column.getDefaultValueType();
+            if (defaultValueType == Column.DefaultValueType.NULL) {
                 throw new AnalysisException("Column " + column.getName() + " has no default value");
+            } else if (defaultValueType == Column.DefaultValueType.CONST) {
+                replaceValue = column.calculatedDefaultValue();
+            } else if (defaultValueType == Column.DefaultValueType.VARY) {
+                throw new AnalysisException("Column " + column.getName() + " has unsupported default value:" +
+                        column.getDefaultExpr().getExpr());
             }
 
             args.add(replaceValue);
@@ -544,7 +575,7 @@ public class DataDescription {
         }
 
         if (replaceValue != null) {
-            ColumnDef.validateDefaultValue(column.getType(), replaceValue);
+            ColumnDef.validateDefaultValue(column.getType(), new StringLiteral(replaceValue));
         }
     }
 
@@ -570,7 +601,7 @@ public class DataDescription {
         }
 
         // check auth
-        if (!Catalog.getCurrentCatalog().getAuth().checkTblPriv(ConnectContext.get(), fullDbName, tableName,
+        if (!GlobalStateMgr.getCurrentState().getAuth().checkTblPriv(ConnectContext.get(), fullDbName, tableName,
                 PrivPredicate.LOAD)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "LOAD",
                     ConnectContext.get().getQualifiedUser(),
@@ -579,7 +610,7 @@ public class DataDescription {
 
         // check hive table auth
         if (isLoadFromTable()) {
-            if (!Catalog.getCurrentCatalog().getAuth().checkTblPriv(ConnectContext.get(), fullDbName, srcTableName,
+            if (!GlobalStateMgr.getCurrentState().getAuth().checkTblPriv(ConnectContext.get(), fullDbName, srcTableName,
                     PrivPredicate.SELECT)) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "SELECT",
                         ConnectContext.get().getQualifiedUser(),
@@ -590,7 +621,18 @@ public class DataDescription {
 
     public void analyze(String fullDbName) throws AnalysisException {
         checkLoadPriv(fullDbName);
+        analyzeTable(fullDbName);
         analyzeWithoutCheckPriv();
+    }
+
+    public void analyzeTable(String fullDbName) throws AnalysisException {
+        Table table = MetaUtils.getTable(ConnectContext.get(), new TableName(fullDbName, tableName));
+        if (table instanceof MaterializedView) {
+            throw new AnalysisException(String.format(
+                    "The data of '%s' cannot be inserted because '%s' is a materialized view," +
+                            "and the data of materialized view must be consistent with the base table.",
+                    tableName, tableName));
+        }
     }
 
     public void analyzeWithoutCheckPriv() throws AnalysisException {
@@ -686,7 +728,7 @@ public class DataDescription {
             sb.append(" COLUMNS TERMINATED BY ").append(columnSeparator.toSql());
         }
         if (rowDelimiter != null) {
-            sb.append(" COLUMNS TERMINATED BY ").append(rowDelimiter.toSql());
+            sb.append(" ROWS TERMINATED BY ").append(rowDelimiter.toSql());
         }
         if (columnsFromPath != null && !columnsFromPath.isEmpty()) {
             sb.append(" COLUMNS FROM PATH AS (");

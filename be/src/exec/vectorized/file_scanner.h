@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -16,6 +16,9 @@ namespace starrocks::vectorized {
 struct ScannerCounter {
     int64_t num_rows_filtered = 0;
     int64_t num_rows_unselected = 0;
+    int64_t filtered_rows_read = 0;
+    int64_t num_rows_read = 0;
+    int64_t num_bytes_read = 0;
 
     int64_t total_ns = 0;
     int64_t fill_ns = 0;
@@ -40,7 +43,7 @@ public:
 
     virtual StatusOr<ChunkPtr> get_next() = 0;
 
-    virtual void close() = 0;
+    virtual void close();
 
     Status create_random_access_file(const TBrokerRangeDesc& range_desc, const TNetworkAddress& address,
                                      const TBrokerScanRangeParams& params, CompressionTypePB compression,
@@ -54,7 +57,7 @@ protected:
                                 int size);
     // materialize is used to transform source chunk depicted by src_slot_descriptors into destination
     // chunk depicted by dest_slot_descriptors
-    ChunkPtr materialize(const starrocks::vectorized::ChunkPtr& src, starrocks::vectorized::ChunkPtr& cast);
+    StatusOr<ChunkPtr> materialize(const starrocks::vectorized::ChunkPtr& src, starrocks::vectorized::ChunkPtr& cast);
 
 protected:
     RuntimeState* _state;
@@ -63,7 +66,6 @@ protected:
     ScannerCounter* _counter;
 
     std::unique_ptr<RowDescriptor> _row_desc;
-    std::unique_ptr<MemTracker> _mem_tracker;
 
     bool _strict_mode;
     int64_t _error_counter;

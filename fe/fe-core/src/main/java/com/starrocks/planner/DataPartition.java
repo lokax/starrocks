@@ -54,13 +54,18 @@ public class DataPartition {
     private ImmutableList<Expr> partitionExprs;
 
     public DataPartition(TPartitionType type, List<Expr> exprs) {
-        Preconditions.checkNotNull(exprs);
-        Preconditions.checkState(!exprs.isEmpty());
-        Preconditions.checkState(
-                type == TPartitionType.HASH_PARTITIONED || type == TPartitionType.RANGE_PARTITIONED
-                        || type == TPartitionType.BUCKET_SHFFULE_HASH_PARTITIONED);
-        this.type = type;
-        this.partitionExprs = ImmutableList.copyOf(exprs);
+        if (type != TPartitionType.UNPARTITIONED && type != TPartitionType.RANDOM) {
+            Preconditions.checkNotNull(exprs);
+            Preconditions.checkState(!exprs.isEmpty());
+            Preconditions.checkState(
+                    type == TPartitionType.HASH_PARTITIONED || type == TPartitionType.RANGE_PARTITIONED
+                            || type == TPartitionType.BUCKET_SHUFFLE_HASH_PARTITIONED);
+            this.type = type;
+            this.partitionExprs = ImmutableList.copyOf(exprs);
+        } else {
+            this.type = type;
+            this.partitionExprs = ImmutableList.of();
+        }
     }
 
     public void substitute(ExprSubstitutionMap smap, Analyzer analyzer) throws AnalysisException {
@@ -84,7 +89,7 @@ public class DataPartition {
     }
 
     public boolean isBucketShuffle() {
-        return type == TPartitionType.BUCKET_SHFFULE_HASH_PARTITIONED;
+        return type == TPartitionType.BUCKET_SHUFFLE_HASH_PARTITIONED;
     }
 
     public TPartitionType getType() {
@@ -103,16 +108,6 @@ public class DataPartition {
         return result;
     }
 
-    /**
-     * Returns true if 'this' is a partition that is compatible with the
-     * requirements of 's'.
-     * TODO: specify more clearly and implement
-     */
-    public boolean isCompatible(DataPartition s) {
-        // TODO: implement
-        return true;
-    }
-
     public String getExplainString(TExplainLevel explainLevel) {
         StringBuilder str = new StringBuilder();
         str.append(type.toString());
@@ -125,20 +120,5 @@ public class DataPartition {
         }
         str.append("\n");
         return str.toString();
-    }
-
-    public void setUseVectorized(boolean flag) {
-        for (Expr expr : partitionExprs) {
-            expr.setUseVectorized(flag);
-        }
-    }
-
-    public boolean isVectorized() {
-        for (Expr expr : partitionExprs) {
-            if (!expr.isVectorized()) {
-                return false;
-            }
-        }
-        return true;
     }
 }

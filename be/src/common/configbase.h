@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/common/configbase.h
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -19,11 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_COMMON_CONFIGBASE_H
-#define STARROCKS_BE_SRC_COMMON_CONFIGBASE_H
-
-#include <stdint.h>
-
+#pragma once
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -102,7 +95,7 @@ public:
 #define CONF_mDouble(name, defaultstr) DECLARE_FIELD(double, name)
 #endif
 
-// configuration properties load from config file.
+// Configuration properties load from config file.
 class Properties {
 public:
     bool load(const char* filename);
@@ -115,7 +108,7 @@ private:
 
 extern Properties props;
 
-// full configurations.
+// Full configurations.
 extern std::map<std::string, std::string>* full_conf_map;
 
 bool init(const char* filename, bool fillconfmap = false);
@@ -124,5 +117,3 @@ Status set_config(const std::string& field, const std::string& value);
 
 } // namespace config
 } // namespace starrocks
-
-#endif // STARROCKS_BE_SRC_COMMON_CONFIGBASE_H

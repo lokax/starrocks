@@ -26,11 +26,15 @@ add_library(Common STATIC
   daemon.cpp
   status.cpp
   statusor.cpp
-  resource_tls.cpp
   logconfig.cpp
   configbase.cpp
-  minidump.cpp
+  s3_uri.cpp
+  tracer.cpp
 )
+
+if ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86" OR "${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86_64")
+    target_sources(Common PRIVATE minidump.cpp)
+endif()
 
 # Generate env_config.h according to env_config.h.in
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/env_config.h.in ${GENSRC_DIR}/common/env_config.h)

@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -48,7 +48,7 @@ private:
 class RuntimeFilterMergerStatus {
 public:
     RuntimeFilterMergerStatus() = default;
-    RuntimeFilterMergerStatus(RuntimeFilterMergerStatus&& other)
+    RuntimeFilterMergerStatus(RuntimeFilterMergerStatus&& other) noexcept
             : arrives(std::move(other.arrives)),
               expect_number(other.expect_number),
               pool(std::move(other.pool)),
@@ -82,7 +82,7 @@ public:
 // and sent merged RF to consumer nodes.
 class RuntimeFilterMerger {
 public:
-    RuntimeFilterMerger(ExecEnv* env, UniqueId query_id, TQueryOptions query_options);
+    RuntimeFilterMerger(ExecEnv* env, const UniqueId& query_id, const TQueryOptions& query_options, bool is_pipeline);
     Status init(const TRuntimeFilterParams& params);
     void merge_runtime_filter(PTransmitRuntimeFilterParams& params, RuntimeFilterRpcClosure* rpc_closure);
 
@@ -94,6 +94,7 @@ private:
     ExecEnv* _exec_env;
     UniqueId _query_id;
     TQueryOptions _query_options;
+    const bool _is_pipeline;
 };
 
 // RuntimeFilterWorker works in a separated thread, and does following jobs:
@@ -112,15 +113,29 @@ public:
     RuntimeFilterWorker(ExecEnv* env);
     ~RuntimeFilterWorker();
     // open query for creating runtime filter merger.
-    void open_query(TUniqueId query_id, TQueryOptions query_options, const TRuntimeFilterParams& params);
-    void close_query(TUniqueId query_id);
+    void open_query(const TUniqueId& query_id, const TQueryOptions& query_options, const TRuntimeFilterParams& params,
+                    bool is_pipeline);
+    void close_query(const TUniqueId& query_id);
     void receive_runtime_filter(const PTransmitRuntimeFilterParams& params);
     void execute();
     void send_part_runtime_filter(PTransmitRuntimeFilterParams&& params,
                                   const std::vector<starrocks::TNetworkAddress>& addrs, int timeout_ms);
+    void send_broadcast_runtime_filter(PTransmitRuntimeFilterParams&& params,
+                                       const std::vector<TRuntimeFilterDestination>& destinations, int timeout_ms);
 
 private:
     void _receive_total_runtime_filter(PTransmitRuntimeFilterParams& params, RuntimeFilterRpcClosure* rpc_closure);
+    void _process_send_broadcast_runtime_filter_event(PTransmitRuntimeFilterParams&& params,
+                                                      std::vector<TRuntimeFilterDestination>&& destinations,
+                                                      int timeout_ms);
+    void _deliver_broadcast_runtime_filter_passthrough(PTransmitRuntimeFilterParams&& params,
+                                                       std::vector<TRuntimeFilterDestination>&& destinations,
+                                                       int timeout_ms);
+    void _deliver_broadcast_runtime_filter_relay(PTransmitRuntimeFilterParams&& params,
+                                                 std::vector<TRuntimeFilterDestination>&& destinations, int timeout_ms);
+    void _deliver_broadcast_runtime_filter_local(PTransmitRuntimeFilterParams& params,
+                                                 const TRuntimeFilterDestination& destinations);
+
     UnboundedBlockingQueue<RuntimeFilterWorkerEvent> _queue;
     std::unordered_map<TUniqueId, RuntimeFilterMerger> _mergers;
     ExecEnv* _exec_env;

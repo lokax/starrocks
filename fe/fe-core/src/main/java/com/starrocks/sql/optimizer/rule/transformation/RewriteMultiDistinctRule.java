@@ -1,16 +1,18 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.rule.transformation;
 
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.FunctionName;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Function;
 import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.Type;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptimizerContext;
+import com.starrocks.sql.optimizer.operator.AggType;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.logical.LogicalAggregationOperator;
+import com.starrocks.sql.optimizer.operator.logical.LogicalFilterOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalProjectOperator;
 import com.starrocks.sql.optimizer.operator.pattern.Pattern;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
@@ -43,20 +45,18 @@ public class RewriteMultiDistinctRule extends TransformationRule {
     @Override
     public boolean check(OptExpression input, OptimizerContext context) {
         LogicalAggregationOperator agg = (LogicalAggregationOperator) input.getOp();
-
-        List<CallOperator> distinctAggOperatorList = agg.getAggregations().values().stream()
-                .filter(call -> call.isDistinct()).collect(Collectors.toList());
-
-        boolean hasMultiColumns = false;
-        for (CallOperator callOperator : distinctAggOperatorList) {
-            if (callOperator.getChildren().size() > 1) {
-                hasMultiColumns = true;
-                break;
-            }
+        boolean hasNoGroup = agg.getGroupingKeys().isEmpty();
+        // check cbo is enabled and hasNoGroup is true
+        if (context.getSessionVariable().isCboCteReuse()) {
+            return false;
         }
 
-        return (distinctAggOperatorList.size() > 1 && !hasMultiColumns) || agg.getAggregations().values().stream()
-                .anyMatch(call -> call.isDistinct() && call.getFnName().equals(FunctionSet.AVG));
+        List<CallOperator> distinctAggOperatorList = agg.getAggregations().values().stream()
+                .filter(CallOperator::isDistinct).collect(Collectors.toList());
+
+        boolean hasMultiColumns = distinctAggOperatorList.stream().anyMatch(f -> f.getChildren().size() > 1);
+        return (distinctAggOperatorList.size() > 1 || agg.getAggregations().values().stream()
+                .anyMatch(call -> call.isDistinct() && call.getFnName().equals(FunctionSet.AVG))) && !hasMultiColumns;
     }
 
     @Override
@@ -127,25 +127,32 @@ public class RewriteMultiDistinctRule extends TransformationRule {
             }
         }
 
+        OptExpression result;
         if (hasAvg) {
             OptExpression aggOpt = OptExpression
-                    .create(new LogicalAggregationOperator(aggregationOperator.getGroupingKeys(), newAggMapWithAvg),
+                    .create(new LogicalAggregationOperator(AggType.GLOBAL, aggregationOperator.getGroupingKeys(),
+                                    newAggMapWithAvg),
                             input.getInputs());
             aggregationOperator.getGroupingKeys().forEach(c -> projections.put(c, c));
-            return Lists.newArrayList(
-                    OptExpression.create(new LogicalProjectOperator(projections), Lists.newArrayList(aggOpt)));
+            result = OptExpression.create(new LogicalProjectOperator(projections), Lists.newArrayList(aggOpt));
         } else {
-            OptExpression aggOpt = OptExpression
-                    .create(new LogicalAggregationOperator(aggregationOperator.getGroupingKeys(), newAggMap),
+            result = OptExpression
+                    .create(new LogicalAggregationOperator(AggType.GLOBAL, aggregationOperator.getGroupingKeys(),
+                                    newAggMap),
                             input.getInputs());
-            return Lists.newArrayList(aggOpt);
         }
+
+        if (aggregationOperator.getPredicate() != null) {
+            result = OptExpression.create(new LogicalFilterOperator(aggregationOperator.getPredicate()), result);
+        }
+
+        return Lists.newArrayList(result);
     }
 
     private CallOperator buildMultiCountDistinct(CallOperator oldFunctionCall) {
         Function searchDesc = new Function(new FunctionName(FunctionSet.MULTI_DISTINCT_COUNT),
                 oldFunctionCall.getFunction().getArgs(), Type.INVALID, false);
-        Function fn = Catalog.getCurrentCatalog().getFunction(searchDesc, IS_NONSTRICT_SUPERTYPE_OF);
+        Function fn = GlobalStateMgr.getCurrentState().getFunction(searchDesc, IS_NONSTRICT_SUPERTYPE_OF);
 
         return (CallOperator) scalarRewriter.rewrite(
                 new CallOperator(FunctionSet.MULTI_DISTINCT_COUNT, fn.getReturnType(), oldFunctionCall.getChildren(),
@@ -156,7 +163,7 @@ public class RewriteMultiDistinctRule extends TransformationRule {
     private CallOperator buildMultiSumDistinct(CallOperator oldFunctionCall) {
         Function searchDesc = new Function(new FunctionName(FunctionSet.MULTI_DISTINCT_SUM),
                 oldFunctionCall.getFunction().getArgs(), Type.INVALID, false);
-        Function fn = Catalog.getCurrentCatalog().getFunction(searchDesc, IS_NONSTRICT_SUPERTYPE_OF);
+        Function fn = GlobalStateMgr.getCurrentState().getFunction(searchDesc, IS_NONSTRICT_SUPERTYPE_OF);
 
         return (CallOperator) scalarRewriter.rewrite(
                 new CallOperator(FunctionSet.MULTI_DISTINCT_SUM, fn.getReturnType(), oldFunctionCall.getChildren(), fn),

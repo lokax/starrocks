@@ -38,7 +38,6 @@ public class CloneTask extends AgentTask {
     private TStorageMedium storageMedium;
 
     private long visibleVersion;
-    private long visibleVersionHash;
 
     private long srcPathHash = -1;
     private long destPathHash = -1;
@@ -47,15 +46,17 @@ public class CloneTask extends AgentTask {
 
     private int taskVersion = VERSION_1;
 
+    // Migration between different disks on the same backend
+    private boolean isLocal = false;
+
     public CloneTask(long backendId, long dbId, long tableId, long partitionId, long indexId,
                      long tabletId, int schemaHash, List<TBackend> srcBackends, TStorageMedium storageMedium,
-                     long visibleVersion, long visibleVersionHash, int timeoutS) {
+                     long visibleVersion, int timeoutS) {
         super(null, backendId, TTaskType.CLONE, dbId, tableId, partitionId, indexId, tabletId);
         this.schemaHash = schemaHash;
         this.srcBackends = srcBackends;
         this.storageMedium = storageMedium;
         this.visibleVersion = visibleVersion;
-        this.visibleVersionHash = visibleVersionHash;
         this.timeoutS = timeoutS;
     }
 
@@ -71,10 +72,6 @@ public class CloneTask extends AgentTask {
         return visibleVersion;
     }
 
-    public long getVisibleVersionHash() {
-        return visibleVersionHash;
-    }
-
     public void setPathHash(long srcPathHash, long destPathHash) {
         this.srcPathHash = srcPathHash;
         this.destPathHash = destPathHash;
@@ -85,17 +82,25 @@ public class CloneTask extends AgentTask {
         return taskVersion;
     }
 
+    public boolean isLocal() {
+        return isLocal;
+    }
+
+    public void setIsLocal(boolean isLocal) {
+        this.isLocal = isLocal;
+    }
+
     public TCloneReq toThrift() {
         TCloneReq request = new TCloneReq(tabletId, schemaHash, srcBackends);
         request.setStorage_medium(storageMedium);
         request.setCommitted_version(visibleVersion);
-        request.setCommitted_version_hash(visibleVersionHash);
         request.setTask_version(taskVersion);
         if (taskVersion == VERSION_2) {
             request.setSrc_path_hash(srcPathHash);
             request.setDest_path_hash(destPathHash);
         }
         request.setTimeout_s(timeoutS);
+        request.setIs_local(isLocal);
 
         return request;
     }
@@ -105,10 +110,11 @@ public class CloneTask extends AgentTask {
         StringBuilder sb = new StringBuilder();
         sb.append("tablet id: ").append(tabletId).append(", schema hash: ").append(schemaHash);
         sb.append(", storageMedium: ").append(storageMedium.name());
-        sb.append(", visible version(hash): ").append(visibleVersion).append("-").append(visibleVersionHash);
+        sb.append(", visible version(hash): ").append(visibleVersion).append("-").append(0);
         sb.append(", src backend: ").append(srcBackends.get(0).getHost()).append(", src path hash: ")
                 .append(srcPathHash);
         sb.append(", dest backend: ").append(backendId).append(", dest path hash: ").append(destPathHash);
+        sb.append(", is local: ").append(isLocal);
         return sb.toString();
     }
 }

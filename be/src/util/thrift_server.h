@@ -19,14 +19,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_COMMON_UTIL_THRIFT_SERVER_H
-#define STARROCKS_BE_SRC_COMMON_UTIL_THRIFT_SERVER_H
+#pragma once
 
 #include <thrift/TProcessor.h>
 #include <thrift/server/TServer.h>
 
-#include <boost/thread.hpp>
-#include <boost/unordered_map.hpp>
+#include <thread>
+#include <unordered_map>
 
 #include "common/status.h"
 #include "util/metrics.h"
@@ -69,14 +68,14 @@ public:
     //  - name: human-readable name of this server. Should not contain spaces
     //  - processor: Thrift processor to handle RPCs
     //  - port: The port the server will listen for connections on
-    //  - metrics: if not NULL, the server will register metrics on this object
+    //  - metrics: if not nullptr, the server will register metrics on this object
     //  - num_worker_threads: the number of worker threads to use in any thread pool
     //  - server_type: the type of IO strategy this server should employ
-    ThriftServer(const std::string& name, const std::shared_ptr<apache::thrift::TProcessor>& processor, int port,
-                 MetricRegistry* metrics = NULL, int num_worker_threads = DEFAULT_WORKER_THREADS,
+    ThriftServer(const std::string& name, std::shared_ptr<apache::thrift::TProcessor> processor, int port,
+                 MetricRegistry* metrics = nullptr, int num_worker_threads = DEFAULT_WORKER_THREADS,
                  ServerType server_type = THREADED);
 
-    ~ThriftServer() {}
+    ~ThriftServer() = default;
 
     int port() const { return _port; }
 
@@ -107,6 +106,9 @@ private:
     // True if the server has been successfully started, for internal use only
     bool _started;
 
+    // True if the server has been stop()
+    bool _stopped = false;
+
     // The port on which the server interface is exposed
     int _port;
 
@@ -121,13 +123,13 @@ private:
     const std::string _name;
 
     // Thread that runs the TNonblockingServer::serve loop
-    std::unique_ptr<boost::thread> _server_thread;
+    std::unique_ptr<std::thread> _server_thread;
 
     // Thrift housekeeping
     std::unique_ptr<apache::thrift::server::TServer> _server;
     std::shared_ptr<apache::thrift::TProcessor> _processor;
 
-    // If not NULL, called when session events happen. Not owned by us.
+    // If not nullptr, called when session events happen. Not owned by us.
     SessionHandlerIf* _session_handler;
 
     // Protects _session_keys
@@ -135,7 +137,7 @@ private:
 
     // Map of active session keys to shared_ptr containing that key; when a key is
     // removed it is automatically freed.
-    typedef boost::unordered_map<SessionKey*, std::shared_ptr<SessionKey> > SessionKeySet;
+    typedef std::unordered_map<SessionKey*, std::shared_ptr<SessionKey> > SessionKeySet;
     SessionKeySet _session_keys;
 
     // True if metrics are enabled
@@ -154,5 +156,3 @@ private:
 };
 
 } // namespace starrocks
-
-#endif

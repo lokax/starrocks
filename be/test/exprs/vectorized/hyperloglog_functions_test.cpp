@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/hyperloglog_functions.h"
 
@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "exprs/vectorized/mock_vectorized_expr.h"
+#include "util/phmap/phmap.h"
 
 namespace starrocks {
 namespace vectorized {

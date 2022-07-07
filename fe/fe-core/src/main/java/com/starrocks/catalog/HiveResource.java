@@ -1,16 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.catalog;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.proc.BaseProcResult;
 import org.apache.commons.lang.StringUtils;
 
 import java.util.Map;
+
+import static com.starrocks.common.util.Util.validateMetastoreUris;
 
 /**
  * Hive resource for external hive table
@@ -26,27 +27,26 @@ import java.util.Map;
  * DROP RESOURCE "hive0";
  */
 public class HiveResource extends Resource {
+
+    // require only one property currently
     private static final String HIVE_METASTORE_URIS = "hive.metastore.uris";
 
     @SerializedName(value = "metastoreURIs")
     private String metastoreURIs;
 
-    @SerializedName(value = "properties")
-    private Map<String, String> properties;
-
     public HiveResource(String name) {
         super(name, ResourceType.HIVE);
-        properties = Maps.newHashMap();
     }
 
     @Override
     protected void setProperties(Map<String, String> properties) throws DdlException {
-        Preconditions.checkState(properties != null);
+        Preconditions.checkState(properties != null, "properties can not be null");
 
         metastoreURIs = properties.get(HIVE_METASTORE_URIS);
         if (StringUtils.isBlank(metastoreURIs)) {
             throw new DdlException(HIVE_METASTORE_URIS + " must be set in properties");
         }
+        validateMetastoreUris(metastoreURIs);
     }
 
     @Override
@@ -57,5 +57,31 @@ public class HiveResource extends Resource {
 
     public String getHiveMetastoreURIs() {
         return metastoreURIs;
+    }
+
+    /**
+     * <p>alter the resource properties.</p>
+     * <p>the user can not alter the property that the system does not support.
+     * currently , hive resource only support 'hive.metastore.uris' property to alter. </p>
+     *
+     * @param properties the properties that user uses to alter
+     * @throws DdlException
+     */
+    public void alterProperties(Map<String, String> properties) throws DdlException {
+        Preconditions.checkState(properties != null, "properties can not be null");
+
+        for (Map.Entry<String, String> entry : properties.entrySet()) {
+            String key = entry.getKey();
+            String value = entry.getValue();
+            if (HIVE_METASTORE_URIS.equals(key)) {
+                if (StringUtils.isBlank(value)) {
+                    throw new DdlException(HIVE_METASTORE_URIS + " can not be null");
+                }
+                validateMetastoreUris(value);
+                this.metastoreURIs = value;
+            } else {
+                throw new DdlException(String.format("property %s has not support yet", key));
+            }
+        }
     }
 }

@@ -1,21 +1,21 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exec/vectorized/file_scanner.h"
 
+#include <memory>
+
+#include "column/chunk.h"
 #include "column/column_helper.h"
 #include "column/hash_set.h"
-#include "env/compressed_file.h"
-#include "env/env.h"
-#include "env/env_broker.h"
-#include "env/env_stream_pipe.h"
-#include "env/env_util.h"
-#include "exec/decompressor.h"
+#include "fs/fs.h"
+#include "fs/fs_broker.h"
 #include "gutil/strings/substitute.h"
+#include "io/compressed_input_stream.h"
 #include "runtime/descriptors.h"
 #include "runtime/exec_env.h"
-#include "runtime/mem_tracker.h"
 #include "runtime/runtime_state.h"
 #include "runtime/stream_load/load_stream_mgr.h"
+#include "util/compression/stream_compression.h"
 
 namespace starrocks::vectorized {
 
@@ -27,17 +27,12 @@ FileScanner::FileScanner(starrocks::RuntimeState* state, starrocks::RuntimeProfi
           _params(params),
           _counter(counter),
           _row_desc(nullptr),
-#if BE_TEST
-          _mem_tracker(new MemTracker()),
-#else
-          _mem_tracker(new MemTracker(-1, "Broker FileScanner", state->instance_mem_tracker())),
-//          _mem_pool(_state->instance_mem_tracker()),
-#endif
           _strict_mode(false),
-          _error_counter(0) {
-}
+          _error_counter(0) {}
 
-FileScanner::~FileScanner() {
+FileScanner::~FileScanner() = default;
+
+void FileScanner::close() {
     Expr::close(_dest_expr_ctx, _state);
 }
 
@@ -90,7 +85,7 @@ Status FileScanner::init_expr_ctx() {
 
         ExprContext* ctx = nullptr;
         RETURN_IF_ERROR(Expr::create_expr_tree(_state->obj_pool(), it->second, &ctx));
-        RETURN_IF_ERROR(ctx->prepare(_state, *_row_desc.get(), _mem_tracker.get()));
+        RETURN_IF_ERROR(ctx->prepare(_state));
         RETURN_IF_ERROR(ctx->open(_state));
 
         _dest_expr_ctx.emplace_back(ctx);
@@ -140,7 +135,8 @@ void FileScanner::fill_columns_from_path(starrocks::vectorized::ChunkPtr& chunk,
     }
 }
 
-ChunkPtr FileScanner::materialize(const starrocks::vectorized::ChunkPtr& src, starrocks::vectorized::ChunkPtr& cast) {
+StatusOr<ChunkPtr> FileScanner::materialize(const starrocks::vectorized::ChunkPtr& src,
+                                            starrocks::vectorized::ChunkPtr& cast) {
     SCOPED_RAW_TIMER(&_counter->materialize_ns);
     // materialize
     ChunkPtr dest_chunk = std::make_shared<Chunk>();
@@ -162,8 +158,7 @@ ChunkPtr FileScanner::materialize(const starrocks::vectorized::ChunkPtr& src, st
 
         int dest_index = ctx_index++;
         ExprContext* ctx = _dest_expr_ctx[dest_index];
-
-        auto col = ctx->evaluate(cast.get());
+        ASSIGN_OR_RETURN(auto col, ctx->evaluate(cast.get()));
         uintptr_t col_pointer = reinterpret_cast<uintptr_t>(col.get());
         if (column_pointers.contains(col_pointer)) {
             col = col->clone();
@@ -189,11 +184,10 @@ ChunkPtr FileScanner::materialize(const starrocks::vectorized::ChunkPtr& src, st
                     if (_error_counter > 50) {
                         continue;
                     }
-                    _state->append_error_msg_to_file(
-                            src->debug_row(i),
-                            strings::Substitute("column($0) value is incorrect while strict "
-                                                "mode is $1, src value is $2",
-                                                slot->col_name(), _strict_mode, src_col->debug_item(i)));
+                    std::stringstream error_msg;
+                    error_msg << "Value '" << src_col->debug_item(i) << "' is out of range. "
+                              << "The type of '" << slot->col_name() << "' is " << slot->type().debug_string();
+                    _state->append_error_msg_to_file(src->debug_row(i), error_msg.str());
                 }
             }
 
@@ -212,8 +206,7 @@ ChunkPtr FileScanner::materialize(const starrocks::vectorized::ChunkPtr& src, st
                     }
                     _state->append_error_msg_to_file(
                             src->debug_row(i),
-                            strings::Substitute("column($0)) value is null while columns is not nullable",
-                                                slot->col_name()));
+                            strings::Substitute("NULL value in non-nullable column '$0'", slot->col_name()));
                 }
             }
         }
@@ -250,7 +243,7 @@ Status FileScanner::create_sequential_file(const TBrokerRangeDesc& range_desc, c
     std::shared_ptr<SequentialFile> src_file;
     switch (range_desc.file_type) {
     case TFileType::FILE_LOCAL: {
-        RETURN_IF_ERROR(env_util::open_file_for_sequential(Env::Default(), range_desc.path, &src_file));
+        ASSIGN_OR_RETURN(src_file, FileSystem::Default()->new_sequential_file(range_desc.path));
         break;
     }
     case TFileType::FILE_STREAM: {
@@ -260,13 +253,17 @@ Status FileScanner::create_sequential_file(const TBrokerRangeDesc& range_desc, c
             range_desc.load_id.printTo(ss);
             return Status::InternalError(std::string(ss.str()));
         }
-        src_file = std::make_shared<StreamPipeSequentialFile>(std::move(pipe));
+        bool non_blocking_read = false;
+        if (params.__isset.non_blocking_read) {
+            non_blocking_read = params.non_blocking_read;
+        }
+        auto stream = std::make_shared<StreamLoadPipeInputStream>(std::move(pipe), non_blocking_read);
+        src_file = std::make_shared<SequentialFile>(std::move(stream), "stream-load-pipe");
         break;
     }
     case TFileType::FILE_BROKER: {
-        EnvBroker env_broker(address, params.properties);
-        std::unique_ptr<SequentialFile> broker_file;
-        RETURN_IF_ERROR(env_broker.new_sequential_file(range_desc.path, &broker_file));
+        BrokerFileSystem fs_broker(address, params.properties);
+        ASSIGN_OR_RETURN(auto broker_file, fs_broker.new_sequential_file(range_desc.path));
         src_file = std::shared_ptr<SequentialFile>(std::move(broker_file));
         break;
     }
@@ -276,10 +273,11 @@ Status FileScanner::create_sequential_file(const TBrokerRangeDesc& range_desc, c
         return Status::OK();
     }
 
-    using DecompressorPtr = std::shared_ptr<Decompressor>;
-    Decompressor* dec = nullptr;
-    RETURN_IF_ERROR(Decompressor::create_decompressor(compression, &dec));
-    *file = std::make_shared<CompressedSequentialFile>(std::move(src_file), DecompressorPtr(dec));
+    using DecompressorPtr = std::shared_ptr<StreamCompression>;
+    std::unique_ptr<StreamCompression> dec;
+    RETURN_IF_ERROR(StreamCompression::create_decompressor(compression, &dec));
+    auto stream = std::make_unique<io::CompressedInputStream>(src_file->stream(), DecompressorPtr(dec.release()));
+    *file = std::make_shared<SequentialFile>(std::move(stream), range_desc.path);
     return Status::OK();
 }
 
@@ -289,16 +287,12 @@ Status FileScanner::create_random_access_file(const TBrokerRangeDesc& range_desc
     std::shared_ptr<RandomAccessFile> src_file;
     switch (range_desc.file_type) {
     case TFileType::FILE_LOCAL: {
-        RETURN_IF_ERROR(env_util::open_file_for_random(Env::Default(), range_desc.path, &src_file));
+        ASSIGN_OR_RETURN(src_file, FileSystem::Default()->new_random_access_file(range_desc.path));
         break;
     }
     case TFileType::FILE_BROKER: {
-        EnvBroker env_broker(address, params.properties);
-        std::unique_ptr<RandomAccessFile> broker_file;
-        RETURN_IF_ERROR(env_broker.new_random_access_file(range_desc.path, &broker_file));
-        if (range_desc.start_offset != 0) {
-            return Status::NotSupported("non-zero start offset");
-        }
+        BrokerFileSystem fs_broker(address, params.properties);
+        ASSIGN_OR_RETURN(auto broker_file, fs_broker.new_random_access_file(range_desc.path));
         src_file = std::shared_ptr<RandomAccessFile>(std::move(broker_file));
         break;
     }

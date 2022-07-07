@@ -23,36 +23,45 @@ package com.starrocks.metric;
 
 import com.codahale.metrics.Histogram;
 import com.codahale.metrics.MetricRegistry;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Sets;
 import com.starrocks.alter.Alter;
 import com.starrocks.alter.AlterJob.JobType;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.TabletInvertedIndex;
 import com.starrocks.common.Config;
+import com.starrocks.common.DdlException;
 import com.starrocks.common.ThreadPoolManager;
+import com.starrocks.common.UserException;
+import com.starrocks.common.util.KafkaUtil;
 import com.starrocks.load.EtlJobType;
 import com.starrocks.load.loadv2.JobState;
 import com.starrocks.load.loadv2.LoadManager;
+import com.starrocks.load.routineload.KafkaProgress;
+import com.starrocks.load.routineload.KafkaRoutineLoadJob;
 import com.starrocks.load.routineload.RoutineLoadJob;
 import com.starrocks.load.routineload.RoutineLoadManager;
 import com.starrocks.metric.Metric.MetricType;
 import com.starrocks.metric.Metric.MetricUnit;
 import com.starrocks.monitor.jvm.JvmService;
 import com.starrocks.monitor.jvm.JvmStats;
-import com.starrocks.persist.EditLog;
+import com.starrocks.proto.PKafkaOffsetProxyRequest;
+import com.starrocks.proto.PKafkaOffsetProxyResult;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.ExecuteEnv;
 import com.starrocks.system.Backend;
 import com.starrocks.system.SystemInfoService;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.SortedMap;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 public final class MetricRepo {
     private static final Logger LOG = LogManager.getLogger(MetricRepo.class);
@@ -71,6 +80,7 @@ public final class MetricRepo {
     public static LongCounterMetric COUNTER_QUERY_ERR;
     public static LongCounterMetric COUNTER_QUERY_TIMEOUT;
     public static LongCounterMetric COUNTER_QUERY_SUCCESS;
+    public static LongCounterMetric COUNTER_SLOW_QUERY;
     public static LongCounterMetric COUNTER_LOAD_ADD;
     public static LongCounterMetric COUNTER_LOAD_FINISHED;
     public static LongCounterMetric COUNTER_EDIT_LOG_WRITE;
@@ -89,6 +99,9 @@ public final class MetricRepo {
 
     public static Histogram HISTO_QUERY_LATENCY;
     public static Histogram HISTO_EDIT_LOG_WRITE_LATENCY;
+    public static Histogram HISTO_JOURNAL_WRITE_LATENCY;
+    public static Histogram HISTO_JOURNAL_WRITE_BATCH;
+    public static Histogram HISTO_JOURNAL_WRITE_BYTES;
 
     // following metrics will be updated by metric calculator
     public static GaugeMetricImpl<Double> GAUGE_QUERY_PER_SECOND;
@@ -103,6 +116,7 @@ public final class MetricRepo {
     public static GaugeMetricImpl<Double> GAUGE_QUERY_LATENCY_P99;
     public static GaugeMetricImpl<Double> GAUGE_QUERY_LATENCY_P999;
     public static GaugeMetricImpl<Long> GAUGE_MAX_TABLET_COMPACTION_SCORE;
+    public static GaugeMetricImpl<Long> GAUGE_STACKED_JOURNAL_NUM;
 
     private static ScheduledThreadPoolExecutor metricTimer =
             ThreadPoolManager.newDaemonScheduledThreadPool(1, "Metric-Timer-Pool", true);
@@ -115,14 +129,18 @@ public final class MetricRepo {
 
         // 1. gauge
         // load jobs
-        LoadManager loadManger = Catalog.getCurrentCatalog().getLoadManager();
+        LoadManager loadManger = GlobalStateMgr.getCurrentState().getLoadManager();
         for (EtlJobType jobType : EtlJobType.values()) {
+            if (jobType == EtlJobType.MINI || jobType == EtlJobType.UNKNOWN) {
+                continue;
+            }
+
             for (JobState state : JobState.values()) {
                 GaugeMetric<Long> gauge = (GaugeMetric<Long>) new GaugeMetric<Long>("job",
                         MetricUnit.NOUNIT, "job statistics") {
                     @Override
                     public Long getValue() {
-                        if (!Catalog.getCurrentCatalog().isMaster()) {
+                        if (!GlobalStateMgr.getCurrentState().isMaster()) {
                             return 0L;
                         }
                         return loadManger.getLoadJobNum(state, jobType);
@@ -136,7 +154,7 @@ public final class MetricRepo {
         }
 
         // running alter job
-        Alter alter = Catalog.getCurrentCatalog().getAlterInstance();
+        Alter alter = GlobalStateMgr.getCurrentState().getAlterInstance();
         for (JobType jobType : JobType.values()) {
             if (jobType != JobType.SCHEMA_CHANGE && jobType != JobType.ROLLUP) {
                 continue;
@@ -146,7 +164,7 @@ public final class MetricRepo {
                     MetricUnit.NOUNIT, "job statistics") {
                 @Override
                 public Long getValue() {
-                    if (!Catalog.getCurrentCatalog().isMaster()) {
+                    if (!GlobalStateMgr.getCurrentState().isMaster()) {
                         return 0L;
                     }
                     if (jobType == JobType.SCHEMA_CHANGE) {
@@ -182,30 +200,37 @@ public final class MetricRepo {
                 "max_journal_id", MetricUnit.NOUNIT, "max journal id of this frontends") {
             @Override
             public Long getValue() {
-                EditLog editLog = Catalog.getCurrentCatalog().getEditLog();
-                if (editLog == null) {
-                    return -1L;
-                }
-                return editLog.getMaxJournalId();
+                return GlobalStateMgr.getCurrentState().getMaxJournalId();
             }
         };
         STARROCKS_METRIC_REGISTER.addMetric(maxJournalId);
+
+        // meta log total count
+        GaugeMetric<Long> metaLogCount = new GaugeMetric<Long>(
+                "meta_log_count", MetricUnit.NOUNIT, "meta log total count") {
+            @Override
+            public Long getValue() {
+                return GlobalStateMgr.getCurrentState().getMaxJournalId() -
+                        GlobalStateMgr.getCurrentState().getImageJournalId();
+            }
+        };
+        STARROCKS_METRIC_REGISTER.addMetric(metaLogCount);
 
         // scheduled tablet num
         GaugeMetric<Long> scheduledTabletNum = (GaugeMetric<Long>) new GaugeMetric<Long>(
                 "scheduled_tablet_num", MetricUnit.NOUNIT, "number of tablets being scheduled") {
             @Override
             public Long getValue() {
-                if (!Catalog.getCurrentCatalog().isMaster()) {
+                if (!GlobalStateMgr.getCurrentState().isMaster()) {
                     return 0L;
                 }
-                return (long) Catalog.getCurrentCatalog().getTabletScheduler().getTotalNum();
+                return (long) GlobalStateMgr.getCurrentState().getTabletScheduler().getTotalNum();
             }
         };
         STARROCKS_METRIC_REGISTER.addMetric(scheduledTabletNum);
 
         // routine load jobs
-        RoutineLoadManager routineLoadManger = Catalog.getCurrentCatalog().getRoutineLoadManager();
+        RoutineLoadManager routineLoadManger = GlobalStateMgr.getCurrentState().getRoutineLoadManager();
         for (RoutineLoadJob.JobState state : RoutineLoadJob.JobState.values()) {
             GaugeMetric<Long> gauge = (GaugeMetric<Long>) new GaugeMetric<Long>("routine_load_jobs",
                     MetricUnit.NOUNIT, "routine load jobs") {
@@ -239,6 +264,11 @@ public final class MetricRepo {
                 MetricUnit.NOUNIT, "max tablet compaction score of all backends");
         GAUGE_MAX_TABLET_COMPACTION_SCORE.setValue(0L);
         STARROCKS_METRIC_REGISTER.addMetric(GAUGE_MAX_TABLET_COMPACTION_SCORE);
+
+        GAUGE_STACKED_JOURNAL_NUM = new GaugeMetricImpl<>(
+                "editlog_stacked_num", MetricUnit.OPERATIONS, "counter of edit log that are stacked");
+        GAUGE_STACKED_JOURNAL_NUM.setValue(0L);
+        STARROCKS_METRIC_REGISTER.addMetric(GAUGE_STACKED_JOURNAL_NUM);
 
         GAUGE_QUERY_LATENCY_MEAN =
                 new GaugeMetricImpl<>("query_latency", MetricUnit.MILLISECONDS, "mean of query latency");
@@ -293,6 +323,8 @@ public final class MetricRepo {
         STARROCKS_METRIC_REGISTER.addMetric(COUNTER_QUERY_TIMEOUT);
         COUNTER_QUERY_SUCCESS = new LongCounterMetric("query_success", MetricUnit.REQUESTS, "total success query");
         STARROCKS_METRIC_REGISTER.addMetric(COUNTER_QUERY_SUCCESS);
+        COUNTER_SLOW_QUERY = new LongCounterMetric("slow_query", MetricUnit.REQUESTS, "total slow query");
+        STARROCKS_METRIC_REGISTER.addMetric(COUNTER_SLOW_QUERY);
         COUNTER_LOAD_ADD = new LongCounterMetric("load_add", MetricUnit.REQUESTS, "total load submit");
         STARROCKS_METRIC_REGISTER.addMetric(COUNTER_LOAD_ADD);
         COUNTER_ROUTINE_LOAD_PAUSED =
@@ -340,6 +372,12 @@ public final class MetricRepo {
         HISTO_QUERY_LATENCY = METRIC_REGISTER.histogram(MetricRegistry.name("query", "latency", "ms"));
         HISTO_EDIT_LOG_WRITE_LATENCY =
                 METRIC_REGISTER.histogram(MetricRegistry.name("editlog", "write", "latency", "ms"));
+        HISTO_JOURNAL_WRITE_LATENCY =
+                METRIC_REGISTER.histogram(MetricRegistry.name("journal", "write", "latency", "ms"));
+        HISTO_JOURNAL_WRITE_BATCH =
+                METRIC_REGISTER.histogram(MetricRegistry.name("journal", "write", "batch"));
+        HISTO_JOURNAL_WRITE_BYTES =
+                METRIC_REGISTER.histogram(MetricRegistry.name("journal", "write", "bytes"));
 
         // init system metrics
         initSystemMetrics();
@@ -406,8 +444,8 @@ public final class MetricRepo {
         STARROCKS_METRIC_REGISTER.removeMetrics(TABLET_NUM);
         STARROCKS_METRIC_REGISTER.removeMetrics(TABLET_MAX_COMPACTION_SCORE);
 
-        SystemInfoService infoService = Catalog.getCurrentSystemInfo();
-        TabletInvertedIndex invertedIndex = Catalog.getCurrentInvertedIndex();
+        SystemInfoService infoService = GlobalStateMgr.getCurrentSystemInfo();
+        TabletInvertedIndex invertedIndex = GlobalStateMgr.getCurrentInvertedIndex();
 
         for (Long beId : infoService.getBackendIds(false)) {
             Backend be = infoService.getBackend(beId);
@@ -420,10 +458,10 @@ public final class MetricRepo {
                     MetricUnit.NOUNIT, "tablet number") {
                 @Override
                 public Long getValue() {
-                    if (!Catalog.getCurrentCatalog().isMaster()) {
+                    if (!GlobalStateMgr.getCurrentState().isMaster()) {
                         return 0L;
                     }
-                    return (long) invertedIndex.getTabletNumByBackendId(beId);
+                    return invertedIndex.getTabletNumByBackendId(beId);
                 }
             };
             tabletNum.addLabel(new MetricLabel("backend", be.getHost() + ":" + be.getHeartbeatPort()));
@@ -435,7 +473,7 @@ public final class MetricRepo {
                     "tablet max compaction score") {
                 @Override
                 public Long getValue() {
-                    if (!Catalog.getCurrentCatalog().isMaster()) {
+                    if (!GlobalStateMgr.getCurrentState().isMaster()) {
                         return 0L;
                     }
                     return be.getTabletMaxCompactionScore();
@@ -476,6 +514,12 @@ public final class MetricRepo {
         for (Map.Entry<String, Histogram> entry : histograms.entrySet()) {
             visitor.visitHistogram(entry.getKey(), entry.getValue());
         }
+        ResourceGroupMetricMgr.visitQueryLatency();
+
+        // collect routine load process metrics
+        if (Config.enable_routine_load_lag_metrics) {
+            collectRoutineLoadProcessMetrics(visitor);
+        }
 
         // node info
         visitor.getNodeInfo();
@@ -489,10 +533,10 @@ public final class MetricRepo {
 
     // collect table-level metrics
     private static void collectTableMetrics(MetricVisitor visitor, boolean minifyTableMetrics) {
-        Catalog catalog = Catalog.getCurrentCatalog();
-        List<String> dbNames = catalog.getDbNames();
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        List<String> dbNames = globalStateMgr.getDbNames();
         for (String dbName : dbNames) {
-            Database db = Catalog.getCurrentCatalog().getDb(dbName);
+            Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
             if (null == db) {
                 continue;
             }
@@ -514,6 +558,78 @@ public final class MetricRepo {
                 }
             } finally {
                 db.readUnlock();
+            }
+        }
+    }
+
+    private static void collectRoutineLoadProcessMetrics(MetricVisitor visitor) {
+        List<RoutineLoadJob> jobs = GlobalStateMgr.getCurrentState().getRoutineLoadManager().getRoutineLoadJobByState(
+                Sets.newHashSet(RoutineLoadJob.JobState.NEED_SCHEDULE, RoutineLoadJob.JobState.RUNNING));
+
+        List<RoutineLoadJob> kafkaJobs = jobs.stream()
+                .filter(job -> (job instanceof KafkaRoutineLoadJob)
+                        && ((KafkaProgress) job.getProgress()).hasPartition())
+                .collect(Collectors.toList());
+
+        if (kafkaJobs.size() <= 0) {
+            return;
+        }
+
+        // get all partitions offset in a batch api
+        List<PKafkaOffsetProxyRequest> requests = new ArrayList<>();
+        for (RoutineLoadJob job : kafkaJobs) {
+            KafkaRoutineLoadJob kJob = (KafkaRoutineLoadJob) job;
+            try {
+                kJob.convertCustomProperties(false);
+            } catch (DdlException e) {
+                LOG.warn("convert custom properties failed", e);
+                return;
+            }
+            PKafkaOffsetProxyRequest offsetProxyRequest = new PKafkaOffsetProxyRequest();
+            offsetProxyRequest.kafkaInfo = KafkaUtil.genPKafkaLoadInfo(kJob.getBrokerList(), kJob.getTopic(),
+                    ImmutableMap.copyOf(kJob.getConvertedCustomProperties()));
+            offsetProxyRequest.partitionIds = new ArrayList<>(
+                    ((KafkaProgress) kJob.getProgress()).getPartitionIdToOffset().keySet());
+            requests.add(offsetProxyRequest);
+        }
+        List<PKafkaOffsetProxyResult> offsetProxyResults;
+        try {
+            offsetProxyResults = KafkaUtil.getBatchOffsets(requests);
+        } catch (UserException e) {
+            LOG.warn("get batch offsets failed", e);
+            return;
+        }
+
+        for (int i = 0; i < kafkaJobs.size(); i++) {
+            KafkaRoutineLoadJob kJob = (KafkaRoutineLoadJob) kafkaJobs.get(i);
+            ImmutableMap<Integer, Long> partitionIdToProgress =
+                    ((KafkaProgress) kJob.getProgress()).getPartitionIdToOffset();
+
+            // offset of partitionIds[i] is beginningOffsets[i] and latestOffsets[i]
+            List<Integer> partitionIds = offsetProxyResults.get(i).partitionIds;
+            List<Long> beginningOffsets = offsetProxyResults.get(i).beginningOffsets;
+            List<Long> latestOffsets = offsetProxyResults.get(i).latestOffsets;
+
+            long maxLag = Long.MIN_VALUE;
+            for (int j = 0; j < partitionIds.size(); j++) {
+                int partitionId = partitionIds.get(j);
+                if (!partitionIdToProgress.containsKey(partitionId)) {
+                    continue;
+                }
+                long progress = partitionIdToProgress.get(partitionId);
+                if (progress == KafkaProgress.OFFSET_BEGINNING_VAL) {
+                    progress = beginningOffsets.get(j);
+                }
+
+                maxLag = Math.max(latestOffsets.get(j) - progress, maxLag);
+            }
+            if (maxLag >= Config.min_routine_load_lag_for_metrics) {
+                GaugeMetricImpl<Long> metric =
+                        new GaugeMetricImpl<>("routine_load_max_lag_of_partition", MetricUnit.NOUNIT,
+                                "routine load kafka lag");
+                metric.addLabel(new MetricLabel("job_name", kJob.getName()));
+                metric.setValue(maxLag);
+                visitor.visit(metric);
             }
         }
     }

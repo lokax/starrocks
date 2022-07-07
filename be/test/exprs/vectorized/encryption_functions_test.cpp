@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/encryption_functions.h"
 
@@ -46,6 +46,51 @@ TEST_F(EncryptionFunctionsTest, aes_encryptGeneralTest) {
 
     for (int j = 0; j < sizeof(results) / sizeof(results[0]); ++j) {
         ASSERT_EQ(results[j], v->get_data()[j].to_string());
+    }
+}
+
+TEST_F(EncryptionFunctionsTest, aes_encryptSingularCasesTest) {
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+    Columns columns;
+    auto plain = BinaryColumn::create();
+    auto text = BinaryColumn::create();
+    auto null_column = NullColumn::create();
+
+    std::string plains[] = {"key", "kewfewy", "apacheejian", "", ""};
+    std::string texts[] = {"key", "doris342422131ey", "naixuex", "", ""};
+    std::string results[] = {"CEF5BE724B7B98B63216C95A7BD681C9", "424B4E9B042FC5274A77A82BB4BB9826",
+                             "09529C15ECF0FC27073310DCEB76FAF4", "0143DB63EE66B0CDFF9F69917680151E",
+                             "0143DB63EE66B0CDFF9F69917680151E"};
+
+    for (int j = 0; j < sizeof(plains) / sizeof(plains[0]); ++j) {
+        plain->append(plains[j]);
+        if (j % 2 == 0) {
+            null_column->append(DATUM_NOT_NULL);
+            text->append(texts[j]);
+        } else {
+            null_column->append(DATUM_NULL);
+            text->append_default();
+        }
+    }
+
+    auto nullable_text = NullableColumn::create(text, null_column);
+    columns.emplace_back(plain);
+    columns.emplace_back(nullable_text);
+
+    ColumnPtr result = EncryptionFunctions::aes_encrypt(ctx.get(), columns);
+
+    columns.clear();
+    columns.emplace_back(result);
+    result = StringFunctions::hex_string(ctx.get(), columns);
+    ASSERT_TRUE(result->is_nullable());
+    for (int j = 0; j < sizeof(results) / sizeof(results[0]); ++j) {
+        if (j % 2 == 0) {
+            ASSERT_FALSE(result->is_null(j));
+            auto datum = result->get(j);
+            ASSERT_EQ(results[j], datum.get_slice().to_string());
+        } else {
+            ASSERT_TRUE(result->is_null(j));
+        }
     }
 }
 
@@ -688,6 +733,76 @@ TEST_F(EncryptionFunctionsTest, md5sumNullTest) {
         ASSERT_EQ(results[j], v->get_data()[j].to_string());
     }
 }
+
+class ShaTestFixture : public ::testing::TestWithParam<std::tuple<std::string, int, std::string>> {};
+
+TEST_P(ShaTestFixture, test_sha2) {
+    auto [str, len, expected] = GetParam();
+
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+    Columns columns;
+
+    auto plain = BinaryColumn::create();
+    plain->append(str);
+
+    ColumnPtr hash_length =
+            len == -1 ? ColumnHelper::create_const_null_column(1) : ColumnHelper::create_const_column<TYPE_INT>(len, 1);
+
+    if (str == "NULL") {
+        columns.emplace_back(ColumnHelper::create_const_null_column(1));
+    } else {
+        columns.emplace_back(plain);
+    }
+    columns.emplace_back(hash_length);
+
+    ctx->impl()->set_constant_columns(columns);
+    ASSERT_TRUE(EncryptionFunctions::sha2_prepare(ctx.get(), FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+
+    if (len != -1) {
+        ASSERT_NE(nullptr, ctx->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+    } else {
+        ASSERT_EQ(nullptr, ctx->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+    }
+
+    ColumnPtr result = EncryptionFunctions::sha2(ctx.get(), columns);
+    if (expected == "NULL") {
+        std::cerr << result->debug_string() << std::endl;
+        EXPECT_TRUE(result->is_null(0));
+    } else {
+        auto v = ColumnHelper::cast_to<TYPE_VARCHAR>(result);
+        EXPECT_EQ(expected, v->get_data()[0].to_string());
+    }
+
+    ASSERT_TRUE(EncryptionFunctions::sha2_close(ctx.get(),
+                                                FunctionContext::FunctionContext::FunctionStateScope::FRAGMENT_LOCAL)
+                        .ok());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+        ShaTest, ShaTestFixture,
+        ::testing::Values(
+                // Invalid cases
+                // -1 means null
+                std::make_tuple("starrocks", -1, "NULL"), std::make_tuple("starrocks", 225, "NULL"),
+                std::make_tuple("NULL", 1, "NULL"),
+
+                // Normal cases
+                std::make_tuple("starrocks", 224, "0057da608f56e8cdd3c22208a93cdda3e142279a694dfc53007e80f3"),
+                std::make_tuple("20211119", 224, "b080f0657e5b67fd52b2f010328d2fad10775f81aa71c05313d46a24"),
+                std::make_tuple("starrocks", 256, "87da3b6aefc0bd626a32626685dad2dba7435095f26c5a9628a6b13ced5721b0"),
+                std::make_tuple("20211119", 256, "1deab4a6f88c6cbab900c2ae0a1da4f0e7e981f8b0f0680d8ec6c25155ab4885"),
+                std::make_tuple("starrocks", 384,
+                                "eda8e790960d9ff4fdc6f481ec57bf443c147bf092086006e98a2ab0108afbaaf8e6f51d197f988dd798d2"
+                                "524b12de2c"),
+                std::make_tuple("20211119", 384,
+                                "6195d65242957bdf844e6623acabf2b0879c9cb282a9490ed332f7fdc41aedbda7802af06d07f38d7ed694"
+                                "49d3ff5bf8"),
+                std::make_tuple("starrocks", 512,
+                                "9df77afa38c688166eaa7511440dd3a0b1c32918e9ae60b8c74e4b0f530852cd1a0facc610b71ebfcbe345"
+                                "f5fa40983fe68a686144d2c6981b8a3fab1b045cd0"),
+                std::make_tuple("20211119", 512,
+                                "eaf18d26b2976216790d95b2942d15b7db5f926c7d62d35f24c98b8eedbe96f2e6241e5e4fdc6b7d9e7893"
+                                "d94d86cd8a6f3bb6b1804c22097b337ecc24f6015e")));
 
 } // namespace vectorized
 } // namespace starrocks

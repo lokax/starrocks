@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rule.implementation;
 
@@ -26,15 +26,11 @@ public class HiveScanImplementationRule extends ImplementationRule {
         LogicalHiveScanOperator scan = (LogicalHiveScanOperator) input.getOp();
         if (scan.getTableType() == Table.TableType.HIVE) {
             PhysicalHiveScanOperator physicalHiveScan = new PhysicalHiveScanOperator(scan.getTable(),
-                    scan.getOutputColumns(),
-                    scan.getColumnRefMap(),
-                    scan.getSelectedPartitionIds(),
-                    scan.getIdToPartitionKey(),
-                    scan.getNoEvalPartitionConjuncts(),
-                    scan.getNonPartitionConjuncts(),
-                    scan.getMinMaxConjuncts(),
-                    scan.getMinMaxColumnRefMap());
-            physicalHiveScan.setLimit(scan.getLimit());
+                    scan.getColRefToColumnMetaMap(),
+                    scan.getScanOperatorPredicates(),
+                    scan.getLimit(),
+                    scan.getPredicate(),
+                    scan.getProjection());
 
             result = new OptExpression(physicalHiveScan);
         }

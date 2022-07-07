@@ -22,8 +22,8 @@
 package com.starrocks.task;
 
 import com.google.common.collect.Lists;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.common.ClientPool;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.thrift.BackendService;
 import com.starrocks.thrift.TAgentServiceVersion;
@@ -50,6 +50,7 @@ import com.starrocks.thrift.TUploadReq;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
@@ -65,7 +66,7 @@ public class AgentBatchTask implements Runnable {
     private final Map<Long, List<AgentTask>> backendIdToTasks;
 
     public AgentBatchTask() {
-        this.backendIdToTasks = new HashMap<Long, List<AgentTask>>();
+        this.backendIdToTasks = new HashMap<>();
     }
 
     public AgentBatchTask(AgentTask singleTask) {
@@ -78,28 +79,30 @@ public class AgentBatchTask implements Runnable {
             return;
         }
         long backendId = agentTask.getBackendId();
-        if (backendIdToTasks.containsKey(backendId)) {
-            List<AgentTask> tasks = backendIdToTasks.get(backendId);
-            tasks.add(agentTask);
-        } else {
-            List<AgentTask> tasks = new LinkedList<AgentTask>();
-            tasks.add(agentTask);
-            backendIdToTasks.put(backendId, tasks);
+        List<AgentTask> tasks = backendIdToTasks.computeIfAbsent(backendId, k -> new ArrayList<>());
+        tasks.add(agentTask);
+    }
+
+    public void addTasks(Long backendId, List<AgentTask> agentTasks) {
+        if (agentTasks == null) {
+            return;
         }
+        List<AgentTask> tasks = backendIdToTasks.computeIfAbsent(backendId, k -> new ArrayList<>());
+        tasks.addAll(agentTasks);
     }
 
     public List<AgentTask> getAllTasks() {
-        List<AgentTask> tasks = new LinkedList<AgentTask>();
-        for (Long backendId : this.backendIdToTasks.keySet()) {
-            tasks.addAll(this.backendIdToTasks.get(backendId));
+        List<AgentTask> tasks = new ArrayList<>(getTaskNum());
+        for (Map.Entry<Long, List<AgentTask>> entry : this.backendIdToTasks.entrySet()) {
+            tasks.addAll(entry.getValue());
         }
         return tasks;
     }
 
     public int getTaskNum() {
         int num = 0;
-        for (List<AgentTask> tasks : backendIdToTasks.values()) {
-            num += tasks.size();
+        for (Map.Entry<Long, List<AgentTask>> entry : backendIdToTasks.entrySet()) {
+            num += entry.getValue().size();
         }
         return num;
     }
@@ -108,8 +111,8 @@ public class AgentBatchTask implements Runnable {
     // NOTICE that even if AgentTask.isFinished() return false, it does not mean that task is not finished.
     // this depends on caller's logic. See comments on 'isFinished' member.
     public boolean isFinished() {
-        for (List<AgentTask> tasks : this.backendIdToTasks.values()) {
-            for (AgentTask agentTask : tasks) {
+        for (Map.Entry<Long, List<AgentTask>> entry : this.backendIdToTasks.entrySet()) {
+            for (AgentTask agentTask : entry.getValue()) {
                 if (!agentTask.isFinished()) {
                     return false;
                 }
@@ -121,11 +124,15 @@ public class AgentBatchTask implements Runnable {
     // return the limit number of unfinished tasks.
     public List<AgentTask> getUnfinishedTasks(int limit) {
         List<AgentTask> res = Lists.newArrayList();
-        for (List<AgentTask> tasks : this.backendIdToTasks.values()) {
-            for (AgentTask agentTask : tasks) {
+        if (limit == 0) {
+            return res;
+        }
+        for (Map.Entry<Long, List<AgentTask>> entry : this.backendIdToTasks.entrySet()) {
+            for (AgentTask agentTask : entry.getValue()) {
                 if (!agentTask.isFinished()) {
-                    if (res.size() < limit) {
-                        res.add(agentTask);
+                    res.add(agentTask);
+                    if (res.size() >= limit) {
+                        return res;
                     }
                 }
             }
@@ -135,11 +142,9 @@ public class AgentBatchTask implements Runnable {
 
     public int getFinishedTaskNum() {
         int count = 0;
-        for (List<AgentTask> tasks : this.backendIdToTasks.values()) {
-            for (AgentTask agentTask : tasks) {
-                if (agentTask.isFinished()) {
-                    count++;
-                }
+        for (Map.Entry<Long, List<AgentTask>> entry : this.backendIdToTasks.entrySet()) {
+            for (AgentTask agentTask : entry.getValue()) {
+                count += agentTask.isFinished() ? 1 : 0;
             }
         }
         return count;
@@ -152,7 +157,7 @@ public class AgentBatchTask implements Runnable {
             TNetworkAddress address = null;
             boolean ok = false;
             try {
-                Backend backend = Catalog.getCurrentSystemInfo().getBackend(backendId);
+                Backend backend = GlobalStateMgr.getCurrentSystemInfo().getBackend(backendId);
                 if (backend == null || !backend.isAlive()) {
                     continue;
                 }
@@ -210,8 +215,7 @@ public class AgentBatchTask implements Runnable {
                 tAgentTaskRequest.setDrop_tablet_req(request);
                 return tAgentTaskRequest;
             }
-            case REALTIME_PUSH:
-            case PUSH: {
+            case REALTIME_PUSH: {
                 PushTask pushTask = (PushTask) task;
                 TPushReq request = pushTask.toThrift();
                 if (LOG.isDebugEnabled()) {

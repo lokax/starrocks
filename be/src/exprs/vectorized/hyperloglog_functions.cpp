@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/hyperloglog_functions.h"
 
@@ -6,9 +6,11 @@
 #include "column/column_viewer.h"
 #include "column/object_column.h"
 #include "exprs/vectorized/unary_function.h"
+#include "types/hll.h"
+#include "udf/udf.h"
+#include "util/phmap/phmap.h"
 
-namespace starrocks {
-namespace vectorized {
+namespace starrocks::vectorized {
 
 // hll_cardinality_from_string
 DEFINE_UNARY_FN_WITH_IMPL(hllCardinalityFromStringImpl, str) {
@@ -64,5 +66,4 @@ ColumnPtr HyperloglogFunction::hll_empty(FunctionContext* context, const Columns
     return ConstColumn::create(p, 1);
 }
 
-} // namespace vectorized
-} // namespace starrocks
+} // namespace starrocks::vectorized

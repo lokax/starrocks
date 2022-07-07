@@ -27,10 +27,10 @@ import com.starrocks.catalog.ColocateTableIndex.GroupId;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
 import org.junit.After;
-import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -38,15 +38,11 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
 
-import java.io.File;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 public class ColocateTableTest {
-    private static String runningDir = "fe/mocked/ColocateTableTest" + UUID.randomUUID().toString() + "/";
-
     private static ConnectContext connectContext;
     private static String dbName = "testDb";
     private static String fullDbName = "default_cluster:" + dbName;
@@ -60,28 +56,22 @@ public class ColocateTableTest {
 
     @BeforeClass
     public static void beforeClass() throws Exception {
-        UtFrameUtils.createMinStarRocksCluster(runningDir);
+        UtFrameUtils.createMinStarRocksCluster();
         connectContext = UtFrameUtils.createDefaultCtx();
         starRocksAssert = new StarRocksAssert(connectContext);
-    }
-
-    @AfterClass
-    public static void tearDown() {
-        File file = new File(runningDir);
-        file.delete();
     }
 
     @Before
     public void createDb() throws Exception {
         starRocksAssert.withDatabase(dbName).useDatabase(dbName);
-        Catalog.getCurrentCatalog().setColocateTableIndex(new ColocateTableIndex());
+        GlobalStateMgr.getCurrentState().setColocateTableIndex(new ColocateTableIndex());
     }
 
     @After
     public void dropDb() throws Exception {
         String dropDbStmtStr = "drop database " + dbName;
         DropDbStmt dropDbStmt = (DropDbStmt) UtFrameUtils.parseAndAnalyzeStmt(dropDbStmtStr, connectContext);
-        Catalog.getCurrentCatalog().dropDb(dropDbStmt);
+        GlobalStateMgr.getCurrentState().getMetadata().dropDb(dropDbStmt.getDbName(), dropDbStmt.isForceDrop());
     }
 
     private static void createTable(String sql) throws Exception {
@@ -102,8 +92,8 @@ public class ColocateTableTest {
                 " \"colocate_with\" = \"" + groupName + "\"\n" +
                 ");");
 
-        ColocateTableIndex index = Catalog.getCurrentColocateIndex();
-        Database db = Catalog.getCurrentCatalog().getDb(fullDbName);
+        ColocateTableIndex index = GlobalStateMgr.getCurrentColocateIndex();
+        Database db = GlobalStateMgr.getCurrentState().getDb(fullDbName);
         long tableId = db.getTable(tableName1).getId();
 
         Assert.assertEquals(1, Deencapsulation.<Multimap<GroupId, Long>>getField(index, "group2Tables").size());
@@ -160,8 +150,8 @@ public class ColocateTableTest {
                 " \"colocate_with\" = \"" + groupName + "\"\n" +
                 ");");
 
-        ColocateTableIndex index = Catalog.getCurrentColocateIndex();
-        Database db = Catalog.getCurrentCatalog().getDb(fullDbName);
+        ColocateTableIndex index = GlobalStateMgr.getCurrentColocateIndex();
+        Database db = GlobalStateMgr.getCurrentState().getDb(fullDbName);
         long firstTblId = db.getTable(tableName1).getId();
         long secondTblId = db.getTable(tableName2).getId();
 

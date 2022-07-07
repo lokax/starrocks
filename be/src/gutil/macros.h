@@ -7,10 +7,9 @@
 // any changes here, make sure that you're not breaking any platforms.
 //
 
-#ifndef BASE_MACROS_H_
-#define BASE_MACROS_H_
+#pragma once
 
-#include <stddef.h> // For size_t
+#include <cstddef> // For size_t
 
 #include "butil/macros.h"
 #include "gutil/port.h"
@@ -95,15 +94,17 @@ struct CompileAssert {};
 // Note, that most uses of DISALLOW_ASSIGN and DISALLOW_COPY are broken
 // semantically, one should either use disallow both or neither. Try to
 // avoid these in new code.
-#ifndef DISALLOW_COPY_AND_ASSIGN
+#undef DISALLOW_COPY_AND_ASSIGN
 #define DISALLOW_COPY_AND_ASSIGN(TypeName) \
     TypeName(const TypeName&) = delete;    \
     void operator=(const TypeName&) = delete
-#endif
 
-// An older, politically incorrect name for the above.
-// Prefer DISALLOW_COPY_AND_ASSIGN for new code.
-#define DISALLOW_EVIL_CONSTRUCTORS(TypeName) DISALLOW_COPY_AND_ASSIGN(TypeName)
+#undef DISALLOW_COPY_AND_MOVE
+#define DISALLOW_COPY_AND_MOVE(TypeName)      \
+    TypeName(const TypeName&) = delete;       \
+    void operator=(const TypeName&) = delete; \
+    TypeName(TypeName&&) = delete;            \
+    void operator=(TypeName&&) = delete
 
 // A macro to disallow all the implicit constructors, namely the
 // default constructor, copy constructor and operator= functions.
@@ -286,5 +287,3 @@ enum LinkerInitialized { LINKER_INITIALIZED };
         static_assert(std::is_pointer<decltype(ptr)>::value == true, #ptr " must be a pointer"); \
         (ptr) = (expr);                                                                          \
     } while ((ptr) == nullptr && errno == EINTR)
-
-#endif // BASE_MACROS_H_

@@ -21,14 +21,15 @@
 
 package com.starrocks.common;
 
-import com.starrocks.proto.PStatus;
+import com.starrocks.proto.StatusPB;
 import com.starrocks.thrift.TStatus;
 import com.starrocks.thrift.TStatusCode;
+
+import java.util.Optional;
 
 public class Status {
     public static final Status OK = new Status();
     public static final Status CANCELLED = new Status(TStatusCode.CANCELLED, "Cancelled");
-    public static final Status THRIFT_RPC_ERROR = new Status(TStatusCode.THRIFT_RPC_ERROR, "Thrift RPC failed");
 
     public TStatusCode getErrorCode() {
         return errorCode;
@@ -74,6 +75,10 @@ public class Status {
         return this.errorCode == TStatusCode.THRIFT_RPC_ERROR;
     }
 
+    public boolean isGlobalDictError() {
+        return this.errorCode == TStatusCode.GLOBAL_DICT_ERROR;
+    }
+
     public void setStatus(Status status) {
         this.errorCode = status.errorCode;
         this.errorMsg = status.getErrorMsg();
@@ -84,10 +89,10 @@ public class Status {
         this.errorMsg = msg;
     }
 
-    public void setPstatus(PStatus status) {
-        this.errorCode = TStatusCode.findByValue(status.status_code);
-        if (status.error_msgs != null && !status.error_msgs.isEmpty()) {
-            this.errorMsg = status.error_msgs.get(0);
+    public void setPstatus(StatusPB status) {
+        this.errorCode = TStatusCode.findByValue(status.statusCode);
+        if (status.errorMsgs != null && !status.errorMsgs.isEmpty()) {
+            this.errorMsg = status.errorMsgs.get(0);
         }
     }
 
@@ -139,6 +144,10 @@ public class Status {
                 break;
             }
         }
+    }
+
+    public String getErrorCodeString() {
+        return Optional.ofNullable(getErrorCode()).map(Enum::toString).orElse("UNKNOWN");
     }
 
     @Override

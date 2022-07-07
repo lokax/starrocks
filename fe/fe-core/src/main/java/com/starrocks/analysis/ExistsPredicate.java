@@ -22,21 +22,11 @@
 package com.starrocks.analysis;
 
 import com.google.common.base.Preconditions;
-import com.starrocks.sql.analyzer.ExprVisitor;
 import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.thrift.TExprNode;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-/**
- * Class representing a [NOT] EXISTS predicate.
- */
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public class ExistsPredicate extends Predicate {
-    private static final Logger LOG = LoggerFactory.getLogger(
-            ExistsPredicate.class);
     private boolean notExists = false;
 
     public boolean isNotExists() {
@@ -70,6 +60,7 @@ public class ExistsPredicate extends Predicate {
         return new ExistsPredicate(this);
     }
 
+    @Override
     public String toSqlImpl() {
         StringBuilder strBuilder = new StringBuilder();
         if (notExists) {
@@ -82,12 +73,24 @@ public class ExistsPredicate extends Predicate {
     }
 
     @Override
+    public String toDigestImpl() {
+        StringBuilder strBuilder = new StringBuilder();
+        if (notExists) {
+            strBuilder.append("not ");
+
+        }
+        strBuilder.append("exists ");
+        strBuilder.append(getChild(0).toDigest());
+        return strBuilder.toString();
+    }
+
+    @Override
     public int hashCode() {
         return 31 * super.hashCode() + Boolean.hashCode(notExists);
     }
 
     @Override
-    public <R, C> R accept(ExprVisitor<R, C> visitor, C context) throws SemanticException {
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) throws SemanticException {
         return visitor.visitExistsPredicate(this, context);
     }
 }

@@ -1,11 +1,12 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "util/buffered_stream.h"
 
 #include <gtest/gtest.h>
 
-#include "env/env.h"
-#include "env/env_memory.h"
+#include "fs/fs.h"
+#include "fs/fs_memory.h"
+#include "io/string_input_stream.h"
 
 namespace starrocks {
 
@@ -21,9 +22,9 @@ TEST_F(BufferedStreamTest, Normal) {
     for (int i = 0; i < 10; ++i) {
         test_str[i] = i;
     }
-    StringRandomAccessFile file(std::move(test_str));
+    RandomAccessFile file(std::make_shared<io::StringInputStream>(std::move(test_str)), "string-file");
 
-    BufferedInputStream stream(&file, 0, 10);
+    DefaultBufferedInputStream stream(&file, 0, 10);
 
     ASSERT_EQ(0, stream.tell());
     {
@@ -57,9 +58,9 @@ TEST_F(BufferedStreamTest, Normal) {
 TEST_F(BufferedStreamTest, Large) {
     std::string test_str;
     test_str.resize(66 * 1024);
-    StringRandomAccessFile file(std::move(test_str));
+    RandomAccessFile file(std::make_shared<io::StringInputStream>(std::move(test_str)), "string-file");
 
-    BufferedInputStream stream(&file, 0, 66 * 1024);
+    DefaultBufferedInputStream stream(&file, 0, 66 * 1024);
 
     // get 1K
     {
@@ -89,9 +90,9 @@ TEST_F(BufferedStreamTest, Large) {
 TEST_F(BufferedStreamTest, Large2) {
     std::string test_str;
     test_str.resize(65 * 1024);
-    StringRandomAccessFile file(std::move(test_str));
+    RandomAccessFile file(std::make_shared<io::StringInputStream>(std::move(test_str)), "string-file");
 
-    BufferedInputStream stream(&file, 0, 65 * 1024);
+    DefaultBufferedInputStream stream(&file, 0, 65 * 1024);
 
     // get 1K
     {

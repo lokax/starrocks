@@ -21,60 +21,57 @@
 
 package com.starrocks.analysis;
 
-import com.starrocks.common.AnalysisException;
-import com.starrocks.mysql.privilege.Auth;
-import com.starrocks.mysql.privilege.MockedAuth;
 import com.starrocks.qe.ConnectContext;
-import mockit.Mocked;
+import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.utframe.UtFrameUtils;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
 public class ShowTableStmtTest {
-    private Analyzer analyzer;
 
-    @Mocked
-    private Auth auth;
-    @Mocked
     private ConnectContext ctx;
 
     @Before
-    public void setUp() {
-        analyzer = AccessTestUtil.fetchAdminAnalyzer(true);
-        MockedAuth.mockedAuth(auth);
-        MockedAuth.mockedConnectContext(ctx, "root", "192.168.1.1");
+    public void setUp() throws Exception {
     }
 
     @Test
-    public void testNormal() throws AnalysisException {
+    public void testNormal() throws Exception {
+        ctx = UtFrameUtils.createDefaultCtx();
+        ctx.setCluster("default_cluster");
+        ctx.setDatabase("testDb");
+
         ShowTableStmt stmt = new ShowTableStmt("", false, null);
-        stmt.analyze(analyzer);
-        Assert.assertEquals("SHOW TABLES FROM testCluster:testDb", stmt.toString());
-        Assert.assertEquals("testCluster:testDb", stmt.getDb());
+
+        com.starrocks.sql.analyzer.Analyzer.analyze(stmt, ctx);
+        Assert.assertEquals("SHOW TABLES FROM default_cluster:testDb", stmt.toString());
+        Assert.assertEquals("default_cluster:testDb", stmt.getDb());
         Assert.assertFalse(stmt.isVerbose());
         Assert.assertEquals(1, stmt.getMetaData().getColumnCount());
         Assert.assertEquals("Tables_in_testDb", stmt.getMetaData().getColumn(0).getName());
 
         stmt = new ShowTableStmt("abc", true, null);
-        stmt.analyze(analyzer);
-        Assert.assertEquals("SHOW FULL TABLES FROM testCluster:abc", stmt.toString());
+        com.starrocks.sql.analyzer.Analyzer.analyze(stmt, ctx);
+        Assert.assertEquals("SHOW FULL TABLES FROM default_cluster:abc", stmt.toString());
         Assert.assertEquals(2, stmt.getMetaData().getColumnCount());
         Assert.assertEquals("Tables_in_abc", stmt.getMetaData().getColumn(0).getName());
         Assert.assertEquals("Table_type", stmt.getMetaData().getColumn(1).getName());
 
         stmt = new ShowTableStmt("abc", true, "bcd");
-        stmt.analyze(analyzer);
+        com.starrocks.sql.analyzer.Analyzer.analyze(stmt, ctx);
         Assert.assertEquals("bcd", stmt.getPattern());
-        Assert.assertEquals("SHOW FULL TABLES FROM testCluster:abc LIKE 'bcd'", stmt.toString());
+        Assert.assertEquals("SHOW FULL TABLES FROM default_cluster:abc LIKE 'bcd'", stmt.toString());
         Assert.assertEquals(2, stmt.getMetaData().getColumnCount());
         Assert.assertEquals("Tables_in_abc", stmt.getMetaData().getColumn(0).getName());
         Assert.assertEquals("Table_type", stmt.getMetaData().getColumn(1).getName());
     }
 
-    @Test(expected = AnalysisException.class)
-    public void testNoDb() throws AnalysisException {
+    @Test(expected = SemanticException.class)
+    public void testNoDb() throws Exception {
+        ctx = UtFrameUtils.createDefaultCtx();
         ShowTableStmt stmt = new ShowTableStmt("", false, null);
-        stmt.analyze(AccessTestUtil.fetchEmptyDbAnalyzer());
+        com.starrocks.sql.analyzer.Analyzer.analyze(stmt, ctx);
         Assert.fail("No exception throws");
     }
 }

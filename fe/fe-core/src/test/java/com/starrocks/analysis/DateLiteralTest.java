@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/analysis/DateLiteralTest.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -77,5 +73,64 @@ public class DateLiteralTest {
             hasException = true;
         }
         Assert.assertFalse(hasException);
+    }
+
+    @Test
+    public void invalidDate() {
+        String[] testDateCases = {
+                // Invalid year.
+                "20190-05-31",
+                "1-05-31",
+                // Invalid month.
+                "2019-5-31",
+                "2019-16-31",
+                // Invalid day.
+                "2019-02-29",
+                "2019-04-31",
+                "2019-05-32",
+
+                // Other invalid formats.
+                "2019-05-31-1",
+                "not-date",
+        };
+        for (String c : testDateCases) {
+            Assert.assertThrows(AnalysisException.class, () -> new DateLiteral(c, Type.DATE));
+        }
+
+        String[] testDatetimeCases = {
+                // Invalid year.
+                "20190-05-31 10:11:12",
+                "20190-05-31 10:11:12.123",
+                "1-05-31 10:11:12",
+                "1-05-31 10:11:12.123",
+                // Invalid month.
+                "2019-5-31 10:11:12",
+                "2019-5-31 10:11:12.123",
+                "2019-16-31 10:11:12",
+                "2019-16-31 10:11:12.123",
+                // Invalid day.
+                "2019-02-29 10:11:12",
+                "2019-02-29 10:11:12.123",
+                "2019-04-31 10:11:12",
+                "2019-04-31 10:11:12.123",
+                "2019-05-32 10:11:12",
+                "2019-05-32 10:11:12.123",
+                // Invalid hour, minute, or second.
+                "2019-05-31 25:11:12",
+                "2019-05-31 25:11:12.123",
+                "2019-05-31 10:61:12",
+                "2019-05-31 10:61:12.123",
+                "2019-05-31 10:11:61",
+                "2019-05-31 10:11:61.123",
+                "2019-05-31 10:11:12.1234567",
+
+                // Other invalid formats.
+                "2019-05-31-1 10:11:12",
+                "2019-05-31-1 10:11:12.123",
+                "not-date",
+        };
+        for (String c : testDatetimeCases) {
+            Assert.assertThrows(AnalysisException.class, () -> new DateLiteral(c, Type.DATETIME));
+        }
     }
 }

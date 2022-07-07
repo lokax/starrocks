@@ -21,6 +21,8 @@
 
 #include "runtime/decimalv2_value.h"
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <iostream>
 #include <utility>
@@ -209,7 +211,7 @@ int128_t div(const int128_t& x, const int128_t& y) {
 
     if (!is_positive) result = -result;
 
-    return DecimalV2Value(result);
+    return result;
 }
 
 DecimalV2Value operator/(const DecimalV2Value& v1, const DecimalV2Value& v2) {
@@ -392,7 +394,7 @@ void DecimalV2Value::to_max_decimal(int32_t precision, int32_t scale) {
         precision = PRECISION - SCALE + scale;
     } else if (precision <= scale) {
         LOG(WARNING) << "Warning: error precision: " << precision << " or scale: " << scale;
-        precision = scale + 1; // corect error precision
+        precision = scale + 1; // correct error precision
     }
 
     int64_t int_value = INT_MAX_VALUE[precision - scale - 1];

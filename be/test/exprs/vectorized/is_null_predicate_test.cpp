@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/is_null_predicate.h"
 
@@ -7,6 +7,7 @@
 
 #include <memory>
 
+#include "column/chunk.h"
 #include "column/column_helper.h"
 #include "column/fixed_length_column.h"
 #include "exprs/vectorized/mock_vectorized_expr.h"

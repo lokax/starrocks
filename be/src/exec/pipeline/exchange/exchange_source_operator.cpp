@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exec/pipeline/exchange/exchange_source_operator.h"
 
@@ -10,38 +10,70 @@
 
 namespace starrocks::pipeline {
 Status ExchangeSourceOperator::prepare(RuntimeState* state) {
-    Operator::prepare(state);
-    _stream_recvr = state->exec_env()->stream_mgr()->create_recvr(
-            state, _row_desc, state->fragment_instance_id(), _plan_node_id, _num_sender,
-            config::exchg_node_buffer_size_bytes, _runtime_profile, false, nullptr);
-    return Status::OK();
-}
-
-Status ExchangeSourceOperator::close(RuntimeState* state) {
-    Operator::close(state);
+    SourceOperator::prepare(state);
+    _stream_recvr = std::move(
+            static_cast<ExchangeSourceOperatorFactory*>(_factory)->create_stream_recvr(state, _unique_metrics));
     return Status::OK();
 }
 
 bool ExchangeSourceOperator::has_output() const {
-    return _stream_recvr->has_output();
+    return _stream_recvr->has_output_for_pipeline(_driver_sequence);
 }
 
 bool ExchangeSourceOperator::is_finished() const {
     return _stream_recvr->is_finished();
 }
 
-void ExchangeSourceOperator::finish(RuntimeState* state) {
-    if (_is_finishing) {
-        return;
-    }
+Status ExchangeSourceOperator::set_finishing(RuntimeState* state) {
     _is_finishing = true;
-    return _stream_recvr->close();
+    _stream_recvr->short_circuit_for_pipeline(_driver_sequence);
+    static_cast<ExchangeSourceOperatorFactory*>(_factory)->close_stream_recvr();
+    return Status::OK();
 }
 
 StatusOr<vectorized::ChunkPtr> ExchangeSourceOperator::pull_chunk(RuntimeState* state) {
-    std::unique_ptr<vectorized::Chunk> chunk = std::make_unique<vectorized::Chunk>();
-    RETURN_IF_ERROR(_stream_recvr->get_chunk(&chunk));
+    auto chunk = std::make_unique<vectorized::Chunk>();
+    RETURN_IF_ERROR(_stream_recvr->get_chunk_for_pipeline(&chunk, _driver_sequence));
+
+    eval_runtime_bloom_filters(chunk.get());
     return std::move(chunk);
+}
+
+std::shared_ptr<DataStreamRecvr> ExchangeSourceOperatorFactory::create_stream_recvr(
+        RuntimeState* state, const std::shared_ptr<RuntimeProfile>& profile) {
+    if (_stream_recvr != nullptr) {
+        return _stream_recvr;
+    }
+    _stream_recvr = state->exec_env()->stream_mgr()->create_recvr(
+            state, _row_desc, state->fragment_instance_id(), _plan_node_id, _num_sender,
+            config::exchg_node_buffer_size_bytes, profile, false, nullptr, true, _degree_of_parallelism, false);
+    return _stream_recvr;
+}
+
+void ExchangeSourceOperatorFactory::close_stream_recvr() {
+    if (--_stream_recvr_cnt == 0) {
+        _stream_recvr->close();
+    }
+}
+
+bool ExchangeSourceOperatorFactory::need_local_shuffle() const {
+    DCHECK(_texchange_node.__isset.partition_type);
+    // There are two ways of shuffle
+    // 1. If previous op is ExchangeSourceOperator and its partition type is HASH_PARTITIONED or BUCKET_SHUFFLE_HASH_PARTITIONED
+    // then pipeline level shuffle will be performed at sender side (ExchangeSinkOperator), so
+    // there is no need to perform local shuffle again at receiver side
+    // 2. Otherwise, add LocalExchangeOperator
+    // to shuffle multi-stream into #degree_of_parallelism# streams each of that pipes.
+    return _texchange_node.partition_type != TPartitionType::HASH_PARTITIONED &&
+           _texchange_node.partition_type != TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED;
+}
+
+TPartitionType::type ExchangeSourceOperatorFactory::partition_type() const {
+    DCHECK(_texchange_node.__isset.partition_type);
+    if (_texchange_node.partition_type != TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED) {
+        return SourceOperatorFactory::partition_type();
+    }
+    return _texchange_node.partition_type;
 }
 
 } // namespace starrocks::pipeline

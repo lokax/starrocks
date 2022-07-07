@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.operator.scalar;
 
 import com.starrocks.analysis.DateLiteral;
@@ -7,6 +7,7 @@ import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.common.util.DateUtils;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.common.ErrorType;
 import com.starrocks.sql.common.StarRocksPlannerException;
@@ -16,7 +17,12 @@ import com.starrocks.sql.optimizer.operator.OperatorType;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.ResolverStyle;
+import java.time.format.SignStyle;
+import java.time.temporal.ChronoField;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -48,31 +54,37 @@ import static java.util.Collections.emptyList;
  * TYPE_PERCENTILE |    NOT_SUPPORT
  */
 public final class ConstantOperator extends ScalarOperator implements Comparable<ConstantOperator> {
+
     private static final LocalDateTime MAX_DATETIME = LocalDateTime.of(9999, 12, 31, 23, 59, 59);
     private static final LocalDateTime MIN_DATETIME = LocalDateTime.of(0, 1, 1, 0, 0, 0);
 
+    public static final ConstantOperator TRUE = ConstantOperator.createBoolean(true);
+
+    // Don't need fixWidth
+    private static final DateTimeFormatter DATE_TIME_FORMATTER_MS =
+            DateUtils.unixDatetimeFormatBuilder("%Y-%m-%d %H:%i:%s.")
+                    .appendValue(ChronoField.MICRO_OF_SECOND, 1, 6, SignStyle.NORMAL)
+                    .toFormatter().withResolverStyle(ResolverStyle.STRICT);
+
     private static void requiredValid(LocalDateTime dateTime) throws SemanticException {
         if (null == dateTime || dateTime.isBefore(MIN_DATETIME) || dateTime.isAfter(MAX_DATETIME)) {
-            throw new SemanticException("Invalid date value");
+            throw new SemanticException("Invalid date value: " + (dateTime == null ? "NULL" : dateTime.toString()));
         }
     }
 
     private final Object value;
-    private final Type type;
     private final boolean isNull;
 
     private ConstantOperator(Type type) {
         super(OperatorType.CONSTANT, type);
         this.value = null;
         this.isNull = true;
-        this.type = type;
     }
 
     private ConstantOperator(Object value, Type type) {
         super(OperatorType.CONSTANT, type);
         Objects.requireNonNull(value, "constant value is null");
         this.value = value;
-        this.type = type;
         this.isNull = false;
     }
 
@@ -160,6 +172,10 @@ public final class ConstantOperator extends ScalarOperator implements Comparable
         return false;
     }
 
+    public Object getValue() {
+        return value;
+    }
+
     @Override
     public List<ScalarOperator> getChildren() {
         // constant scalar operator should be the leaf node
@@ -237,7 +253,9 @@ public final class ConstantOperator extends ScalarOperator implements Comparable
 
     @Override
     public String toString() {
-        if (type.isDatetime()) {
+        if (isNull()) {
+            return "null";
+        } else if (type.isDatetime()) {
             LocalDateTime time = (LocalDateTime) Optional.ofNullable(value).orElse(LocalDateTime.MIN);
             return String.format("%04d-%02d-%02d %02d:%02d:%02d",
                     time.getYear(), time.getMonthValue(), time.getDayOfMonth(),
@@ -245,6 +263,10 @@ public final class ConstantOperator extends ScalarOperator implements Comparable
         } else if (type.isDate()) {
             LocalDateTime time = (LocalDateTime) Optional.ofNullable(value).orElse(LocalDateTime.MIN);
             return String.format("%04d-%02d-%02d", time.getYear(), time.getMonthValue(), time.getDayOfMonth());
+        } else if (type.isDouble()) {
+            double val = (double) Optional.ofNullable(value).orElse((double) 0);
+            BigDecimal decimal = BigDecimal.valueOf(val);
+            return decimal.toPlainString();
         }
 
         return String.valueOf(value);
@@ -252,7 +274,7 @@ public final class ConstantOperator extends ScalarOperator implements Comparable
 
     @Override
     public int hashCode() {
-        return Objects.hash(value, type, isNull);
+        return Objects.hash(value, type.getPrimitiveType(), isNull);
     }
 
     @Override
@@ -266,7 +288,7 @@ public final class ConstantOperator extends ScalarOperator implements Comparable
         ConstantOperator that = (ConstantOperator) obj;
         return isNull == that.isNull &&
                 Objects.equals(value, that.value) &&
-                Objects.equals(type, that.type);
+                type.matchesType(that.getType());
     }
 
     @Override
@@ -284,7 +306,10 @@ public final class ConstantOperator extends ScalarOperator implements Comparable
         }
 
         PrimitiveType t = type.getPrimitiveType();
-        if (t != o.getType().getPrimitiveType()) {
+        // char is same with varchar, but equivalence expression deriver can't keep same in some expression
+        if (t != o.getType().getPrimitiveType()
+                && (!t.isCharFamily() && !o.getType().getPrimitiveType().isCharFamily())
+                && (!t.isDecimalOfAnyVersion() && !o.getType().getPrimitiveType().isDecimalOfAnyVersion())) {
             throw new StarRocksPlannerException(
                     "Constant " + this.toString() + " can't compare with Constant " + o.toString(),
                     ErrorType.INTERNAL_ERROR);
@@ -319,7 +344,31 @@ public final class ConstantOperator extends ScalarOperator implements Comparable
 
     @Override
     public boolean isNullable() {
-        return type.equals(Type.NULL);
+        return type.equals(Type.NULL) || isNull;
+    }
+
+    public ConstantOperator castToStrictly(Type type) throws Exception {
+        if (!type.isDecimalV3()) {
+            return castTo(type);
+        }
+
+        BigDecimal decimal = new BigDecimal(value.toString());
+        ScalarType scalarType = (ScalarType) type;
+        try {
+            DecimalLiteral.checkLiteralOverflowInDecimalStyle(decimal, scalarType);
+        } catch (AnalysisException ignored) {
+            return ConstantOperator.createNull(type);
+        }
+        int realScale = DecimalLiteral.getRealScale(decimal);
+        int scale = scalarType.getScalarScale();
+        if (scale <= realScale) {
+            decimal = decimal.setScale(scale, RoundingMode.HALF_UP);
+        }
+
+        if (scalarType.getScalarScale() == 0 && scalarType.getScalarPrecision() == 0) {
+            throw new SemanticException("Forbidden cast to decimal(precision=0, scale=0)");
+        }
+        return ConstantOperator.createDecimal(decimal, type);
     }
 
     public ConstantOperator castTo(Type desc) throws Exception {
@@ -359,7 +408,13 @@ public final class ConstantOperator extends ScalarOperator implements Comparable
             try {
                 // DateLiteral will throw Exception if cast failed
                 // 1.try cast by format "yyyy-MM-dd HH:mm:ss"
-                literal = new DateLiteral(childString, Type.DATETIME);
+                if (childString.length() <= "yyyy-MM-dd HH:mm:ss".length()) {
+                    literal = new DateLiteral(childString, Type.DATETIME);
+                } else {
+                    // try cast by format "yyyy-MM-dd HH:mm:ss.SSS"
+                    LocalDateTime localDateTime = LocalDateTime.from(DATE_TIME_FORMATTER_MS.parse(childString));
+                    return ConstantOperator.createDatetime(localDateTime, desc);
+                }
             } catch (Exception e) {
                 // 2.try cast by format "yyyy-MM-dd", will original operator if failed
                 literal = new DateLiteral(childString, Type.DATE);
@@ -373,14 +428,24 @@ public final class ConstantOperator extends ScalarOperator implements Comparable
         } else if (desc.isDecimalV2()) {
             return ConstantOperator.createDecimal(BigDecimal.valueOf(Double.parseDouble(childString)), Type.DECIMALV2);
         } else if (desc.isDecimalV3()) {
-            BigDecimal value = new BigDecimal(childString);
+            BigDecimal decimal = new BigDecimal(childString);
+            ScalarType scalarType = (ScalarType) desc;
             try {
-                DecimalLiteral.checkLiteralOverflow(value, (ScalarType) desc);
-            } catch (AnalysisException e) {
-                throw new SemanticException(e.getMessage());
+                DecimalLiteral.checkLiteralOverflowInBinaryStyle(decimal, scalarType);
+            } catch (AnalysisException ignored) {
+                return ConstantOperator.createNull(desc);
+            }
+            int realScale = DecimalLiteral.getRealScale(decimal);
+            int scale = scalarType.getScalarScale();
+            if (scale <= realScale) {
+                decimal = decimal.setScale(scale, RoundingMode.HALF_UP);
             }
 
-            return ConstantOperator.createDecimal(value, desc);
+            if (scalarType.getScalarScale() == 0 && scalarType.getScalarPrecision() == 0) {
+                throw new SemanticException("Forbidden cast to decimal(precision=0, scale=0)");
+            }
+
+            return ConstantOperator.createDecimal(decimal, desc);
         } else if (desc.isChar() || desc.isVarchar()) {
             return ConstantOperator.createChar(childString, desc);
         }

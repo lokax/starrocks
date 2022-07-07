@@ -22,12 +22,12 @@
 package com.starrocks.load.routineload;
 
 import com.google.common.collect.Lists;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.common.Config;
 import com.starrocks.common.UserException;
 import com.starrocks.common.util.DebugUtil;
 import com.starrocks.common.util.TimeUtils;
 import com.starrocks.metric.MetricRepo;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.FrontendOptions;
 import com.starrocks.thrift.TRoutineLoadTask;
 import com.starrocks.transaction.TransactionState;
@@ -51,12 +51,11 @@ public abstract class RoutineLoadTaskInfo {
 
     public static final long INVALID_BE_ID = -1L;
 
-    private RoutineLoadManager routineLoadManager = Catalog.getCurrentCatalog().getRoutineLoadManager();
+    private RoutineLoadManager routineLoadManager = GlobalStateMgr.getCurrentState().getRoutineLoadManager();
 
     protected UUID id;
     protected long txnId = -1L;
     protected long jobId;
-    protected String clusterName;
 
     private final long createTimeMs;
     // The time when the task is actually executed
@@ -84,20 +83,19 @@ public abstract class RoutineLoadTaskInfo {
     // record task schedule info
     protected String msg;
 
-    public RoutineLoadTaskInfo(UUID id, long jobId, String clusterName, long taskScheduleIntervalMs,
+    public RoutineLoadTaskInfo(UUID id, long jobId, long taskScheduleIntervalMs,
                                long timeToExecuteMs) {
         this.id = id;
         this.jobId = jobId;
-        this.clusterName = clusterName;
         this.createTimeMs = System.currentTimeMillis();
         this.taskScheduleIntervalMs = taskScheduleIntervalMs;
         this.timeoutMs = 1000 * Config.routine_load_task_timeout_second;
         this.timeToExecuteMs = timeToExecuteMs;
     }
 
-    public RoutineLoadTaskInfo(UUID id, long jobId, String clusterName, long taskSchedulerIntervalMs,
+    public RoutineLoadTaskInfo(UUID id, long jobId, long taskSchedulerIntervalMs,
                                long timeToExecuteMs, long previousBeId) {
-        this(id, jobId, clusterName, taskSchedulerIntervalMs, timeToExecuteMs);
+        this(id, jobId, taskSchedulerIntervalMs, timeToExecuteMs);
         this.previousBeId = previousBeId;
     }
 
@@ -107,10 +105,6 @@ public abstract class RoutineLoadTaskInfo {
 
     public long getJobId() {
         return jobId;
-    }
-
-    public String getClusterName() {
-        return clusterName;
     }
 
     public void setExecuteStartTimeMs(long executeStartTimeMs) {
@@ -187,7 +181,7 @@ public abstract class RoutineLoadTaskInfo {
 
     abstract boolean readyToExecute() throws UserException;
 
-    abstract public boolean isProgressKeepUp(RoutineLoadProgress progress);
+    public abstract boolean isProgressKeepUp(RoutineLoadProgress progress);
 
     // begin the txn of this task
     // throw exception if unrecoverable errors happen.
@@ -195,7 +189,7 @@ public abstract class RoutineLoadTaskInfo {
         // begin a txn for task
         RoutineLoadJob routineLoadJob = routineLoadManager.getJob(jobId);
         MetricRepo.COUNTER_LOAD_ADD.increase(1L);
-        txnId = Catalog.getCurrentGlobalTransactionMgr().beginTransaction(
+        txnId = GlobalStateMgr.getCurrentGlobalTransactionMgr().beginTransaction(
                 routineLoadJob.getDbId(), Lists.newArrayList(routineLoadJob.getTableId()), DebugUtil.printId(id), null,
                 new TxnCoordinator(TxnSourceType.FE, FrontendOptions.getLocalHostAddress()),
                 TransactionState.LoadJobSourceType.ROUTINE_LOAD_TASK, routineLoadJob.getId(),

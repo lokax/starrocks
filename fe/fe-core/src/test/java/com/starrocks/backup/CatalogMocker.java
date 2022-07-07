@@ -26,7 +26,6 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
 import com.starrocks.analysis.PartitionValue;
 import com.starrocks.catalog.AggregateType;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.DataProperty;
 import com.starrocks.catalog.Database;
@@ -34,6 +33,7 @@ import com.starrocks.catalog.DistributionInfo;
 import com.starrocks.catalog.FakeEditLog;
 import com.starrocks.catalog.HashDistributionInfo;
 import com.starrocks.catalog.KeysType;
+import com.starrocks.catalog.LocalTablet;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndex.IndexState;
 import com.starrocks.catalog.MysqlTable;
@@ -48,7 +48,6 @@ import com.starrocks.catalog.Replica;
 import com.starrocks.catalog.Replica.ReplicaState;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.SinglePartitionInfo;
-import com.starrocks.catalog.Tablet;
 import com.starrocks.catalog.TabletMeta;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
@@ -59,6 +58,7 @@ import com.starrocks.mysql.privilege.Auth;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.persist.EditLog;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.thrift.TStorageMedium;
 import com.starrocks.thrift.TStorageType;
@@ -66,6 +66,7 @@ import mockit.Expectations;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 
 public class CatalogMocker {
     // user
@@ -107,6 +108,10 @@ public class CatalogMocker {
     // partition olap table with a rollup
     public static final String TEST_TBL2_NAME = "test_tbl2";
     public static final long TEST_TBL2_ID = 30002;
+
+    // primary key olap table
+    public static final String TEST_TBL3_NAME = "test_tbl3";
+    public static final long TEST_TBL3_ID = 30003;
 
     public static final String TEST_PARTITION1_NAME = "p1";
     public static final long TEST_PARTITION1_ID = 40001;
@@ -246,7 +251,7 @@ public class CatalogMocker {
                 KeysType.AGG_KEYS, partitionInfo, distributionInfo);
         Deencapsulation.setField(olapTable, "baseIndexId", TEST_TBL_ID);
 
-        Tablet tablet0 = new Tablet(TEST_TABLET0_ID);
+        LocalTablet tablet0 = new LocalTablet(TEST_TABLET0_ID);
         TabletMeta tabletMeta = new TabletMeta(TEST_DB_ID, TEST_TBL_ID, TEST_SINGLE_PARTITION_ID,
                 TEST_TBL_ID, SCHEMA_HASH, TStorageMedium.HDD);
         baseIndex.addTablet(tablet0, tabletMeta);
@@ -318,7 +323,11 @@ public class CatalogMocker {
                 KeysType.AGG_KEYS, rangePartitionInfo, distributionInfo2);
         Deencapsulation.setField(olapTable2, "baseIndexId", TEST_TBL2_ID);
 
-        Tablet baseTabletP1 = new Tablet(TEST_BASE_TABLET_P1_ID);
+        OlapTable olapTable3 = new OlapTable(TEST_TBL3_ID, TEST_TBL3_NAME, TEST_TBL_BASE_SCHEMA,
+                KeysType.PRIMARY_KEYS, partitionInfo, distributionInfo);
+        Deencapsulation.setField(olapTable3, "baseIndexId", TEST_TBL3_ID);
+
+        LocalTablet baseTabletP1 = new LocalTablet(TEST_BASE_TABLET_P1_ID);
         TabletMeta tabletMetaBaseTabletP1 = new TabletMeta(TEST_DB_ID, TEST_TBL2_ID, TEST_PARTITION1_ID,
                 TEST_TBL2_ID, SCHEMA_HASH, TStorageMedium.HDD);
         baseIndexP1.addTablet(baseTabletP1, tabletMetaBaseTabletP1);
@@ -330,7 +339,7 @@ public class CatalogMocker {
         baseTabletP1.addReplica(replica4);
         baseTabletP1.addReplica(replica5);
 
-        Tablet baseTabletP2 = new Tablet(TEST_BASE_TABLET_P2_ID);
+        LocalTablet baseTabletP2 = new LocalTablet(TEST_BASE_TABLET_P2_ID);
         TabletMeta tabletMetaBaseTabletP2 = new TabletMeta(TEST_DB_ID, TEST_TBL2_ID, TEST_PARTITION2_ID,
                 TEST_TBL2_ID, SCHEMA_HASH, TStorageMedium.HDD);
         baseIndexP2.addTablet(baseTabletP2, tabletMetaBaseTabletP2);
@@ -349,7 +358,7 @@ public class CatalogMocker {
 
         // rollup index p1
         MaterializedIndex rollupIndexP1 = new MaterializedIndex(TEST_ROLLUP_ID, IndexState.NORMAL);
-        Tablet rollupTabletP1 = new Tablet(TEST_ROLLUP_TABLET_P1_ID);
+        LocalTablet rollupTabletP1 = new LocalTablet(TEST_ROLLUP_TABLET_P1_ID);
         TabletMeta tabletMetaRollupTabletP1 = new TabletMeta(TEST_DB_ID, TEST_TBL2_ID, TEST_PARTITION1_ID,
                 TEST_ROLLUP_TABLET_P1_ID, ROLLUP_SCHEMA_HASH,
                 TStorageMedium.HDD);
@@ -366,7 +375,7 @@ public class CatalogMocker {
 
         // rollup index p2
         MaterializedIndex rollupIndexP2 = new MaterializedIndex(TEST_ROLLUP_ID, IndexState.NORMAL);
-        Tablet rollupTabletP2 = new Tablet(TEST_ROLLUP_TABLET_P2_ID);
+        LocalTablet rollupTabletP2 = new LocalTablet(TEST_ROLLUP_TABLET_P2_ID);
         TabletMeta tabletMetaRollupTabletP2 = new TabletMeta(TEST_DB_ID, TEST_TBL2_ID, TEST_PARTITION1_ID,
                 TEST_ROLLUP_TABLET_P2_ID, ROLLUP_SCHEMA_HASH,
                 TStorageMedium.HDD);
@@ -383,62 +392,63 @@ public class CatalogMocker {
         olapTable2.setIndexMeta(TEST_ROLLUP_ID, TEST_ROLLUP_NAME, TEST_ROLLUP_SCHEMA, 0, ROLLUP_SCHEMA_HASH,
                 (short) 1, TStorageType.COLUMN, KeysType.AGG_KEYS);
         db.createTable(olapTable2);
+        db.createTable(olapTable3);
 
         return db;
     }
 
-    public static Catalog fetchAdminCatalog() {
+    public static GlobalStateMgr fetchAdminCatalog() {
         try {
             FakeEditLog fakeEditLog = new FakeEditLog();
 
-            Catalog catalog = Deencapsulation.newInstance(Catalog.class);
+            GlobalStateMgr globalStateMgr = Deencapsulation.newInstance(GlobalStateMgr.class);
 
             Database db = new Database();
             Auth auth = fetchAdminAccess();
 
-            new Expectations(catalog) {
+            new Expectations(globalStateMgr) {
                 {
-                    catalog.getAuth();
+                    globalStateMgr.getAuth();
                     minTimes = 0;
                     result = auth;
 
-                    catalog.getDb(TEST_DB_NAME);
+                    globalStateMgr.getDb(TEST_DB_NAME);
                     minTimes = 0;
                     result = db;
 
-                    catalog.getDb(WRONG_DB);
+                    globalStateMgr.getDb(WRONG_DB);
                     minTimes = 0;
                     result = null;
 
-                    catalog.getDb(TEST_DB_ID);
+                    globalStateMgr.getDb(TEST_DB_ID);
                     minTimes = 0;
                     result = db;
 
-                    catalog.getDb(anyString);
+                    globalStateMgr.getDb(anyString);
                     minTimes = 0;
                     result = new Database();
 
-                    catalog.getDbNames();
+                    globalStateMgr.getDbNames();
                     minTimes = 0;
                     result = Lists.newArrayList(TEST_DB_NAME);
 
-                    catalog.getLoadInstance();
+                    globalStateMgr.getLoadInstance();
                     minTimes = 0;
                     result = new Load();
 
-                    catalog.getEditLog();
+                    globalStateMgr.getEditLog();
                     minTimes = 0;
-                    result = new EditLog("name");
+                    result = new EditLog(new ArrayBlockingQueue<>(100));
 
-                    catalog.changeDb((ConnectContext) any, WRONG_DB);
+                    globalStateMgr.changeCatalogDb((ConnectContext) any, WRONG_DB);
                     minTimes = 0;
                     result = new DdlException("failed");
 
-                    catalog.changeDb((ConnectContext) any, anyString);
+                    globalStateMgr.changeCatalogDb((ConnectContext) any, anyString);
                     minTimes = 0;
                 }
             };
-            return catalog;
+            return globalStateMgr;
         } catch (DdlException e) {
             return null;
         }

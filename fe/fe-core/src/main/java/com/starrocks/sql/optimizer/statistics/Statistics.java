@@ -1,8 +1,9 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.statistics;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Maps;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 
@@ -14,20 +15,40 @@ import static java.lang.Double.NaN;
 public class Statistics {
     private final double outputRowCount;
     private final Map<ColumnRefOperator, ColumnStatistic> columnStatistics;
+    // This flag set true if get table row count from GlobalStateMgr LE 1
+    // Table row count in FE depends on BE reporting，but FE may not get report from BE which just started，
+    // this causes the table row count stored in FE to be inaccurate.
+    private boolean tableRowCountMayInaccurate;
 
-    public Statistics(double outputRowCount,
-                      Map<ColumnRefOperator, ColumnStatistic> columnStatistics) {
-        this.outputRowCount = outputRowCount;
-        this.columnStatistics = columnStatistics;
+    private Statistics(Builder builder) {
+        this.outputRowCount = builder.outputRowCount;
+        this.columnStatistics = builder.columnStatistics;
+        this.tableRowCountMayInaccurate = builder.tableRowCountMayInaccurate;
     }
 
     public double getOutputRowCount() {
         return outputRowCount;
     }
 
-    public double getOutputSize() {
-        return this.columnStatistics.values().stream().map(ColumnStatistic::getAverageRowSize).
-                reduce(0.0, Double::sum) * outputRowCount;
+    public double getOutputSize(ColumnRefSet outputColumns) {
+        double totalSize = 0;
+        boolean nonEmpty = false;
+        for (Map.Entry<ColumnRefOperator, ColumnStatistic> entry : columnStatistics.entrySet()) {
+            if (outputColumns.contains(entry.getKey().getId())) {
+                totalSize += entry.getValue().getAverageRowSize();
+                nonEmpty = true;
+            }
+        }
+        if (nonEmpty) {
+            totalSize = Math.max(totalSize, 1.0);
+        }
+        return totalSize * outputRowCount;
+    }
+
+    public double getComputeSize() {
+        // Make it at least 1 byte, otherwise the cost model would propagate estimate error
+        return Math.max(1.0, this.columnStatistics.values().stream().map(ColumnStatistic::getAverageRowSize).
+                reduce(0.0, Double::sum)) * outputRowCount;
     }
 
     public ColumnStatistic getColumnStatistic(ColumnRefOperator column) {
@@ -40,6 +61,20 @@ public class Statistics {
         return columnStatistics;
     }
 
+    public Map<ColumnRefOperator, ColumnStatistic> getOutputColumnsStatistics(ColumnRefSet outputColumns) {
+        Map<ColumnRefOperator, ColumnStatistic> outputColumnsStatistics = Maps.newHashMap();
+        for (Map.Entry<ColumnRefOperator, ColumnStatistic> entry : columnStatistics.entrySet()) {
+            if (outputColumns.contains(entry.getKey().getId())) {
+                outputColumnsStatistics.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return outputColumnsStatistics;
+    }
+
+    public boolean isTableRowCountMayInaccurate() {
+        return this.tableRowCountMayInaccurate;
+    }
+
     public ColumnRefSet getUsedColumns() {
         ColumnRefSet usedColumns = new ColumnRefSet();
         for (Map.Entry<ColumnRefOperator, ColumnStatistic> entry : columnStatistics.entrySet()) {
@@ -49,7 +84,7 @@ public class Statistics {
     }
 
     public static Builder buildFrom(Statistics other) {
-        return new Builder(other.getOutputRowCount(), other.columnStatistics);
+        return new Builder(other.getOutputRowCount(), other.columnStatistics, other.tableRowCountMayInaccurate);
     }
 
     public static Builder builder() {
@@ -59,18 +94,26 @@ public class Statistics {
     public static final class Builder {
         private double outputRowCount;
         private final Map<ColumnRefOperator, ColumnStatistic> columnStatistics;
+        private boolean tableRowCountMayInaccurate;
 
         public Builder() {
-            this(NaN, new HashMap<>());
+            this(NaN, new HashMap<>(), false);
         }
 
-        private Builder(double outputRowCount, Map<ColumnRefOperator, ColumnStatistic> columnStatistics) {
+        private Builder(double outputRowCount, Map<ColumnRefOperator, ColumnStatistic> columnStatistics,
+                        boolean tableRowCountMayInaccurate) {
             this.outputRowCount = outputRowCount;
             this.columnStatistics = new HashMap<>(columnStatistics);
+            this.tableRowCountMayInaccurate = tableRowCountMayInaccurate;
         }
 
         public Builder setOutputRowCount(double outputRowCount) {
             this.outputRowCount = outputRowCount;
+            return this;
+        }
+
+        public Builder setTableRowCountMayInaccurate(boolean tableRowCountMayInaccurate) {
+            this.tableRowCountMayInaccurate = tableRowCountMayInaccurate;
             return this;
         }
 
@@ -90,7 +133,7 @@ public class Statistics {
         }
 
         public Statistics build() {
-            return new Statistics(outputRowCount, columnStatistics);
+            return new Statistics(this);
         }
     }
 }

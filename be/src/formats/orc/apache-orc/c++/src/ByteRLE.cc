@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/orc/tree/main/c++/src/ByteRLE.cc
-
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
@@ -22,9 +18,8 @@
 
 #include "ByteRLE.hh"
 
-#include <string.h>
-
 #include <algorithm>
+#include <cstring>
 #include <iostream>
 #include <utility>
 
@@ -43,7 +38,7 @@ ByteRleEncoder::~ByteRleEncoder() {
 class ByteRleEncoderImpl : public ByteRleEncoder {
 public:
     ByteRleEncoderImpl(std::unique_ptr<BufferedOutputStream> output);
-    virtual ~ByteRleEncoderImpl() override;
+    ~ByteRleEncoderImpl() override;
 
     /**
      * Encode the next batch of values.
@@ -52,19 +47,19 @@ public:
      * @param notNull If the pointer is null, all values are read. If the
      *    pointer is not null, positions that are false are skipped.
      */
-    virtual void add(const char* data, uint64_t numValues, const char* notNull) override;
+    void add(const char* data, uint64_t numValues, const char* notNull) override;
 
     /**
      * Get size of buffer used so far.
      */
-    virtual uint64_t getBufferSize() const override;
+    uint64_t getBufferSize() const override;
 
     /**
      * Flush underlying BufferedOutputStream.
      */
-    virtual uint64_t flush() override;
+    uint64_t flush() override;
 
-    virtual void recordPosition(PositionRecorder* recorder) const override;
+    void recordPosition(PositionRecorder* recorder) const override;
 
 protected:
     std::unique_ptr<BufferedOutputStream> outputStream;
@@ -209,7 +204,7 @@ std::unique_ptr<ByteRleEncoder> createByteRleEncoder(std::unique_ptr<BufferedOut
 class BooleanRleEncoderImpl : public ByteRleEncoderImpl {
 public:
     BooleanRleEncoderImpl(std::unique_ptr<BufferedOutputStream> output);
-    virtual ~BooleanRleEncoderImpl() override;
+    ~BooleanRleEncoderImpl() override;
 
     /**
      * Encode the next batch of values
@@ -218,14 +213,14 @@ public:
      * @param notNull If the pointer is null, all values are read. If the
      *    pointer is not null, positions that are false are skipped.
      */
-    virtual void add(const char* data, uint64_t numValues, const char* notNull) override;
+    void add(const char* data, uint64_t numValues, const char* notNull) override;
 
     /**
      * Flushing underlying BufferedOutputStream
      */
-    virtual uint64_t flush() override;
+    uint64_t flush() override;
 
-    virtual void recordPosition(PositionRecorder* recorder) const override;
+    void recordPosition(PositionRecorder* recorder) const override;
 
 private:
     int bitsRemained;
@@ -290,22 +285,22 @@ class ByteRleDecoderImpl : public ByteRleDecoder {
 public:
     ByteRleDecoderImpl(std::unique_ptr<SeekableInputStream> input);
 
-    virtual ~ByteRleDecoderImpl();
+    ~ByteRleDecoderImpl() override;
 
     /**
      * Seek to a particular spot.
      */
-    virtual void seek(PositionProvider&);
+    void seek(PositionProvider&) override;
 
     /**
      * Seek over a given number of values.
      */
-    virtual void skip(uint64_t numValues);
+    void skip(uint64_t numValues) override;
 
     /**
      * Read a number of values into the batch.
      */
-    virtual void next(char* data, uint64_t numValues, char* notNull);
+    void next(char* data, uint64_t numValues, char* notNull) override;
 
 protected:
     inline void nextBuffer();
@@ -465,22 +460,22 @@ class BooleanRleDecoderImpl : public ByteRleDecoderImpl {
 public:
     BooleanRleDecoderImpl(std::unique_ptr<SeekableInputStream> input);
 
-    virtual ~BooleanRleDecoderImpl();
+    ~BooleanRleDecoderImpl() override;
 
     /**
      * Seek to a particular spot.
      */
-    virtual void seek(PositionProvider&);
+    void seek(PositionProvider&) override;
 
     /**
      * Seek over a given number of values.
      */
-    virtual void skip(uint64_t numValues);
+    void skip(uint64_t numValues) override;
 
     /**
      * Read a number of values into the batch.
      */
-    virtual void next(char* data, uint64_t numValues, char* notNull);
+    void next(char* data, uint64_t numValues, char* notNull) override;
 
 protected:
     size_t remainingBits;

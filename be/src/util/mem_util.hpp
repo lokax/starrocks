@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/util/mem_util.hpp
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -19,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef  STARROCKS_BE_SRC_COMMON_UTIL_MEM_UTIL_HPP
-#define  STARROCKS_BE_SRC_COMMON_UTIL_MEM_UTIL_HPP
+#pragma once
 
-#include <string.h>
+#include <cstring>
 
 namespace starrocks {
 
@@ -624,11 +619,8 @@ B255:
 #endif
 
     memcpy(dst, src, size);
-    return;
 }
 
 }
-
-#endif  // STARROCKS_BE_SRC_COMMON_SRC_UTIL_MEM_UTIL_H
 
 /* vim: set expandtab ts=4 sw=4 sts=4 tw=100: */

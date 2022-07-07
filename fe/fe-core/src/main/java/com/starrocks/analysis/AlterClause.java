@@ -21,8 +21,8 @@
 
 package com.starrocks.analysis;
 
+import com.google.common.collect.Maps;
 import com.starrocks.alter.AlterOpType;
-import org.apache.commons.lang.NotImplementedException;
 
 import java.util.Map;
 
@@ -36,10 +36,14 @@ public abstract class AlterClause implements ParseNode {
     }
 
     public Map<String, String> getProperties() {
-        throw new NotImplementedException();
+        return Maps.newHashMap();
     }
 
     public AlterOpType getOpType() {
         return opType;
+    }
+
+    public boolean isSupportNewPlanner() {
+        return false;
     }
 }

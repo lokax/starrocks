@@ -28,6 +28,7 @@ import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.common.util.PropertyAnalyzer;
 import com.starrocks.persist.OperationType;
+import com.starrocks.persist.gson.GsonPostProcessable;
 import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.thrift.TStorageFormat;
 
@@ -43,17 +44,19 @@ import java.util.Map;
  * Different properties is recognized by prefix such as dynamic_partition
  * If there is different type properties is added.Write a method such as buildDynamicProperty to build it.
  */
-public class TableProperty implements Writable {
+public class TableProperty implements Writable, GsonPostProcessable {
     public static final String DYNAMIC_PARTITION_PROPERTY_PREFIX = "dynamic_partition";
 
     @SerializedName(value = "properties")
     private Map<String, String> properties;
 
-    private DynamicPartitionProperty dynamicPartitionProperty = new DynamicPartitionProperty(Maps.newHashMap());
+    private transient DynamicPartitionProperty dynamicPartitionProperty = new DynamicPartitionProperty(Maps.newHashMap());
     // table's default replication num
     private Short replicationNum = FeConstants.default_replication_num;
 
     private boolean isInMemory = false;
+
+    private boolean enablePersistentIndex = false;
 
     /*
      * the default storage format of this table.
@@ -64,6 +67,14 @@ public class TableProperty implements Writable {
      * This property should be set when creating the table, and can only be changed to V2 using Alter Table stmt.
      */
     private TStorageFormat storageFormat = TStorageFormat.DEFAULT;
+
+    // 1. This table has been deleted. if hasDelete is false, the BE segment must don't have deleteConditions.
+    //    If hasDelete is true, the BE segment maybe have deleteConditions because compaction.
+    // 2. Before checkpoint, we relay delete job journal log to persist.
+    //    After checkpoint, we relay TableProperty::write to persist.
+    private boolean hasDelete = false;
+
+    private boolean hasForbitGlobalDict = false;
 
     public TableProperty(Map<String, String> properties) {
         this.properties = properties;
@@ -88,6 +99,9 @@ public class TableProperty implements Writable {
                 break;
             case OperationType.OP_MODIFY_IN_MEMORY:
                 buildInMemory();
+                break;
+            case OperationType.OP_MODIFY_ENABLE_PERSISTENT_INDEX:
+                buildEnablePersistentIndex();
                 break;
             default:
                 break;
@@ -123,6 +137,12 @@ public class TableProperty implements Writable {
         return this;
     }
 
+    public TableProperty buildEnablePersistentIndex() {
+        enablePersistentIndex = Boolean.parseBoolean(
+                properties.getOrDefault(PropertyAnalyzer.PROPERTIES_ENABLE_PERSISTENT_INDEX, "false"));
+        return this;
+    }
+
     public void modifyTableProperties(Map<String, String> modifyProperties) {
         properties.putAll(modifyProperties);
     }
@@ -147,8 +167,28 @@ public class TableProperty implements Writable {
         return isInMemory;
     }
 
+    public boolean enablePersistentIndex() {
+        return enablePersistentIndex;
+    }
+
     public TStorageFormat getStorageFormat() {
         return storageFormat;
+    }
+
+    public boolean hasDelete() {
+        return hasDelete;
+    }
+
+    public void setHasDelete(boolean hasDelete) {
+        this.hasDelete = hasDelete;
+    }
+
+    public boolean hasForbitGlobalDict() {
+        return hasForbitGlobalDict;
+    }
+
+    public void setHasForbitGlobalDict(boolean hasForbitGlobalDict) {
+        this.hasForbitGlobalDict = hasForbitGlobalDict;
     }
 
     @Override
@@ -157,10 +197,15 @@ public class TableProperty implements Writable {
     }
 
     public static TableProperty read(DataInput in) throws IOException {
-        return GsonUtils.GSON.fromJson(Text.readString(in), TableProperty.class)
-                .buildDynamicProperty()
-                .buildReplicationNum()
-                .buildInMemory()
-                .buildStorageFormat();
+        return GsonUtils.GSON.fromJson(Text.readString(in), TableProperty.class);
+    }
+
+    @Override
+    public void gsonPostProcess() throws IOException {
+        buildDynamicProperty();
+        buildReplicationNum();
+        buildInMemory();
+        buildStorageFormat();
+        buildEnablePersistentIndex();
     }
 }

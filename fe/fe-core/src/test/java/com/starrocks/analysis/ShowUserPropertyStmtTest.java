@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/analysis/ShowUserPropertyStmtTest.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -50,6 +46,6 @@ public class ShowUserPropertyStmtTest {
     public void testNormal() throws UserException, AnalysisException {
         ShowUserPropertyStmt stmt = new ShowUserPropertyStmt("testUser", "%load_cluster%");
         stmt.analyze(analyzer);
-        Assert.assertEquals("SHOW PROPERTY FOR 'testCluster:testUser' LIKE '%load_cluster%'", stmt.toString());
+        Assert.assertEquals("SHOW PROPERTY FOR 'default_cluster:testUser' LIKE '%load_cluster%'", stmt.toString());
     }
 }

@@ -21,7 +21,10 @@
 
 #include "util/bfd_parser.h"
 
+#include <bfd.h>
+
 #include <memory>
+#include <utility>
 
 #include "common/logging.h"
 
@@ -101,7 +104,9 @@ BfdParser* BfdParser::create() {
     }
 
     char prog_name[1024];
-    fscanf(file, "%s ", prog_name);
+    if (fscanf(file, "%s ", prog_name) != 1) {
+        strcpy(prog_name, "read cmdline failed");
+    }
     fclose(file);
     std::unique_ptr<BfdParser> parser(new BfdParser(prog_name));
     if (parser->parse()) {
@@ -131,8 +136,8 @@ void BfdParser::list_targets(std::vector<std::string>* out) {
     free(targets);
 }
 
-BfdParser::BfdParser(const std::string& file_name)
-        : _file_name(file_name), _abfd(nullptr), _syms(nullptr), _num_symbols(0), _symbol_size(0) {
+BfdParser::BfdParser(std::string file_name)
+        : _file_name(std::move(file_name)), _abfd(nullptr), _syms(nullptr), _num_symbols(0), _symbol_size(0) {
     if (!_is_bfd_inited) {
         init_bfd();
     }
@@ -170,7 +175,7 @@ int BfdParser::open_bfd() {
         return -1;
     }
     if (bfd_check_format(_abfd, bfd_archive)) {
-        LOG(WARNING) << "bfd_check_format for archive fialed because errmsg=" << bfd_errmsg(bfd_get_error());
+        LOG(WARNING) << "bfd_check_format for archive failed because errmsg=" << bfd_errmsg(bfd_get_error());
         return -1;
     }
 

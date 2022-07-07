@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -14,6 +14,9 @@ public:
 
     ColumnRef(const SlotDescriptor* desc);
 
+    // only used for UT
+    ColumnRef(const TypeDescriptor& type, SlotId slot = -1);
+
     SlotId slot_id() const { return _column_id; }
 
     TupleId tuple_id() const { return _tuple_id; }
@@ -24,12 +27,11 @@ public:
 
     // FixMe(kks): currenly, join runtime filter need this method
     // we should find a way remove this method
-    bool is_bound(const std::vector<TupleId>& tuple_ids) const;
+    bool is_bound(const std::vector<TupleId>& tuple_ids) const override;
 
     Expr* clone(ObjectPool* pool) const override { return pool->add(new ColumnRef(*this)); }
 
     bool is_constant() const override { return false; }
-    bool is_vectorized() const override { return true; }
 
     int get_slot_ids(std::vector<SlotId>* slot_ids) const override;
 
@@ -48,12 +50,6 @@ private:
     TupleId _tuple_id = 0; // used for desc this slot from
     bool _is_nullable = false;
 };
-
-inline vectorized::ColumnPtr& ColumnRef::get_column(Expr* expr, vectorized::Chunk* chunk) {
-    ColumnRef* ref = (ColumnRef*)expr;
-    ColumnPtr& column = (chunk)->get_column_by_slot_id(ref->slot_id());
-    return column;
-}
 
 } // namespace vectorized
 } // namespace starrocks

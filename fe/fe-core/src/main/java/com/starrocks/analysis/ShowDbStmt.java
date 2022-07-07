@@ -21,13 +21,14 @@
 
 package com.starrocks.analysis;
 
-import com.google.common.collect.Lists;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.InfoSchemaDb;
 import com.starrocks.catalog.ScalarType;
-import com.starrocks.common.AnalysisException;
-import com.starrocks.common.UserException;
 import com.starrocks.qe.ShowResultSetMetaData;
+import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.ast.QueryStatement;
+import com.starrocks.sql.ast.SelectRelation;
+import com.starrocks.sql.ast.TableRelation;
 
 // Show database statement.
 public class ShowDbStmt extends ShowStmt {
@@ -37,10 +38,10 @@ public class ShowDbStmt extends ShowStmt {
             ShowResultSetMetaData.builder()
                     .addColumn(new Column(DB_COL, ScalarType.createVarchar(20)))
                     .build();
-
-    private String pattern;
+    private final String pattern;
     private Expr where;
-    private SelectStmt selectStmt;
+
+    private String catalogName;
 
     public ShowDbStmt(String pattern) {
         this.pattern = pattern;
@@ -51,22 +52,37 @@ public class ShowDbStmt extends ShowStmt {
         this.where = where;
     }
 
+    public ShowDbStmt(String pattern, String catalogName) {
+        this.pattern = pattern;
+        this.catalogName = catalogName;
+    }
+
+    public ShowDbStmt(String pattern, Expr where, String catalogName) {
+        this.pattern = pattern;
+        this.where = where;
+        this.catalogName = catalogName;
+    }
+
     public String getPattern() {
         return pattern;
     }
 
-    @Override
-    public void analyze(Analyzer analyzer) throws AnalysisException, UserException {
-        super.analyze(analyzer);
+    public String getCatalogName() {
+        return catalogName;
+    }
+
+    public void setCatalogName(String catalogName) {
+        this.catalogName = catalogName;
     }
 
     @Override
-    public SelectStmt toSelectStmt(Analyzer analyzer) {
+    public void analyze(Analyzer analyzer) {
+    }
+
+    @Override
+    public QueryStatement toSelectStmt() {
         if (where == null) {
             return null;
-        }
-        if (selectStmt != null) {
-            return selectStmt;
         }
         // Columns
         SelectList selectList = new SelectList();
@@ -75,18 +91,21 @@ public class ShowDbStmt extends ShowStmt {
         selectList.addItem(item);
         aliasMap.put(new SlotRef(null, DB_COL), item.getExpr().clone(null));
         where = where.substitute(aliasMap);
-        selectStmt = new SelectStmt(selectList,
-                new FromClause(Lists.newArrayList(new TableRef(TABLE_NAME, null))),
-                where, null, null, null, LimitElement.NO_LIMIT);
-
-        return selectStmt;
+        return new QueryStatement(new SelectRelation(selectList, new TableRelation(TABLE_NAME),
+                where, null, null));
     }
 
     @Override
     public String toSql() {
         StringBuilder sb = new StringBuilder("SHOW DATABASES");
+        if (catalogName != null) {
+            sb.append(" FROM ").append(catalogName);
+        }
         if (pattern != null) {
             sb.append(" LIKE '").append(pattern).append("'");
+        }
+        if (where != null) {
+            sb.append(" WHERE '").append(where).append("'");
         }
         return sb.toString();
     }
@@ -99,5 +118,15 @@ public class ShowDbStmt extends ShowStmt {
     @Override
     public ShowResultSetMetaData getMetaData() {
         return META_DATA;
+    }
+
+    @Override
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
+        return visitor.visitShowDatabasesStmt(this, context);
+    }
+
+    @Override
+    public boolean isSupportNewPlanner() {
+        return true;
     }
 }

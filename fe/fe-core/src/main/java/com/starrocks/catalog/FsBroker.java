@@ -22,10 +22,12 @@
 package com.starrocks.catalog;
 
 import com.google.gson.annotations.SerializedName;
+import com.starrocks.common.Config;
 import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.persist.gson.GsonUtils;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.BrokerHbResponse;
 import com.starrocks.system.HeartbeatResponse.HbStatus;
 
@@ -46,6 +48,8 @@ public class FsBroker implements Writable, Comparable<FsBroker> {
     public long lastStartTime = -1;
     @SerializedName(value = "isAlive")
     public boolean isAlive;
+
+    private int heartbeatRetryTimes = 0;
 
     public FsBroker() {
     }
@@ -71,12 +75,17 @@ public class FsBroker implements Writable, Comparable<FsBroker> {
             }
             lastUpdateTime = hbResponse.getHbTime();
             heartbeatErrMsg = "";
+            this.heartbeatRetryTimes = 0;
         } else {
-            if (isAlive) {
-                isAlive = false;
-                isChanged = true;
+            if (this.heartbeatRetryTimes < Config.heartbeat_retry_times) {
+                this.heartbeatRetryTimes++;
+            } else {
+                if (isAlive) {
+                    isAlive = false;
+                    isChanged = true;
+                }
+                heartbeatErrMsg = hbResponse.getMsg() == null ? "Unknown error" : hbResponse.getMsg();
             }
-            heartbeatErrMsg = hbResponse.getMsg() == null ? "Unknown error" : hbResponse.getMsg();
         }
 
         return isChanged;
@@ -133,7 +142,7 @@ public class FsBroker implements Writable, Comparable<FsBroker> {
     }
 
     public static FsBroker readIn(DataInput in) throws IOException {
-        if (Catalog.getCurrentCatalogJournalVersion() < FeMetaVersion.VERSION_73) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() < FeMetaVersion.VERSION_73) {
             FsBroker broker = new FsBroker();
             broker.readFields(in);
             return broker;

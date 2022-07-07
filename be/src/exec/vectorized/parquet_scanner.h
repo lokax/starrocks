@@ -1,8 +1,8 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
-#include <env/env.h>
+#include <fs/fs.h>
 
 #include <map>
 #include <memory>
@@ -25,14 +25,10 @@ namespace starrocks::vectorized {
 // Broker scanner convert the data read from broker to starrocks's tuple.
 class ParquetScanner : public FileScanner {
 public:
-    ParquetScanner(RuntimeState* state, RuntimeProfile* profile, const TBrokerScanRangeParams& params,
-                   ScannerCounter* counter, const std::vector<TBrokerRangeDesc>& ranges,
-                   std::vector<std::shared_ptr<RandomAccessFile>>&& files);
-
     ParquetScanner(RuntimeState* state, RuntimeProfile* profile, const TBrokerScanRange& scan_range,
                    ScannerCounter* counter);
 
-    ~ParquetScanner();
+    ~ParquetScanner() override;
 
     Status open() override;
 
@@ -50,7 +46,7 @@ private:
     bool batch_is_exhausted();
     Status finalize_src_chunk(ChunkPtr* chunk);
     Status convert_array_to_column(ConvertFunc func, size_t num_elements, const arrow::Array* array,
-                                   const TypeDescriptor* type_desc, ColumnPtr column);
+                                   const TypeDescriptor* type_desc, const ColumnPtr& column);
 
     Status new_column(const arrow::DataType* arrow_type, const SlotDescriptor* slot_desc, ColumnPtr* column,
                       ConvertFunc* conv_func, Expr** expr);

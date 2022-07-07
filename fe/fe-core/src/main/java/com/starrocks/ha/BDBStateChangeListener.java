@@ -24,28 +24,34 @@ package com.starrocks.ha;
 import com.google.common.base.Preconditions;
 import com.sleepycat.je.rep.StateChangeEvent;
 import com.sleepycat.je.rep.StateChangeListener;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.common.util.Util;
 import com.starrocks.persist.EditLog;
+import com.starrocks.server.GlobalStateMgr;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 public class BDBStateChangeListener implements StateChangeListener {
     public static final Logger LOG = LogManager.getLogger(EditLog.class);
+    private FrontendNodeType newType = FrontendNodeType.UNKNOWN;
+    private final boolean isElectable;
 
-    public BDBStateChangeListener() {
+    public BDBStateChangeListener(boolean isElectable) {
+        this.isElectable = isElectable;
+    }
+
+    public synchronized FrontendNodeType getNewType() {
+        return newType;
     }
 
     @Override
     public synchronized void stateChange(StateChangeEvent sce) throws RuntimeException {
-        FrontendNodeType newType = null;
         switch (sce.getState()) {
             case MASTER: {
                 newType = FrontendNodeType.MASTER;
                 break;
             }
             case REPLICA: {
-                if (Catalog.getCurrentCatalog().isElectable()) {
+                if (isElectable) {
                     newType = FrontendNodeType.FOLLOWER;
                 } else {
                     newType = FrontendNodeType.OBSERVER;
@@ -64,7 +70,7 @@ public class BDBStateChangeListener implements StateChangeListener {
             }
         }
         Preconditions.checkNotNull(newType);
-        Catalog.getCurrentCatalog().notifyNewFETypeTransfer(newType);
+        GlobalStateMgr.getCurrentState().notifyNewFETypeTransfer(newType);
     }
 
 }

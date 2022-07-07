@@ -25,13 +25,12 @@ import com.starrocks.catalog.ArrayType;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.sql.analyzer.ExprVisitor;
+import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.thrift.TExprNode;
 import com.starrocks.thrift.TExprNodeType;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.stream.Collectors;
 
 public class ArrayExpr extends Expr {
@@ -73,6 +72,10 @@ public class ArrayExpr extends Expr {
         this.type = this.type == null ? new ArrayType(targetItemType) : this.type;
     }
 
+    public boolean isExplicitType() {
+        return explicitType;
+    }
+
     @Override
     protected String toSqlImpl() {
         StringBuilder sb = new StringBuilder();
@@ -81,6 +84,18 @@ public class ArrayExpr extends Expr {
         }
         sb.append('[');
         sb.append(children.stream().map(Expr::toSql).collect(Collectors.joining(",")));
+        sb.append(']');
+        return sb.toString();
+    }
+
+    @Override
+    protected String toDigestImpl() {
+        StringBuilder sb = new StringBuilder();
+        if (this.explicitType) {
+            sb.append(this.type.toSql());
+        }
+        sb.append('[');
+        sb.append(children.stream().map(Expr::toDigest).collect(Collectors.joining(",")));
         sb.append(']');
         return sb.toString();
     }
@@ -114,25 +129,7 @@ public class ArrayExpr extends Expr {
     }
 
     @Override
-    public boolean isVectorized() {
-        Optional<Expr> e = children.stream().filter(x -> !x.isVectorized()).findFirst();
-        return !e.isPresent();
-    }
-
-    @Override
-    protected boolean canCastTo(Type targetType) {
-        if (this.type.isNull()) {
-            return true;
-        }
-        if (!targetType.isArrayType()) {
-            return false;
-        }
-        ArrayType targetArrayType = (ArrayType) targetType;
-        return this.children.stream().allMatch(child -> child.canCastTo(targetArrayType.getItemType()));
-    }
-
-    @Override
-    public <R, C> R accept(ExprVisitor<R, C> visitor, C context) {
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
         return visitor.visitArrayExpr(this, context);
     }
 }

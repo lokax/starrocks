@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rewrite;
 
@@ -7,12 +7,13 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Function;
+import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.rewrite.FEFunction;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
@@ -27,6 +28,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Use for execute constant functions
@@ -101,9 +103,10 @@ public enum ScalarOperatorEvaluator {
 
         // return Null directly iff:
         // 1. Not UDF
-        // 2. Not in NonNullResultWithNullParamFunctions
+        // 2. Not in isNotAlwaysNullResultWithNullParamFunctions
         // 3. Has null parameter
-        if (!Catalog.getCurrentCatalog().isNonNullResultWithNullParamFunction(fn.getFunctionName().getFunction())
+        if (!GlobalStateMgr.getCurrentState()
+                .isNotAlwaysNullResultWithNullParamFunction(fn.getFunctionName().getFunction())
                 && !fn.isUdf()) {
             for (ScalarOperator op : root.getChildren()) {
                 if (((ConstantOperator) op).isNull()) {
@@ -133,7 +136,16 @@ public enum ScalarOperatorEvaluator {
         FunctionInvoker invoker = functions.get(signature);
 
         try {
-            return invoker.invoke(root.getChildren());
+            ConstantOperator operator = invoker.invoke(root.getChildren());
+
+            // check return result type, decimal will change return type
+            if (operator.getType().getPrimitiveType() != fn.getReturnType().getPrimitiveType()) {
+                Preconditions.checkState(operator.getType().isDecimalOfAnyVersion());
+                Preconditions.checkState(fn.getReturnType().isDecimalOfAnyVersion());
+                operator.setType(fn.getReturnType());
+            }
+
+            return operator;
         } catch (AnalysisException e) {
             LOG.debug("failed to invoke", e);
         }
@@ -241,14 +253,21 @@ public enum ScalarOperatorEvaluator {
             }
 
             ScalarOperatorEvaluator.FunctionSignature signature = (ScalarOperatorEvaluator.FunctionSignature) o;
-            return Objects.equals(name, signature.name)
-                    && argTypes.equals(signature.argTypes)
-                    && Objects.equals(returnType, signature.returnType);
+
+            List<PrimitiveType> primitiveTypes =
+                    argTypes.stream().map(Type::getPrimitiveType).collect(Collectors.toList());
+            List<PrimitiveType> sigPrimitiveTypes =
+                    signature.argTypes.stream().map(Type::getPrimitiveType).collect(Collectors.toList());
+            return Objects.equals(name, signature.name) &&
+                    primitiveTypes.equals(sigPrimitiveTypes) &&
+                    returnType.matchesType(signature.returnType);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(name, argTypes, returnType);
+            List<PrimitiveType> primitiveTypes =
+                    argTypes.stream().map(Type::getPrimitiveType).collect(Collectors.toList());
+            return Objects.hash(name, primitiveTypes, returnType.getPrimitiveType());
         }
     }
 }

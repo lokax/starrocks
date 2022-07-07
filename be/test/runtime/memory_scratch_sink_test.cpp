@@ -40,12 +40,9 @@
 #include "runtime/mem_tracker.h"
 #include "runtime/primitive_type.h"
 #include "runtime/result_queue_mgr.h"
-#include "runtime/row_batch.h"
 #include "runtime/runtime_state.h"
 #include "runtime/thread_resource_mgr.h"
-#include "runtime/tuple_row.h"
 #include "storage/options.h"
-#include "storage/row.h"
 #include "testutil/desc_tbl_builder.h"
 #include "util/blocking_queue.hpp"
 #include "util/logging.h"
@@ -74,9 +71,6 @@ public:
     ~MemoryScratchSinkTest() {
         delete _state;
         delete _mem_tracker;
-        delete _exec_env->_result_queue_mgr;
-        delete _exec_env->_thread_mgr;
-        delete _exec_env->_buffer_reservation;
     }
 
     virtual void SetUp() {
@@ -120,9 +114,6 @@ void MemoryScratchSinkTest::init() {
 }
 
 void MemoryScratchSinkTest::init_runtime_state() {
-    _exec_env->_result_queue_mgr = new ResultQueueMgr();
-    _exec_env->_thread_mgr = new ThreadResourceMgr();
-    _exec_env->_buffer_reservation = new ReservationTracker();
     TQueryOptions query_options;
     query_options.batch_size = 1024;
     TUniqueId query_id;
@@ -182,7 +173,7 @@ void MemoryScratchSinkTest::init_desc_tbl() {
     t_tuple_desc.__isset.tableId = true;
     _t_desc_table.tupleDescriptors.push_back(t_tuple_desc);
 
-    DescriptorTbl::create(&_obj_pool, _t_desc_table, &_desc_tbl);
+    DescriptorTbl::create(&_obj_pool, _t_desc_table, &_desc_tbl, config::vector_chunk_size);
 
     std::vector<TTupleId> row_tids;
     row_tids.push_back(0);
@@ -241,7 +232,7 @@ TEST_F(MemoryScratchSinkTest, work_flow_normal) {
     ASSERT_TRUE(status.ok());
 
     std::unique_ptr<MemTracker> mem_tracker(new MemTracker(-1));
-    RowBatch row_batch(scan_node._row_descriptor, _state->batch_size(), mem_tracker.get());
+    RowBatch row_batch(scan_node._row_descriptor, _state->chunk_size(), mem_tracker.get());
     bool eos = false;
 
     while (!eos) {

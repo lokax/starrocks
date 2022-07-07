@@ -28,8 +28,9 @@
 #include "common/config.h"
 #include "common/logging.h"
 #include "common/status.h"
+#include "exec/es/es_scroll_parser.h"
 #include "exec/es/es_scroll_query.h"
-#include "exec/vectorized/es_http_components.h"
+#include "fmt/compile.h"
 
 namespace starrocks {
 
@@ -52,7 +53,9 @@ ESScanReader::ESScanReader(const std::string& target, const std::map<std::string
           _doc_value_mode(doc_value_mode) {
     _target = target;
     _index = props.at(KEY_INDEX);
-    _type = props.at(KEY_TYPE);
+    if (props.find(KEY_TYPE) != props.end()) {
+        _type = props.at(KEY_TYPE);
+    }
     if (props.find(KEY_USER_NAME) != props.end()) {
         _user_name = props.at(KEY_USER_NAME);
     }
@@ -66,33 +69,41 @@ ESScanReader::ESScanReader(const std::string& target, const std::map<std::string
         _query = props.at(KEY_QUERY);
     }
 
+    if (props.find(KEY_ES_NET_SSL) != props.end()) {
+        std::istringstream(props.at(KEY_ES_NET_SSL)) >> std::boolalpha >> _ssl_enabled;
+    }
+
     std::string batch_size_str = props.at(KEY_BATCH_SIZE);
     _batch_size = atoi(batch_size_str.c_str());
     std::string filter_path = _doc_value_mode ? DOCVALUE_SCROLL_SEARCH_FILTER_PATH : SOURCE_SCROLL_SEARCH_FILTER_PATH;
 
     if (props.find(KEY_TERMINATE_AFTER) != props.end()) {
         _exactly_once = true;
-        std::stringstream scratch;
         // just send a normal search  against the elasticsearch with additional terminate_after param to achieve terminate early effect when limit take effect
-        scratch << _target << REQUEST_SEPARATOR << _index << REQUEST_SEPARATOR << _type << "/_search?"
-                << "terminate_after=" << props.at(KEY_TERMINATE_AFTER) << REQUEST_PREFERENCE_PREFIX << _shards << "&"
-                << filter_path;
-        _search_url = scratch.str();
+        if (_type.empty()) {
+            _search_url = fmt::format("{}/{}/_search?terminate_after={}&preference=_shards:{}&{}", _target, _index,
+                                      props.at(KEY_TERMINATE_AFTER), _shards, filter_path);
+        } else {
+            _search_url = fmt::format("{}/{}/{}/_search?terminate_after={}&preference=_shards:{}&{}", _target, _index,
+                                      _type, props.at(KEY_TERMINATE_AFTER), _shards, filter_path);
+        }
     } else {
         _exactly_once = false;
-        std::stringstream scratch;
         // scroll request for scanning
         // add terminate_after for the first scroll to avoid decompress all postings list
-        scratch << _target << REQUEST_SEPARATOR << _index << REQUEST_SEPARATOR << _type << "/_search?"
-                << "scroll=" << _scroll_keep_alive << REQUEST_PREFERENCE_PREFIX << _shards << "&" << filter_path
-                << "&terminate_after=" << batch_size_str;
-        _init_scroll_url = scratch.str();
+        if (_type.empty()) {
+            _init_scroll_url = fmt::format("{}/{}/_search?scroll={}&preference=_shards:{}&{}", _target, _index,
+                                           _scroll_keep_alive, _shards, filter_path);
+        } else {
+            _init_scroll_url = fmt::format("{}/{}/{}/_search?scroll={}&preference=_shards:{}&{}", _target, _index,
+                                           _type, _scroll_keep_alive, _shards, filter_path);
+        }
         _next_scroll_url = _target + REQUEST_SEARCH_SCROLL_PATH + "?" + filter_path;
     }
     _eos = false;
 }
 
-ESScanReader::~ESScanReader() {}
+ESScanReader::~ESScanReader() = default;
 
 Status ESScanReader::open() {
     _is_first = true;
@@ -105,13 +116,15 @@ Status ESScanReader::open() {
     }
     _network_client.set_basic_auth(_user_name, _passwd);
     _network_client.set_content_type("application/json");
+    if (_ssl_enabled) {
+        _network_client.trust_all_ssl();
+    }
     // phase open, we cached the first response for `get_next` phase
     Status status = _network_client.execute_post_request(_query, &_cached_response);
+    VLOG(1) << "ES Query:" << _query;
     if (!status.ok() || _network_client.get_http_status() != 200) {
-        std::stringstream ss;
-        ss << "Failed to connect to ES server, errmsg is: " << status.get_error_msg();
-        LOG(WARNING) << ss.str();
-        return Status::InternalError(ss.str());
+        std::string err_msg = fmt::format("Failed to connect to ES server, errmsg is: {}", status.get_error_msg());
+        return Status::InternalError(err_msg);
     }
     VLOG(1) << "open _cached response: " << _cached_response;
     return Status::OK();
@@ -137,6 +150,9 @@ Status ESScanReader::get_next(bool* scan_eos, std::unique_ptr<T>& scroll_parser)
         _network_client.set_basic_auth(_user_name, _passwd);
         _network_client.set_content_type("application/json");
         _network_client.set_timeout_ms(_http_timeout_ms);
+        if (_ssl_enabled) {
+            _network_client.trust_all_ssl();
+        }
         RETURN_IF_ERROR(_network_client.execute_post_request(
                 ESScrollQueryBuilder::build_next_scroll_body(_scroll_id, _scroll_keep_alive), &response));
         long status = _network_client.get_http_status();
@@ -179,8 +195,6 @@ Status ESScanReader::get_next(bool* scan_eos, std::unique_ptr<T>& scroll_parser)
     return Status::OK();
 }
 
-template Status ESScanReader::get_next<ScrollParser>(bool* scan_eos, std::unique_ptr<ScrollParser>& scroll_parser);
-
 template Status ESScanReader::get_next<vectorized::ScrollParser>(
         bool* scan_eos, std::unique_ptr<vectorized::ScrollParser>& scroll_parser);
 
@@ -195,6 +209,9 @@ Status ESScanReader::close() {
     _network_client.set_method(DELETE);
     _network_client.set_content_type("application/json");
     _network_client.set_timeout_ms(5 * 1000);
+    if (_ssl_enabled) {
+        _network_client.trust_all_ssl();
+    }
     std::string response;
     RETURN_IF_ERROR(_network_client.execute_delete_request(ESScrollQueryBuilder::build_clear_scroll_body(_scroll_id),
                                                            &response));

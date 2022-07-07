@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_OLAP_TASK_ENGINE_TASK_H
-#define STARROCKS_BE_SRC_OLAP_TASK_ENGINE_TASK_H
+#pragma once
 
 #include "storage/olap_common.h"
 #include "storage/olap_define.h"
@@ -35,14 +34,8 @@ namespace starrocks {
 // add "Engine" as task prefix to prevent duplicate name with agent task
 class EngineTask {
 public:
-    // use olap_status not agent_status, because the task is very close to engine
-    virtual OLAPStatus prepare() { return OLAP_SUCCESS; }
-    virtual OLAPStatus execute() { return OLAP_SUCCESS; }
-    virtual OLAPStatus finish() { return OLAP_SUCCESS; }
-    virtual OLAPStatus cancel() { return OLAP_SUCCESS; }
-    virtual void get_related_tablets(std::vector<TabletInfo>* tablet_infos) {}
-    virtual ~EngineTask() {}
+    virtual Status execute() { return Status::OK(); }
+    virtual ~EngineTask() = default;
 };
 
 } // end namespace starrocks
-#endif //STARROCKS_BE_SRC_OLAP_TASK_ENGINE_TASK_H

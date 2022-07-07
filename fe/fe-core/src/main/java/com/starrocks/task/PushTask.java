@@ -50,7 +50,6 @@ public class PushTask extends AgentTask {
     private long replicaId;
     private int schemaHash;
     private long version;
-    private long versionHash;
     private int timeoutSecond;
     private long loadJobId;
     private TPushType pushType;
@@ -62,16 +61,17 @@ public class PushTask extends AgentTask {
     private boolean isSyncDelete;
     private long asyncDeleteJobId;
 
-    private long transactionId;
+    private final long transactionId;
     private boolean isSchemaChanging;
 
     // for load v2 (spark load)
     private TBrokerScanRange tBrokerScanRange;
     private TDescriptorTable tDescriptorTable;
     private boolean useVectorized;
+    private String timezone;
 
     public PushTask(TResourceInfo resourceInfo, long backendId, long dbId, long tableId, long partitionId,
-                    long indexId, long tabletId, long replicaId, int schemaHash, long version, long versionHash,
+                    long indexId, long tabletId, long replicaId, int schemaHash, long version,
                     int timeoutSecond, long loadJobId, TPushType pushType,
                     List<Predicate> conditions, TPriority priority, TTaskType taskType,
                     long transactionId, long signature) {
@@ -79,7 +79,6 @@ public class PushTask extends AgentTask {
         this.replicaId = replicaId;
         this.schemaHash = schemaHash;
         this.version = version;
-        this.versionHash = versionHash;
         this.timeoutSecond = timeoutSecond;
         this.loadJobId = loadJobId;
         this.pushType = pushType;
@@ -91,27 +90,39 @@ public class PushTask extends AgentTask {
         this.transactionId = transactionId;
         this.tBrokerScanRange = null;
         this.tDescriptorTable = null;
-        this.useVectorized = false;
+        this.useVectorized = true;
+    }
+
+    // for cancel delete
+    public PushTask(long backendId, TPushType pushType, TPriority priority, TTaskType taskType,
+                    long transactionId, long signature) {
+        super(null, backendId, taskType, -1, -1, -1, -1, -1);
+        this.pushType = pushType;
+        this.priority = priority;
+        this.transactionId = transactionId;
+        this.signature = signature;
     }
 
     // for load v2 (SparkLoadJob)
     public PushTask(long backendId, long dbId, long tableId, long partitionId, long indexId, long tabletId,
                     long replicaId, int schemaHash, int timeoutSecond, long loadJobId, TPushType pushType,
                     TPriority priority, long transactionId, long signature, TBrokerScanRange tBrokerScanRange,
-                    TDescriptorTable tDescriptorTable, boolean useVectorized) {
+                    TDescriptorTable tDescriptorTable, boolean useVectorized, String timezone) {
         this(null, backendId, dbId, tableId, partitionId, indexId,
-                tabletId, replicaId, schemaHash, -1, 0, timeoutSecond, loadJobId, pushType, null,
+                tabletId, replicaId, schemaHash, -1, timeoutSecond, loadJobId, pushType, null,
                 priority, TTaskType.REALTIME_PUSH, transactionId, signature);
         this.tBrokerScanRange = tBrokerScanRange;
         this.tDescriptorTable = tDescriptorTable;
         this.useVectorized = useVectorized;
+        this.timezone = timezone;
     }
 
     public TPushReq toThrift() {
-        TPushReq request = new TPushReq(tabletId, schemaHash, version, versionHash, timeoutSecond, pushType);
+        TPushReq request = new TPushReq(tabletId, schemaHash, version, 0, timeoutSecond, pushType);
         if (taskType == TTaskType.REALTIME_PUSH) {
             request.setPartition_id(partitionId);
             request.setTransaction_id(transactionId);
+            request.setTimezone(timezone);
         }
         request.setIs_schema_changing(isSchemaChanging);
         switch (pushType) {
@@ -159,11 +170,15 @@ public class PushTask extends AgentTask {
                     tConditions.add(tCondition);
                 }
                 request.setDelete_conditions(tConditions);
+                request.setUse_vectorized(useVectorized);
                 break;
             case LOAD_V2:
                 request.setBroker_scan_range(tBrokerScanRange);
                 request.setDesc_tbl(tDescriptorTable);
                 request.setUse_vectorized(useVectorized);
+                break;
+            case CANCEL_DELETE:
+                request.setTransaction_id(transactionId);
                 break;
             default:
                 LOG.warn("unknown push type. type: " + pushType.name());
@@ -196,10 +211,6 @@ public class PushTask extends AgentTask {
 
     public long getVersion() {
         return version;
-    }
-
-    public long getVersionHash() {
-        return versionHash;
     }
 
     public long getLoadJobId() {

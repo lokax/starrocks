@@ -21,10 +21,12 @@
 
 package com.starrocks.analysis;
 
+import com.starrocks.sql.ast.AstVisitor;
+
 /**
  * Combination of limit and offset expressions.
  */
-public class LimitElement {
+public class LimitElement implements ParseNode {
     public static LimitElement NO_LIMIT = new LimitElement();
 
     /////////////////////////////////////////
@@ -91,9 +93,21 @@ public class LimitElement {
         }
         StringBuilder sb = new StringBuilder(" LIMIT ");
         if (offset != 0) {
-            sb.append(offset + ", ");
+            sb.append(offset).append(", ");
         }
-        sb.append("" + limit);
+        sb.append("").append(limit);
+        return sb.toString();
+    }
+
+    public String toDigest() {
+        if (limit == -1) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(" limit ");
+        if (offset != 0) {
+            sb.append(" ?, ");
+        }
+        sb.append("").append(" ? ");
         return sb.toString();
     }
 
@@ -104,5 +118,10 @@ public class LimitElement {
     }
 
     public void reset() {
+    }
+
+    @Override
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
+        return visitor.visitLimitElement(this, context);
     }
 }

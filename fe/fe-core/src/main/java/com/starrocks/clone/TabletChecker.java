@@ -28,8 +28,9 @@ import com.google.common.collect.Sets;
 import com.google.common.collect.Table.Cell;
 import com.starrocks.analysis.AdminCancelRepairTableStmt;
 import com.starrocks.analysis.AdminRepairTableStmt;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.LocalTablet;
+import com.starrocks.catalog.LocalTablet.TabletStatus;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
 import com.starrocks.catalog.OlapTable;
@@ -38,12 +39,12 @@ import com.starrocks.catalog.Partition.PartitionState;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Table.TableType;
 import com.starrocks.catalog.Tablet;
-import com.starrocks.catalog.Tablet.TabletStatus;
 import com.starrocks.clone.TabletScheduler.AddResult;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.Pair;
 import com.starrocks.common.util.MasterDaemon;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.SystemInfoService;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -63,7 +64,7 @@ public class TabletChecker extends MasterDaemon {
 
     private static final long CHECK_INTERVAL_MS = 20 * 1000L; // 20 second
 
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
     private SystemInfoService infoService;
     private TabletScheduler tabletScheduler;
     private TabletSchedulerStat stat;
@@ -114,10 +115,10 @@ public class TabletChecker extends MasterDaemon {
         }
     }
 
-    public TabletChecker(Catalog catalog, SystemInfoService infoService, TabletScheduler tabletScheduler,
+    public TabletChecker(GlobalStateMgr globalStateMgr, SystemInfoService infoService, TabletScheduler tabletScheduler,
                          TabletSchedulerStat stat) {
         super("tablet checker", CHECK_INTERVAL_MS);
-        this.catalog = catalog;
+        this.globalStateMgr = globalStateMgr;
         this.infoService = infoService;
         this.tabletScheduler = tabletScheduler;
         this.stat = stat;
@@ -180,7 +181,7 @@ public class TabletChecker extends MasterDaemon {
             return;
         }
 
-        checkTablets();
+        checkAllTablets();
 
         removePriosIfNecessary();
 
@@ -188,7 +189,37 @@ public class TabletChecker extends MasterDaemon {
         LOG.info(stat.incrementalBrief());
     }
 
-    private void checkTablets() {
+    /**
+     * Check the manually repaired table/partition first,
+     * so that they can be scheduled for repair at first place.
+     */
+    private void checkAllTablets() {
+        checkTabletsOnlyInPrios();
+        checkTabletsNotInPrios();
+    }
+
+    private void checkTabletsOnlyInPrios() {
+        doCheck(true);
+    }
+
+    private void checkTabletsNotInPrios() {
+        doCheck(false);
+    }
+
+    /**
+     * In order to avoid meaningless repair schedule, for task that need to
+     * choose a source replica to clone from, we check that whether we can
+     * find a healthy source replica before send it to pending queue.
+     * <p>
+     * If we don't do this check, the task will go into the pending queue and
+     * get deleted when no healthy source replica found, and then it will be added
+     * to the queue again in the next `TabletChecker` round.
+     */
+    private boolean tryChooseSrcBeforeSchedule(TabletSchedCtx tabletCtx) {
+        return !(tabletCtx.needCloneFromSource() && tabletCtx.getHealthyReplicas().size() == 0);
+    }
+
+    private void doCheck(boolean checkInPrios) {
         long start = System.currentTimeMillis();
         long totalTabletNum = 0;
         long unhealthyTabletNum = 0;
@@ -196,10 +227,10 @@ public class TabletChecker extends MasterDaemon {
         long tabletInScheduler = 0;
         long tabletNotReady = 0;
 
-        List<Long> dbIds = catalog.getDbIdsIncludeRecycleBin();
+        List<Long> dbIds = globalStateMgr.getDbIdsIncludeRecycleBin();
         OUT:
         for (Long dbId : dbIds) {
-            Database db = catalog.getDbIncludeRecycleBin(dbId);
+            Database db = globalStateMgr.getDbIncludeRecycleBin(dbId);
             if (db == null) {
                 continue;
             }
@@ -210,31 +241,48 @@ public class TabletChecker extends MasterDaemon {
 
             db.readLock();
             try {
-                List<Long> aliveBeIdsInCluster = infoService.getClusterBackendIds(db.getClusterName(), true);
-                for (Table table : catalog.getTablesIncludeRecycleBin(db)) {
-                    if (!table.needSchedule()) {
+                List<Long> aliveBeIdsInCluster = infoService.getBackendIds(true);
+                for (Table table : globalStateMgr.getTablesIncludeRecycleBin(db)) {
+                    if (!table.needSchedule(false)) {
+                        continue;
+                    }
+
+                    if ((checkInPrios && !isTableInPrios(dbId, table.getId())) ||
+                            (!checkInPrios && isTableInPrios(dbId, table.getId()))) {
                         continue;
                     }
 
                     OlapTable olapTbl = (OlapTable) table;
-                    for (Partition partition : catalog.getAllPartitionsIncludeRecycleBin(olapTbl)) {
+                    for (Partition partition : globalStateMgr.getAllPartitionsIncludeRecycleBin(olapTbl)) {
+                        if (partition.isUseStarOS()) {
+                            // replicas are managed by StarOS and cloud storage.
+                            continue;
+                        }
+
                         if (partition.getState() != PartitionState.NORMAL) {
                             // when alter job is in FINISHING state, partition state will be set to NORMAL,
                             // and we can schedule the tablets in it.
                             continue;
                         }
-                        short replicaNum = catalog.getReplicationNumIncludeRecycleBin(olapTbl.getPartitionInfo(),
+
+                        short replicaNum = globalStateMgr.getReplicationNumIncludeRecycleBin(olapTbl.getPartitionInfo(),
                                 partition.getId());
                         if (replicaNum == (short) -1) {
                             continue;
                         }
-                        boolean isInPrios = isInPrios(dbId, table.getId(), partition.getId());
+
+                        boolean isPartitionInPrios = isPartitionInPrios(dbId, table.getId(), partition.getId());
                         boolean prioPartIsHealthy = true;
+                        if ((checkInPrios && !isPartitionInPrios) || (!checkInPrios && isPartitionInPrios)) {
+                            continue;
+                        }
+
                         /*
                          * Tablet in SHADOW index can not be repaired of balanced
                          */
                         for (MaterializedIndex idx : partition.getMaterializedIndices(IndexExtState.VISIBLE)) {
                             for (Tablet tablet : idx.getTablets()) {
+                                LocalTablet localTablet = (LocalTablet) tablet;
                                 totalTabletNum++;
 
                                 if (tabletScheduler.containsTablet(tablet.getId())) {
@@ -243,26 +291,25 @@ public class TabletChecker extends MasterDaemon {
                                 }
 
                                 Pair<TabletStatus, TabletSchedCtx.Priority> statusWithPrio =
-                                        tablet.getHealthStatusWithPriority(
+                                        localTablet.getHealthStatusWithPriority(
                                                 infoService,
                                                 db.getClusterName(),
                                                 partition.getVisibleVersion(),
-                                                partition.getVisibleVersionHash(),
                                                 replicaNum,
                                                 aliveBeIdsInCluster);
 
                                 if (statusWithPrio.first == TabletStatus.HEALTHY) {
                                     // Only set last status check time when status is healthy.
-                                    tablet.setLastStatusCheckTime(start);
+                                    localTablet.setLastStatusCheckTime(start);
                                     continue;
-                                } else if (isInPrios) {
+                                } else if (isPartitionInPrios) {
                                     statusWithPrio.second = TabletSchedCtx.Priority.VERY_HIGH;
                                     prioPartIsHealthy = false;
                                 }
 
                                 unhealthyTabletNum++;
 
-                                if (!tablet.readyToBeRepaired(statusWithPrio.second)) {
+                                if (!localTablet.readyToBeRepaired(statusWithPrio.second)) {
                                     tabletNotReady++;
                                     continue;
                                 }
@@ -276,6 +323,10 @@ public class TabletChecker extends MasterDaemon {
                                 // the tablet status will be set again when being scheduled
                                 tabletCtx.setTabletStatus(statusWithPrio.first);
                                 tabletCtx.setOrigPriority(statusWithPrio.second);
+                                tabletCtx.setTablet(localTablet);
+                                if (!tryChooseSrcBeforeSchedule(tabletCtx)) {
+                                    continue;
+                                }
 
                                 AddResult res = tabletScheduler.addTablet(tabletCtx, false /* not force */);
                                 if (res == AddResult.LIMIT_EXCEED) {
@@ -288,7 +339,7 @@ public class TabletChecker extends MasterDaemon {
                             }
                         } // indices
 
-                        if (prioPartIsHealthy && isInPrios) {
+                        if (prioPartIsHealthy && isPartitionInPrios) {
                             // if all replicas in this partition are healthy, remove this partition from
                             // priorities.
                             LOG.debug("partition is healthy, remove from prios: {}-{}-{}",
@@ -310,13 +361,21 @@ public class TabletChecker extends MasterDaemon {
         stat.counterUnhealthyTabletNum.addAndGet(unhealthyTabletNum);
         stat.counterTabletAddToBeScheduled.addAndGet(addToSchedulerTabletNum);
 
-        LOG.info("finished to check tablets. unhealth/total/added/in_sched/not_ready: {}/{}/{}/{}/{}, cost: {} ms",
-                unhealthyTabletNum, totalTabletNum, addToSchedulerTabletNum, tabletInScheduler, tabletNotReady, cost);
+        LOG.info("finished to check tablets. checkInPrios: {}, " +
+                        "unhealthy/total/added/in_sched/not_ready: {}/{}/{}/{}/{}, cost: {} ms",
+                checkInPrios, unhealthyTabletNum, totalTabletNum, addToSchedulerTabletNum,
+                tabletInScheduler, tabletNotReady, cost);
     }
 
-    private boolean isInPrios(long dbId, long tblId, long partId) {
+    private boolean isTableInPrios(long dbId, long tblId) {
         synchronized (prios) {
-            if (prios.contains(dbId, tblId)) {
+            return prios.contains(dbId, tblId);
+        }
+    }
+
+    private boolean isPartitionInPrios(long dbId, long tblId, long partId) {
+        synchronized (prios) {
+            if (isTableInPrios(dbId, tblId)) {
                 return prios.get(dbId, tblId).contains(new PrioPart(partId, -1, -1));
             }
             return false;
@@ -336,7 +395,7 @@ public class TabletChecker extends MasterDaemon {
         while (iter.hasNext()) {
             Map.Entry<Long, Map<Long, Set<PrioPart>>> dbEntry = iter.next();
             long dbId = dbEntry.getKey();
-            Database db = Catalog.getCurrentCatalog().getDb(dbId);
+            Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
             if (db == null) {
                 iter.remove();
                 continue;
@@ -429,8 +488,8 @@ public class TabletChecker extends MasterDaemon {
 
     public static RepairTabletInfo getRepairTabletInfo(String dbName, String tblName, List<String> partitions)
             throws DdlException {
-        Catalog catalog = Catalog.getCurrentCatalog();
-        Database db = catalog.getDb(dbName);
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        Database db = globalStateMgr.getDb(dbName);
         if (db == null) {
             throw new DdlException("Database " + dbName + " does not exist");
         }

@@ -25,23 +25,23 @@
 
 namespace starrocks {
 
-OLAPStatus decimal12_t::from_string(const std::string& str) {
+Status decimal12_t::from_string(const std::string& str) {
     integer = 0;
     fraction = 0;
     const char* value_string = str.c_str();
     const char* sign = strchr(value_string, '-');
 
-    if (sign != NULL) {
+    if (sign != nullptr) {
         if (sign != value_string) {
-            return OLAP_ERR_INPUT_PARAMETER_ERROR;
+            return Status::InvalidArgument("Fail to cast to decimal.");
         } else {
             ++value_string;
         }
     }
 
     const char* sepr = strchr(value_string, '.');
-    if ((sepr != NULL && sepr - value_string > MAX_INT_DIGITS_NUM) ||
-        (sepr == NULL && strlen(value_string) > MAX_INT_DIGITS_NUM)) {
+    if ((sepr != nullptr && sepr - value_string > MAX_INT_DIGITS_NUM) ||
+        (sepr == nullptr && strlen(value_string) > MAX_INT_DIGITS_NUM)) {
         integer = 999999999999999999;
         fraction = 999999999;
     } else {
@@ -52,17 +52,17 @@ OLAPStatus decimal12_t::from_string(const std::string& str) {
             sscanf(value_string, "%18ld.%9d", &integer, &fraction);
         }
 
-        int32_t frac_len = (NULL != sepr) ? MAX_FRAC_DIGITS_NUM - strlen(sepr + 1) : MAX_FRAC_DIGITS_NUM;
+        int32_t frac_len = (nullptr != sepr) ? MAX_FRAC_DIGITS_NUM - strlen(sepr + 1) : MAX_FRAC_DIGITS_NUM;
         frac_len = frac_len > 0 ? frac_len : 0;
         fraction *= g_power_table[frac_len];
     }
 
-    if (sign != NULL) {
+    if (sign != nullptr) {
         fraction = -fraction;
         integer = -integer;
     }
 
-    return OLAP_SUCCESS;
+    return Status::OK();
 }
 
 } // namespace starrocks

@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/cast_expr.h"
 
@@ -6,18 +6,28 @@
 
 #include "column/array_column.h"
 #include "column/column_builder.h"
+#include "column/column_helper.h"
 #include "column/column_viewer.h"
+#include "column/json_column.h"
+#include "column/nullable_column.h"
+#include "column/type_traits.h"
+#include "column/vectorized_fwd.h"
 #include "common/object_pool.h"
 #include "exprs/vectorized/binary_function.h"
 #include "exprs/vectorized/column_ref.h"
 #include "exprs/vectorized/decimal_cast_expr.h"
 #include "exprs/vectorized/unary_function.h"
+#include "gutil/casts.h"
 #include "gutil/strings/substitute.h"
+#include "runtime/datetime_value.h"
+#include "runtime/large_int_value.h"
+#include "runtime/primitive_type.h"
 #include "runtime/runtime_state.h"
+#include "types/hll.h"
 #include "util/date_func.h"
+#include "util/json.h"
 
-namespace starrocks {
-namespace vectorized {
+namespace starrocks::vectorized {
 
 template <PrimitiveType FromType, PrimitiveType ToType>
 ColumnPtr cast_fn(ColumnPtr& column);
@@ -80,6 +90,116 @@ DEFINE_UNARY_FN_WITH_IMPL(TimeToNumber, value) {
     return timestamp::time_to_literal(value);
 }
 
+template <PrimitiveType FromType, PrimitiveType ToType>
+static ColumnPtr cast_to_json_fn(ColumnPtr& column) {
+    ColumnViewer<FromType> viewer(column);
+    ColumnBuilder<TYPE_JSON> builder(viewer.size());
+
+    for (int row = 0; row < viewer.size(); ++row) {
+        if (viewer.is_null(row)) {
+            builder.append_null();
+            continue;
+        }
+
+        JsonValue value;
+        bool overflow = false;
+        if constexpr (pt_is_integer<FromType>) {
+            constexpr int64_t min = RunTimeTypeLimits<TYPE_BIGINT>::min_value();
+            constexpr int64_t max = RunTimeTypeLimits<TYPE_BIGINT>::max_value();
+            overflow = viewer.value(row) < min || viewer.value(row) > max;
+            value = JsonValue::from_int(viewer.value(row));
+        } else if constexpr (pt_is_float<FromType>) {
+            constexpr double min = RunTimeTypeLimits<TYPE_DOUBLE>::min_value();
+            constexpr double max = RunTimeTypeLimits<TYPE_DOUBLE>::max_value();
+            overflow = viewer.value(row) < min || viewer.value(row) > max;
+            value = JsonValue::from_double(viewer.value(row));
+        } else if constexpr (pt_is_boolean<FromType>) {
+            value = JsonValue::from_bool(viewer.value(row));
+        } else if constexpr (pt_is_binary<FromType>) {
+            auto maybe = JsonValue::parse_json_or_string(viewer.value(row));
+            if (maybe.ok()) {
+                value = maybe.value();
+            } else {
+                overflow = true;
+            }
+        } else {
+            CHECK(false) << "not supported type " << FromType;
+        }
+        if (overflow || value.is_null()) {
+            builder.append_null();
+        } else {
+            builder.append(std::move(value));
+        }
+    }
+
+    return builder.build(column->is_constant());
+}
+
+template <PrimitiveType FromType, PrimitiveType ToType>
+static ColumnPtr cast_from_json_fn(ColumnPtr& column) {
+    ColumnViewer<TYPE_JSON> viewer(column);
+    ColumnBuilder<ToType> builder(viewer.size());
+
+    for (int row = 0; row < viewer.size(); ++row) {
+        if (viewer.is_null(row)) {
+            builder.append_null();
+            continue;
+        }
+
+        JsonValue* json = viewer.value(row);
+        if constexpr (pt_is_arithmetic<ToType>) {
+            [[maybe_unused]] constexpr auto min = RunTimeTypeLimits<ToType>::min_value();
+            [[maybe_unused]] constexpr auto max = RunTimeTypeLimits<ToType>::max_value();
+            RunTimeCppType<ToType> cpp_value{};
+            bool ok = true;
+            if constexpr (pt_is_integer<ToType>) {
+                auto res = json->get_int();
+                ok = res.ok() && min <= res.value() && res.value() <= max;
+                cpp_value = ok ? res.value() : cpp_value;
+            } else if constexpr (pt_is_float<ToType>) {
+                auto res = json->get_double();
+                ok = res.ok() && min <= res.value() && res.value() <= max;
+                cpp_value = ok ? res.value() : cpp_value;
+            } else if constexpr (pt_is_boolean<ToType>) {
+                auto res = json->get_bool();
+                ok = res.ok();
+                cpp_value = ok ? res.value() : cpp_value;
+            } else {
+                CHECK(false) << "unreachable type " << ToType;
+                __builtin_unreachable();
+            }
+            if (ok) {
+                builder.append(cpp_value);
+            } else {
+                builder.append_null();
+            }
+        } else if constexpr (pt_is_binary<ToType>) {
+            // if the json already a string value, get the string directly
+            // else cast it to string representation
+            if (json->get_type() == JsonType::JSON_STRING) {
+                auto res = json->get_string();
+                if (res.ok()) {
+                    builder.append(res.value());
+                } else {
+                    builder.append_null();
+                }
+            } else {
+                auto res = json->to_string();
+                if (res.ok()) {
+                    builder.append(res.value());
+                } else {
+                    builder.append_null();
+                }
+            }
+        } else {
+            DCHECK(false) << "not supported type " << ToType;
+            builder.append_null();
+        }
+    }
+
+    return builder.build(column->is_constant());
+}
+
 SELF_CAST(TYPE_BOOLEAN);
 UNARY_FN_CAST(TYPE_TINYINT, TYPE_BOOLEAN, ImplicitToBoolean);
 UNARY_FN_CAST(TYPE_SMALLINT, TYPE_BOOLEAN, ImplicitToBoolean);
@@ -92,11 +212,12 @@ UNARY_FN_CAST(TYPE_DECIMALV2, TYPE_BOOLEAN, DecimalToBoolean);
 UNARY_FN_CAST(TYPE_DATE, TYPE_BOOLEAN, DateToBoolean);
 UNARY_FN_CAST(TYPE_DATETIME, TYPE_BOOLEAN, TimestampToBoolean);
 UNARY_FN_CAST(TYPE_TIME, TYPE_BOOLEAN, ImplicitToBoolean);
+CUSTOMIZE_FN_CAST(TYPE_JSON, TYPE_BOOLEAN, cast_from_json_fn);
 
 template <>
 ColumnPtr cast_fn<TYPE_VARCHAR, TYPE_BOOLEAN>(ColumnPtr& column) {
-    ColumnBuilder<TYPE_BOOLEAN> builder;
     ColumnViewer<TYPE_VARCHAR> viewer(column);
+    ColumnBuilder<TYPE_BOOLEAN> builder(viewer.size());
 
     StringParser::ParseResult result;
 
@@ -134,6 +255,28 @@ ColumnPtr cast_fn<TYPE_VARCHAR, TYPE_BOOLEAN>(ColumnPtr& column) {
     return builder.build(column->is_constant());
 }
 
+template <>
+ColumnPtr cast_fn<TYPE_VARCHAR, TYPE_HLL>(ColumnPtr& column) {
+    ColumnViewer<TYPE_VARCHAR> viewer(column);
+    ColumnBuilder<TYPE_HLL> builder(viewer.size());
+    for (int row = 0; row < viewer.size(); ++row) {
+        if (viewer.is_null(row)) {
+            builder.append_null();
+            continue;
+        }
+
+        auto value = viewer.value(row);
+        if (!HyperLogLog::is_valid(value)) {
+            builder.append_null();
+        } else {
+            HyperLogLog hll;
+            hll.deserialize(value);
+            builder.append(&hll);
+        }
+    }
+
+    return builder.build(column->is_constant());
+}
 // all int(tinyint, smallint, int, bigint, largeint) cast implements
 DEFINE_UNARY_FN_WITH_IMPL(ImplicitToNumber, value) {
     return value;
@@ -158,32 +301,65 @@ DEFINE_UNARY_FN_WITH_IMPL(TimestampToNumber, value) {
 
 template <PrimitiveType FromType, PrimitiveType ToType>
 ColumnPtr cast_int_from_string_fn(ColumnPtr& column) {
-    ColumnBuilder<ToType> builder;
-    ColumnViewer<TYPE_VARCHAR> viewer(column);
-
     StringParser::ParseResult result;
 
-    for (int row = 0; row < viewer.size(); ++row) {
-        if (viewer.is_null(row)) {
-            builder.append_null();
-            continue;
-        }
+    int sz = column.get()->size();
 
-        auto value = viewer.value(row);
-        RunTimeCppType<ToType> r = StringParser::string_to_int<RunTimeCppType<ToType>>(value.data, value.size, &result);
-
-        bool is_null = (result != StringParser::PARSE_SUCCESS || std::isnan(r) || std::isinf(r));
-
-        builder.append(r, is_null);
+    if (column->only_null()) {
+        return ColumnHelper::create_const_null_column(sz);
     }
 
-    return builder.build(column->is_constant());
+    if (column->is_constant()) {
+        auto* input = ColumnHelper::get_binary_column(column.get());
+        auto slice = input->get_slice(0);
+        RunTimeCppType<ToType> r = StringParser::string_to_int<RunTimeCppType<ToType>>(slice.data, slice.size, &result);
+        if (result != StringParser::PARSE_SUCCESS) {
+            return ColumnHelper::create_const_null_column(sz);
+        }
+        return ColumnHelper::create_const_column<ToType>(r, sz);
+    }
+
+    auto res_data_column = RunTimeColumnType<ToType>::create();
+    res_data_column->resize(sz);
+    auto& res_data = res_data_column->get_data();
+
+    if (column->is_nullable()) {
+        NullableColumn* input_column = down_cast<NullableColumn*>(column.get());
+        NullColumnPtr null_column = ColumnHelper::as_column<NullColumn>(input_column->null_column()->clone());
+        BinaryColumn* data_column = down_cast<BinaryColumn*>(input_column->data_column().get());
+        auto& null_data = down_cast<NullColumn*>(null_column.get())->get_data();
+
+        for (int i = 0; i < sz; ++i) {
+            if (!null_data[i]) {
+                auto slice = data_column->get_slice(i);
+                res_data[i] = StringParser::string_to_int<RunTimeCppType<ToType>>(slice.data, slice.size, &result);
+                null_data[i] = (result != StringParser::PARSE_SUCCESS);
+            }
+        }
+        return NullableColumn::create(std::move(res_data_column), std::move(null_column));
+    } else {
+        NullColumnPtr null_column = NullColumn::create(sz);
+        auto& null_data = null_column->get_data();
+        BinaryColumn* data_column = down_cast<BinaryColumn*>(column.get());
+
+        bool has_null = false;
+        for (int i = 0; i < sz; ++i) {
+            auto slice = data_column->get_slice(i);
+            res_data[i] = StringParser::string_to_int<RunTimeCppType<ToType>>(slice.data, slice.size, &result);
+            null_data[i] = (result != StringParser::PARSE_SUCCESS);
+            has_null |= (result != StringParser::PARSE_SUCCESS);
+        }
+        if (!has_null) {
+            return res_data_column;
+        }
+        return NullableColumn::create(std::move(res_data_column), std::move(null_column));
+    }
 }
 
 template <PrimitiveType FromType, PrimitiveType ToType>
 ColumnPtr cast_float_from_string_fn(ColumnPtr& column) {
-    ColumnBuilder<ToType> builder;
     ColumnViewer<TYPE_VARCHAR> viewer(column);
+    ColumnBuilder<ToType> builder(viewer.size());
 
     StringParser::ParseResult result;
 
@@ -219,6 +395,7 @@ UNARY_FN_CAST(TYPE_DATE, TYPE_TINYINT, DateToNumber);
 UNARY_FN_CAST(TYPE_DATETIME, TYPE_TINYINT, TimestampToNumber);
 UNARY_FN_CAST(TYPE_TIME, TYPE_TINYINT, TimeToNumber);
 CUSTOMIZE_FN_CAST(TYPE_VARCHAR, TYPE_TINYINT, cast_int_from_string_fn);
+CUSTOMIZE_FN_CAST(TYPE_JSON, TYPE_TINYINT, cast_from_json_fn);
 
 // smallint
 SELF_CAST(TYPE_SMALLINT);
@@ -234,6 +411,7 @@ UNARY_FN_CAST(TYPE_DATE, TYPE_SMALLINT, DateToNumber);
 UNARY_FN_CAST(TYPE_DATETIME, TYPE_SMALLINT, TimestampToNumber);
 UNARY_FN_CAST(TYPE_TIME, TYPE_SMALLINT, TimeToNumber);
 CUSTOMIZE_FN_CAST(TYPE_VARCHAR, TYPE_SMALLINT, cast_int_from_string_fn);
+CUSTOMIZE_FN_CAST(TYPE_JSON, TYPE_SMALLINT, cast_from_json_fn);
 
 // int
 SELF_CAST(TYPE_INT);
@@ -249,6 +427,7 @@ UNARY_FN_CAST(TYPE_DATE, TYPE_INT, DateToNumber);
 UNARY_FN_CAST(TYPE_DATETIME, TYPE_INT, TimestampToNumber);
 UNARY_FN_CAST(TYPE_TIME, TYPE_INT, TimeToNumber);
 CUSTOMIZE_FN_CAST(TYPE_VARCHAR, TYPE_INT, cast_int_from_string_fn);
+CUSTOMIZE_FN_CAST(TYPE_JSON, TYPE_INT, cast_from_json_fn);
 
 // bigint
 SELF_CAST(TYPE_BIGINT);
@@ -264,6 +443,7 @@ UNARY_FN_CAST(TYPE_DATE, TYPE_BIGINT, DateToNumber);
 UNARY_FN_CAST(TYPE_DATETIME, TYPE_BIGINT, TimestampToNumber);
 UNARY_FN_CAST(TYPE_TIME, TYPE_BIGINT, TimeToNumber);
 CUSTOMIZE_FN_CAST(TYPE_VARCHAR, TYPE_BIGINT, cast_int_from_string_fn);
+CUSTOMIZE_FN_CAST(TYPE_JSON, TYPE_BIGINT, cast_from_json_fn);
 
 // largeint
 SELF_CAST(TYPE_LARGEINT);
@@ -279,6 +459,7 @@ UNARY_FN_CAST(TYPE_DATE, TYPE_LARGEINT, DateToNumber);
 UNARY_FN_CAST(TYPE_DATETIME, TYPE_LARGEINT, TimestampToNumber);
 UNARY_FN_CAST(TYPE_TIME, TYPE_LARGEINT, TimeToNumber);
 CUSTOMIZE_FN_CAST(TYPE_VARCHAR, TYPE_LARGEINT, cast_int_from_string_fn);
+CUSTOMIZE_FN_CAST(TYPE_JSON, TYPE_LARGEINT, cast_from_json_fn);
 
 // float
 SELF_CAST(TYPE_FLOAT);
@@ -294,6 +475,7 @@ UNARY_FN_CAST(TYPE_DATE, TYPE_FLOAT, DateToNumber);
 UNARY_FN_CAST(TYPE_DATETIME, TYPE_FLOAT, TimestampToNumber);
 UNARY_FN_CAST(TYPE_TIME, TYPE_FLOAT, TimeToNumber);
 CUSTOMIZE_FN_CAST(TYPE_VARCHAR, TYPE_FLOAT, cast_float_from_string_fn);
+CUSTOMIZE_FN_CAST(TYPE_JSON, TYPE_FLOAT, cast_from_json_fn);
 
 // double
 SELF_CAST(TYPE_DOUBLE);
@@ -309,6 +491,7 @@ UNARY_FN_CAST(TYPE_DATE, TYPE_DOUBLE, DateToNumber);
 UNARY_FN_CAST(TYPE_DATETIME, TYPE_DOUBLE, TimestampToNumber);
 UNARY_FN_CAST(TYPE_TIME, TYPE_DOUBLE, TimeToNumber);
 CUSTOMIZE_FN_CAST(TYPE_VARCHAR, TYPE_DOUBLE, cast_float_from_string_fn);
+CUSTOMIZE_FN_CAST(TYPE_JSON, TYPE_DOUBLE, cast_from_json_fn);
 
 // decimal
 DEFINE_UNARY_FN_WITH_IMPL(NumberToDecimal, value) {
@@ -353,8 +536,8 @@ UNARY_FN_CAST(TYPE_DATETIME, TYPE_DECIMALV2, TimestampToDecimal);
 
 template <>
 ColumnPtr cast_fn<TYPE_VARCHAR, TYPE_DECIMALV2>(ColumnPtr& column) {
-    ColumnBuilder<TYPE_DECIMALV2> builder;
     ColumnViewer<TYPE_VARCHAR> viewer(column);
+    ColumnBuilder<TYPE_DECIMALV2> builder(viewer.size());
 
     if (!column->has_null()) {
         for (int row = 0; row < viewer.size(); ++row) {
@@ -385,8 +568,8 @@ ColumnPtr cast_fn<TYPE_VARCHAR, TYPE_DECIMALV2>(ColumnPtr& column) {
 // date
 template <PrimitiveType FromType, PrimitiveType ToType>
 ColumnPtr cast_to_date_fn(ColumnPtr& column) {
-    ColumnBuilder<TYPE_DATE> builder;
     ColumnViewer<FromType> viewer(column);
+    ColumnBuilder<TYPE_DATE> builder(viewer.size());
 
     for (int row = 0; row < viewer.size(); ++row) {
         if (viewer.is_null(row)) {
@@ -424,8 +607,8 @@ UNARY_FN_CAST(TYPE_DATETIME, TYPE_DATE, TimestampToDate);
 
 template <>
 ColumnPtr cast_fn<TYPE_VARCHAR, TYPE_DATE>(ColumnPtr& column) {
-    ColumnBuilder<TYPE_DATE> builder;
     ColumnViewer<TYPE_VARCHAR> viewer(column);
+    ColumnBuilder<TYPE_DATE> builder(viewer.size());
 
     if (!column->has_null()) {
         for (int row = 0; row < viewer.size(); ++row) {
@@ -455,8 +638,8 @@ ColumnPtr cast_fn<TYPE_VARCHAR, TYPE_DATE>(ColumnPtr& column) {
 // datetime(timestamp)
 template <PrimitiveType FromType, PrimitiveType ToType>
 ColumnPtr cast_to_timestamp_fn(ColumnPtr& column) {
-    ColumnBuilder<TYPE_DATETIME> builder;
     ColumnViewer<FromType> viewer(column);
+    ColumnBuilder<TYPE_DATETIME> builder(viewer.size());
 
     for (int row = 0; row < viewer.size(); ++row) {
         if (viewer.is_null(row)) {
@@ -494,8 +677,8 @@ UNARY_FN_CAST(TYPE_DATE, TYPE_DATETIME, DateToTimestmap);
 
 template <>
 ColumnPtr cast_fn<TYPE_VARCHAR, TYPE_DATETIME>(ColumnPtr& column) {
-    ColumnBuilder<TYPE_DATETIME> builder;
     ColumnViewer<TYPE_VARCHAR> viewer(column);
+    ColumnBuilder<TYPE_DATETIME> builder(viewer.size());
 
     if (!column->has_null()) {
         for (int row = 0; row < viewer.size(); ++row) {
@@ -554,11 +737,12 @@ UNARY_FN_CAST_TIME_VALID(TYPE_DECIMALV2, TYPE_TIME, NumberToTime);
 UNARY_FN_CAST(TYPE_DATE, TYPE_TIME, DateToTime);
 UNARY_FN_CAST(TYPE_DATETIME, TYPE_TIME, DatetimeToTime);
 
+SELF_CAST(TYPE_JSON);
+
 template <>
 ColumnPtr cast_fn<TYPE_VARCHAR, TYPE_TIME>(ColumnPtr& column) {
-    ColumnBuilder<TYPE_TIME> builder;
-
     auto size = column->size();
+    ColumnBuilder<TYPE_TIME> builder(size);
     ColumnViewer<TYPE_VARCHAR> viewer_time(column);
     for (size_t row = 0; row < size; ++row) {
         if (viewer_time.is_null(row)) {
@@ -643,7 +827,19 @@ public:
         }
         const TypeDescriptor& to_type = this->type();
 
-        if constexpr (pt_is_decimal<FromType> && pt_is_decimal<ToType>) {
+        ColumnPtr result_column;
+        // NOTE
+        // For json type, it could not be converted from decimal directly, as a workaround we convert decimal
+        // to double at first, then convert double to JSON
+        if constexpr (FromType == TYPE_JSON || ToType == TYPE_JSON) {
+            if constexpr (pt_is_decimal<FromType>) {
+                ColumnPtr double_column =
+                        VectorizedUnaryFunction<DecimalTo<true>>::evaluate<FromType, TYPE_DOUBLE>(column);
+                result_column = cast_fn<TYPE_DOUBLE, TYPE_JSON>(double_column);
+            } else {
+                result_column = cast_fn<FromType, ToType>(column);
+            }
+        } else if constexpr (pt_is_decimal<FromType> && pt_is_decimal<ToType>) {
             return VectorizedUnaryFunction<DecimalToDecimal<true>>::evaluate<FromType, ToType>(
                     column, to_type.precision, to_type.scale);
         } else if constexpr (pt_is_decimal<FromType>) {
@@ -652,10 +848,15 @@ public:
             return VectorizedUnaryFunction<DecimalFrom<true>>::evaluate<FromType, ToType>(column, to_type.precision,
                                                                                           to_type.scale);
         } else {
-            return cast_fn<FromType, ToType>(column);
+            result_column = cast_fn<FromType, ToType>(column);
         }
+        DCHECK(result_column.get() != nullptr);
+        if (result_column->is_constant()) {
+            result_column->resize(column->size());
+        }
+        return result_column;
     };
-    std::string debug_string() const {
+    std::string debug_string() const override {
         std::stringstream out;
         auto expr_debug_string = Expr::debug_string();
         out << "VectorizedCastExpr ("
@@ -682,7 +883,8 @@ DEFINE_BINARY_FUNCTION_WITH_IMPL(timeToDatetime, date, time) {
     class VectorizedCastExpr<TYPE_TIME, TO_TYPE> final : public Expr {                                          \
     public:                                                                                                     \
         DEFINE_CAST_CONSTRUCT(VectorizedCastExpr);                                                              \
-        Status prepare(RuntimeState* state, const RowDescriptor& row_desc, ExprContext* context) override {     \
+        Status prepare(RuntimeState* state, ExprContext* context) override {                                    \
+            RETURN_IF_ERROR(Expr::prepare(state, context));                                                     \
             DateTimeValue dtv;                                                                                  \
             if (dtv.from_unixtime(state->timestamp_ms() / 1000, state->timezone())) {                           \
                 DateValue dv;                                                                                   \
@@ -742,7 +944,7 @@ DEFINE_STRING_UNARY_FN_WITH_IMPL(DoubleCastToString, v) {
  */
 struct CastToString {
     template <typename Type, typename ResultType>
-    static inline std::string apply(const Type& v) {
+    static std::string apply(const Type& v) {
         if constexpr (IsDate<Type> || IsTimestamp<Type> || IsDecimal<Type>) {
             // DateValue, TimestampValue, DecimalV2
             return v.to_string();
@@ -786,6 +988,19 @@ DEFINE_INT_CAST_TO_STRING(TYPE_SMALLINT, TYPE_VARCHAR);
 DEFINE_INT_CAST_TO_STRING(TYPE_INT, TYPE_VARCHAR);
 DEFINE_INT_CAST_TO_STRING(TYPE_BIGINT, TYPE_VARCHAR);
 
+// Cast SQL type to JSON
+CUSTOMIZE_FN_CAST(TYPE_NULL, TYPE_JSON, cast_to_json_fn);
+CUSTOMIZE_FN_CAST(TYPE_INT, TYPE_JSON, cast_to_json_fn);
+CUSTOMIZE_FN_CAST(TYPE_TINYINT, TYPE_JSON, cast_to_json_fn);
+CUSTOMIZE_FN_CAST(TYPE_SMALLINT, TYPE_JSON, cast_to_json_fn);
+CUSTOMIZE_FN_CAST(TYPE_BIGINT, TYPE_JSON, cast_to_json_fn);
+CUSTOMIZE_FN_CAST(TYPE_LARGEINT, TYPE_JSON, cast_to_json_fn);
+CUSTOMIZE_FN_CAST(TYPE_BOOLEAN, TYPE_JSON, cast_to_json_fn);
+CUSTOMIZE_FN_CAST(TYPE_FLOAT, TYPE_JSON, cast_to_json_fn);
+CUSTOMIZE_FN_CAST(TYPE_DOUBLE, TYPE_JSON, cast_to_json_fn);
+CUSTOMIZE_FN_CAST(TYPE_CHAR, TYPE_JSON, cast_to_json_fn);
+CUSTOMIZE_FN_CAST(TYPE_VARCHAR, TYPE_JSON, cast_to_json_fn);
+
 /**
  * Resolve cast to string
  */
@@ -822,6 +1037,10 @@ public:
             return _evaluate_time(context, column);
         }
 
+        if constexpr (Type == TYPE_JSON) {
+            return cast_from_json_fn<TYPE_JSON, TYPE_VARCHAR>(column);
+        }
+
         return _evaluate_string(context, column);
     };
 
@@ -837,14 +1056,13 @@ private:
                                                                                                   TYPE_VARCHAR>(column);
             }
         }
-
         if (type().len < 0) {
             return ColumnHelper::create_const_null_column(column->size());
         }
 
         // type.length > 0
-        ColumnBuilder<TYPE_VARCHAR> builder;
         ColumnViewer<FloatType> viewer(column);
+        ColumnBuilder<TYPE_VARCHAR> builder(viewer.size());
 
         char value[MAX_DOUBLE_STR_LENGTH];
         size_t len = 0;
@@ -876,8 +1094,8 @@ private:
             return column;
         }
 
-        ColumnBuilder<TYPE_VARCHAR> builder;
         ColumnViewer<TYPE_VARCHAR> viewer(column);
+        ColumnBuilder<TYPE_VARCHAR> builder(viewer.size());
 
         for (int row = 0; row < viewer.size(); ++row) {
             if (viewer.is_null(row)) {
@@ -894,8 +1112,8 @@ private:
     }
 
     ColumnPtr _evaluate_time(ExprContext* context, const ColumnPtr& column) {
-        ColumnBuilder<TYPE_VARCHAR> builder;
         ColumnViewer<TYPE_TIME> viewer(column);
+        ColumnBuilder<TYPE_VARCHAR> builder(viewer.size());
 
         for (int row = 0; row < viewer.size(); ++row) {
             if (viewer.is_null(row)) {
@@ -942,6 +1160,16 @@ private:
     case TO_TYPE: {                    \
         SWITCH_ALL_FROM_TYPE(TO_TYPE); \
         break;                         \
+    }
+
+#define CASE_FROM_JSON_TO(TO_TYPE)                               \
+    case TO_TYPE: {                                              \
+        return new VectorizedCastExpr<TYPE_JSON, TO_TYPE>(node); \
+    }
+
+#define CASE_TO_JSON(FROM_TYPE)                                    \
+    case FROM_TYPE: {                                              \
+        return new VectorizedCastExpr<FROM_TYPE, TYPE_JSON>(node); \
     }
 
 #define CASE_TO_STRING_FROM(FROM_TYPE)                          \
@@ -1005,6 +1233,10 @@ Expr* VectorizedCastExprFactory::from_thrift(const TExprNode& node) {
         from_type = to_type;
     }
 
+    if (from_type == TYPE_VARCHAR && to_type == TYPE_HLL) {
+        return new VectorizedCastExpr<TYPE_VARCHAR, TYPE_HLL>(node);
+    }
+
     if (to_type == TYPE_VARCHAR) {
         switch (from_type) {
             CASE_TO_STRING_FROM(TYPE_BOOLEAN);
@@ -1023,9 +1255,48 @@ Expr* VectorizedCastExprFactory::from_thrift(const TExprNode& node) {
             CASE_TO_STRING_FROM(TYPE_DECIMAL32);
             CASE_TO_STRING_FROM(TYPE_DECIMAL64);
             CASE_TO_STRING_FROM(TYPE_DECIMAL128);
+            CASE_TO_STRING_FROM(TYPE_JSON);
         default:
             LOG(WARNING) << "vectorized engine not support from type: " << from_type << ", to type: " << to_type;
             return nullptr;
+        }
+    } else if (from_type == TYPE_JSON || to_type == TYPE_JSON) {
+        // TODO(mofei) simplify type enumeration
+        if (from_type == TYPE_JSON) {
+            switch (to_type) {
+                CASE_FROM_JSON_TO(TYPE_BOOLEAN);
+                CASE_FROM_JSON_TO(TYPE_TINYINT);
+                CASE_FROM_JSON_TO(TYPE_SMALLINT);
+                CASE_FROM_JSON_TO(TYPE_INT);
+                CASE_FROM_JSON_TO(TYPE_BIGINT);
+                CASE_FROM_JSON_TO(TYPE_LARGEINT);
+                CASE_FROM_JSON_TO(TYPE_FLOAT);
+                CASE_FROM_JSON_TO(TYPE_DOUBLE);
+                CASE_FROM_JSON_TO(TYPE_JSON);
+            default:
+                LOG(WARNING) << "vectorized engine not support from type: " << from_type << ", to type: " << to_type;
+                return nullptr;
+            }
+        } else {
+            switch (from_type) {
+                CASE_TO_JSON(TYPE_BOOLEAN);
+                CASE_TO_JSON(TYPE_TINYINT);
+                CASE_TO_JSON(TYPE_SMALLINT);
+                CASE_TO_JSON(TYPE_INT);
+                CASE_TO_JSON(TYPE_BIGINT);
+                CASE_TO_JSON(TYPE_LARGEINT);
+                CASE_TO_JSON(TYPE_FLOAT);
+                CASE_TO_JSON(TYPE_DOUBLE);
+                CASE_TO_JSON(TYPE_JSON);
+                CASE_TO_JSON(TYPE_CHAR);
+                CASE_TO_JSON(TYPE_VARCHAR);
+                CASE_TO_JSON(TYPE_DECIMAL32);
+                CASE_TO_JSON(TYPE_DECIMAL64);
+                CASE_TO_JSON(TYPE_DECIMAL128);
+            default:
+                LOG(WARNING) << "vectorized engine not support from type: " << from_type << ", to type: " << to_type;
+                return nullptr;
+            }
         }
     } else {
         switch (to_type) {
@@ -1105,5 +1376,4 @@ Expr* VectorizedCastExprFactory::from_type(const TypeDescriptor& from, const Typ
     return expr;
 }
 
-} // namespace vectorized
-} // namespace starrocks
+} // namespace starrocks::vectorized

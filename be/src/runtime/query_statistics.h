@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_EXEC_QUERY_STATISTICS_H
-#define STARROCKS_BE_EXEC_QUERY_STATISTICS_H
+#pragma once
 
 #include <mutex>
 
@@ -36,7 +35,7 @@ class QueryStatisticsRecvr;
 // or plan's statistics and QueryStatisticsRecvr is responsible for collecting it.
 class QueryStatistics {
 public:
-    QueryStatistics() : scan_rows(0), scan_bytes(0), returned_rows(0) {}
+    QueryStatistics() {}
 
     void merge(const QueryStatistics& other) {
         scan_rows += other.scan_rows;
@@ -52,6 +51,15 @@ public:
         this->scan_bytes += stats_item.scan_bytes();
     }
 
+    void add_scan_stats(int64_t scan_rows, int64_t scan_bytes) {
+        this->scan_rows += scan_rows;
+        this->scan_bytes += scan_bytes;
+    }
+
+    void add_cpu_costs(int64_t cpu_ns) { this->cpu_ns += cpu_ns; }
+
+    void add_mem_costs(int64_t bytes) { mem_cost_bytes += bytes; }
+
     void merge(QueryStatisticsRecvr* recvr);
 
     void clear() {
@@ -61,26 +69,18 @@ public:
         _stats_items.clear();
     }
 
-    void to_pb(PQueryStatistics* statistics) {
-        DCHECK(statistics != nullptr);
-        statistics->set_scan_rows(scan_rows);
-        statistics->set_scan_bytes(scan_bytes);
-        statistics->set_returned_rows(returned_rows);
-        *statistics->mutable_stats_items() = {_stats_items.begin(), _stats_items.end()};
-    }
+    void to_pb(PQueryStatistics* statistics);
 
-    void merge_pb(const PQueryStatistics& statistics) {
-        scan_rows += statistics.scan_rows();
-        scan_bytes += statistics.scan_bytes();
-        _stats_items.insert(_stats_items.end(), statistics.stats_items().begin(), statistics.stats_items().end());
-    }
+    void merge_pb(const PQueryStatistics& statistics);
 
 private:
-    int64_t scan_rows;
-    int64_t scan_bytes;
+    int64_t scan_rows{0};
+    int64_t scan_bytes{0};
+    int64_t cpu_ns{0};
+    int64_t mem_cost_bytes = 0;
     // number rows returned by query.
     // only set once by result sink when closing.
-    int64_t returned_rows;
+    int64_t returned_rows{0};
     std::vector<QueryStatisticsItemPB> _stats_items;
 };
 
@@ -106,5 +106,3 @@ private:
 };
 
 } // namespace starrocks
-
-#endif

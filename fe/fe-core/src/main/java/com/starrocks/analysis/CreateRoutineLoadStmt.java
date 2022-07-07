@@ -37,7 +37,13 @@ import com.starrocks.load.routineload.KafkaProgress;
 import com.starrocks.load.routineload.LoadDataSourceType;
 import com.starrocks.load.routineload.RoutineLoadJob;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.OriginStatement;
+import com.starrocks.qe.SessionVariable;
+import com.starrocks.qe.SqlModeHelper;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -84,6 +90,8 @@ import java.util.regex.Pattern;
           KAFKA
 */
 public class CreateRoutineLoadStmt extends DdlStmt {
+    private static final Logger LOG = LogManager.getLogger(CreateRoutineLoadStmt.class);
+
     // routine load properties
     public static final String DESIRED_CONCURRENT_NUMBER_PROPERTY = "desired_concurrent_number";
     // max error number in ten thousand records
@@ -121,6 +129,7 @@ public class CreateRoutineLoadStmt extends DdlStmt {
             .add(JSONROOT)
             .add(LoadStmt.STRICT_MODE)
             .add(LoadStmt.TIMEZONE)
+            .add(LoadStmt.PARTIAL_UPDATE)
             .build();
 
     private static final ImmutableSet<String> KAFKA_PROPERTIES_SET = new ImmutableSet.Builder<String>()
@@ -148,6 +157,7 @@ public class CreateRoutineLoadStmt extends DdlStmt {
     private long maxBatchRows = -1;
     private boolean strictMode = true;
     private String timezone = TimeUtils.DEFAULT_TIME_ZONE;
+    private boolean partialUpdate = false;
     /**
      * RoutineLoad support json data.
      * Require Params:
@@ -228,6 +238,10 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         return timezone;
     }
 
+    public boolean isPartialUpdate() {
+        return partialUpdate;
+    }
+
     public String getFormat() {
         return format;
     }
@@ -260,6 +274,10 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         return customKafkaProperties;
     }
 
+    public List<ParseNode> getLoadPropertyList() {
+        return loadPropertyList;
+    }
+
     @Override
     public void analyze(Analyzer analyzer) throws UserException {
         super.analyze(analyzer);
@@ -268,11 +286,39 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         // check name
         FeNameFormat.checkCommonName(NAME_TYPE, name);
         // check load properties include column separator etc.
-        checkLoadProperties();
+        routineLoadDesc = buildLoadDesc(loadPropertyList);
         // check routine load job properties include desired concurrent number etc.
         checkJobProperties();
         // check data source properties
         checkDataSourceProperties();
+    }
+
+    public static RoutineLoadDesc getLoadDesc(OriginStatement origStmt, Map<String, String> sessionVariables) {
+        long sqlMode;
+        if (sessionVariables != null && sessionVariables.containsKey(SessionVariable.SQL_MODE)) {
+            sqlMode = Long.parseLong(sessionVariables.get(SessionVariable.SQL_MODE));
+        } else {
+            sqlMode = SqlModeHelper.MODE_DEFAULT;
+        }
+
+        // parse the origin stmt to get routine load desc
+        try {
+            List <StatementBase> stmts = com.starrocks.sql.parser.SqlParser.parse(
+                    origStmt.originStmt, sqlMode);
+            StatementBase stmt = stmts.get(origStmt.idx);
+            if (stmt instanceof CreateRoutineLoadStmt) {
+                return CreateRoutineLoadStmt.
+                        buildLoadDesc(((CreateRoutineLoadStmt) stmt).getLoadPropertyList());
+            } else if (stmt instanceof AlterRoutineLoadStmt) {
+                return CreateRoutineLoadStmt.
+                        buildLoadDesc(((AlterRoutineLoadStmt) stmt).getLoadPropertyList());
+            } else {
+                throw new IOException("stmt is neither CreateRoutineLoadStmt nor AlterRoutineLoadStmt");
+            }
+        } catch (Exception e) {
+            LOG.error("error happens when parsing create/alter routine load stmt: " + origStmt.originStmt, e);
+            return null;
+        }
     }
 
     public void checkDBTable(Analyzer analyzer) throws AnalysisException {
@@ -284,9 +330,9 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         }
     }
 
-    public void checkLoadProperties() throws UserException {
+    public static RoutineLoadDesc buildLoadDesc(List<ParseNode> loadPropertyList) throws UserException {
         if (loadPropertyList == null) {
-            return;
+            return null;
         }
         ColumnSeparator columnSeparator = null;
         RowDelimiter rowDelimiter = null;
@@ -302,7 +348,7 @@ public class CreateRoutineLoadStmt extends DdlStmt {
                 columnSeparator = (ColumnSeparator) parseNode;
                 columnSeparator.analyze(null);
             } else if (parseNode instanceof RowDelimiter) {
-                // check row delimiter 
+                // check row delimiter
                 if (rowDelimiter != null) {
                     throw new AnalysisException("repeat setting of row delimiter");
                 }
@@ -329,7 +375,7 @@ public class CreateRoutineLoadStmt extends DdlStmt {
                 partitionNames.analyze(null);
             }
         }
-        routineLoadDesc = new RoutineLoadDesc(columnSeparator, rowDelimiter, importColumnsStmt, importWhereStmt,
+        return new RoutineLoadDesc(columnSeparator, rowDelimiter, importColumnsStmt, importWhereStmt,
                 partitionNames);
     }
 
@@ -361,6 +407,10 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         strictMode = Util.getBooleanPropertyOrDefault(jobProperties.get(LoadStmt.STRICT_MODE),
                 RoutineLoadJob.DEFAULT_STRICT_MODE,
                 LoadStmt.STRICT_MODE + " should be a boolean");
+
+        partialUpdate = Util.getBooleanPropertyOrDefault(jobProperties.get(LoadStmt.PARTIAL_UPDATE),
+                false,
+                LoadStmt.PARTIAL_UPDATE + " should be a boolean");
 
         if (ConnectContext.get() != null) {
             timezone = ConnectContext.get().getSessionVariable().getTimeZone();

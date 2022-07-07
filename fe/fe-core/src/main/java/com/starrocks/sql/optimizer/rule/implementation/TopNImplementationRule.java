@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rule.implementation;
 
@@ -28,9 +28,14 @@ public class TopNImplementationRule extends ImplementationRule {
                 new PhysicalTopNOperator(new OrderSpec(logicalTopN.getOrderByElements()),
                         logicalTopN.getLimit(),
                         logicalTopN.getOffset(),
+                        logicalTopN.getPartitionByColumns(),
+                        logicalTopN.getPartitionLimit(),
                         logicalTopN.getSortPhase(),
+                        logicalTopN.getTopNType(),
                         logicalTopN.isSplit(),
-                        false);
+                        false,
+                        logicalTopN.getPredicate(),
+                        logicalTopN.getProjection());
         return Lists.newArrayList(OptExpression.create(physicalTopN, input.getInputs()));
     }
 }

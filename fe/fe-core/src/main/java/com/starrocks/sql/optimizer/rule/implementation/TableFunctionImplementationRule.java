@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.rule.implementation;
 
 import com.google.common.collect.Lists;
@@ -27,9 +27,10 @@ public class TableFunctionImplementationRule extends ImplementationRule {
                 logicalTableFunctionOperator.getFnResultColumnRefSet(),
                 logicalTableFunctionOperator.getFn(),
                 new ColumnRefSet(new ArrayList(logicalTableFunctionOperator.getFnParamColumnProjectMap().keySet())),
-                logicalTableFunctionOperator.getOuterColumnRefSet());
-        physicalLateral.setLimit(logicalTableFunctionOperator.getLimit());
-        physicalLateral.setPredicate(logicalTableFunctionOperator.getPredicate());
+                logicalTableFunctionOperator.getOuterColumnRefSet(),
+                logicalTableFunctionOperator.getLimit(),
+                logicalTableFunctionOperator.getPredicate(),
+                logicalTableFunctionOperator.getProjection());
         return Lists.newArrayList(OptExpression.create(physicalLateral, input.getInputs()));
     }
 }

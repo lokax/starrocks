@@ -26,7 +26,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import com.starrocks.catalog.Catalog;
+import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.FsBroker;
 import com.starrocks.catalog.Partition;
@@ -40,6 +40,7 @@ import com.starrocks.common.util.PrintableMap;
 import com.starrocks.common.util.PropertyAnalyzer;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -53,9 +54,10 @@ import java.util.Set;
 //
 // syntax:
 //      EXPORT TABLE tablename [PARTITION (name1[, ...])]
+//          [(col1, col2[, ...])]
 //          TO 'export_target_path'
 //          [PROPERTIES("key"="value")]
-//          BY BROKER 'broker_name' [( $broker_attrs)]
+//          WITH BROKER 'broker_name' [( $broker_attrs)]
 public class ExportStmt extends StatementBase {
     private static final Logger LOG = LogManager.getLogger(ExportStmt.class);
 
@@ -70,6 +72,7 @@ public class ExportStmt extends StatementBase {
 
     private TableName tblName;
     private List<String> partitions;
+    private List<String> columnNames;
     // path should include "/"
     private String path;
     private String fileNamePrefix;
@@ -80,10 +83,12 @@ public class ExportStmt extends StatementBase {
     private boolean includeQueryId = true;
 
     private TableRef tableRef;
+    private long exportStartTime;
 
-    public ExportStmt(TableRef tableRef, String path,
+    public ExportStmt(TableRef tableRef, List<String> columnNames, String path,
                       Map<String, String> properties, BrokerDesc brokerDesc) {
         this.tableRef = tableRef;
+        this.columnNames = columnNames;
         this.path = path.trim();
         if (properties != null) {
             this.properties = properties;
@@ -94,12 +99,24 @@ public class ExportStmt extends StatementBase {
         this.includeQueryId = true;
     }
 
+    public long getExportStartTime() {
+        return exportStartTime;
+    }
+
+    public void setExportStartTime(long exportStartTime) {
+        this.exportStartTime = exportStartTime;
+    }
+
     public TableName getTblName() {
         return tblName;
     }
 
     public List<String> getPartitions() {
         return partitions;
+    }
+
+    public List<String> getColumnNames() {
+        return columnNames;
     }
 
     public String getPath() {
@@ -157,7 +174,7 @@ public class ExportStmt extends StatementBase {
         }
 
         // check auth
-        if (!Catalog.getCurrentCatalog().getAuth().checkTblPriv(ConnectContext.get(),
+        if (!GlobalStateMgr.getCurrentState().getAuth().checkTblPriv(ConnectContext.get(),
                 tblName.getDb(), tblName.getTbl(),
                 PrivPredicate.SELECT)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "EXPORT",
@@ -166,7 +183,7 @@ public class ExportStmt extends StatementBase {
                     tblName.getTbl());
         }
 
-        // check table && partitions whether exist
+        // check table && partitions && columns whether exist
         checkTable(analyzer.getCatalog());
 
         // check path is valid
@@ -191,8 +208,8 @@ public class ExportStmt extends StatementBase {
         checkProperties(properties);
     }
 
-    private void checkTable(Catalog catalog) throws AnalysisException {
-        Database db = catalog.getDb(tblName.getDb());
+    private void checkTable(GlobalStateMgr globalStateMgr) throws AnalysisException {
+        Database db = globalStateMgr.getDb(tblName.getDb());
         if (db == null) {
             throw new AnalysisException("Db does not exist. name: " + tblName.getDb());
         }
@@ -204,12 +221,6 @@ public class ExportStmt extends StatementBase {
                 throw new AnalysisException("Table[" + tblName.getTbl() + "] does not exist");
             }
 
-            if (partitions == null) {
-                return;
-            }
-            if (!table.isPartitioned()) {
-                throw new AnalysisException("Table[" + tblName.getTbl() + "] is not partitioned.");
-            }
             Table.TableType tblType = table.getType();
             switch (tblType) {
                 case MYSQL:
@@ -220,14 +231,38 @@ public class ExportStmt extends StatementBase {
                 case INLINE_VIEW:
                 case VIEW:
                 default:
-                    throw new AnalysisException("Table[" + tblName.getTbl() + "] is "
-                            + tblType.toString() + " type, do not support EXPORT.");
+                    throw new AnalysisException("Table[" + tblName.getTbl() + "] is " + tblType.toString() +
+                            " type, do not support EXPORT.");
             }
 
-            for (String partitionName : partitions) {
-                Partition partition = table.getPartition(partitionName);
-                if (partition == null) {
-                    throw new AnalysisException("Partition [" + partitionName + "] does not exist");
+            if (partitions != null) {
+                for (String partitionName : partitions) {
+                    Partition partition = table.getPartition(partitionName);
+                    if (partition == null) {
+                        throw new AnalysisException("Partition [" + partitionName + "] does not exist.");
+                    }
+                }
+            }
+
+            // check columns
+            if (columnNames != null) {
+                if (columnNames.isEmpty()) {
+                    throw new AnalysisException("Columns is empty.");
+                }
+
+                Set<String> tableColumns = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
+                int index = 0;
+                for (Column column : table.getBaseSchema()) {
+                    tableColumns.add(column.getName());
+                }
+                Set<String> uniqColumnNames = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
+                for (String columnName : columnNames) {
+                    if (!uniqColumnNames.add(columnName)) {
+                        throw new AnalysisException("Duplicated column [" + columnName + "]");
+                    }
+                    if (!tableColumns.contains(columnName)) {
+                        throw new AnalysisException("Column [" + columnName + "] does not exist in table.");
+                    }
                 }
             }
         } finally {
@@ -268,12 +303,11 @@ public class ExportStmt extends StatementBase {
         this.columnSeparator = Delimiter.convertDelimiter(this.columnSeparator);
         this.rowDelimiter = PropertyAnalyzer.analyzeRowDelimiter(properties, ExportStmt.DEFAULT_LINE_DELIMITER);
         this.rowDelimiter = Delimiter.convertDelimiter(this.rowDelimiter);
-        // exec_mem_limit
         if (properties.containsKey(LoadStmt.LOAD_MEM_LIMIT)) {
             try {
                 Long.parseLong(properties.get(LoadStmt.LOAD_MEM_LIMIT));
             } catch (NumberFormatException e) {
-                throw new AnalysisException("Invalid exec_mem_limit value: " + e.getMessage());
+                throw new AnalysisException("Invalid load_mem_limit value: " + e.getMessage());
             }
         } else {
             // use session variables

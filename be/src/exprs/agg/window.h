@@ -1,23 +1,4 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/exprs/agg/window.h
-
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -32,60 +13,67 @@ class WindowFunction : public AggregateFunctionStateHelper<State> {
         DCHECK(false) << "Shouldn't call this method for window function!";
     }
 
-    void merge_batch(FunctionContext* ctx, size_t batch_size, size_t state_offset, const Column* column,
+    void merge_batch(FunctionContext* ctx, size_t chunk_size, size_t state_offset, const Column* column,
                      AggDataPtr* states) const override {
         DCHECK(false) << "Shouldn't call this method for window function!";
     }
 
-    void merge_batch_single_state(FunctionContext* ctx, size_t batch_size, const Column* column,
-                                  AggDataPtr state) const override {
+    void merge_batch_selectively(FunctionContext* ctx, size_t chunk_size, size_t state_offset, const Column* column,
+                                 AggDataPtr* states, const std::vector<uint8_t>& filter) const override {
         DCHECK(false) << "Shouldn't call this method for window function!";
     }
 
-    void update(FunctionContext* ctx, const Column** columns, AggDataPtr state, size_t row_num) const override {
+    void merge_batch_single_state(FunctionContext* ctx, size_t chunk_size, const Column* column,
+                                  AggDataPtr __restrict state) const override {
         DCHECK(false) << "Shouldn't call this method for window function!";
     }
 
-    void update_batch(FunctionContext* ctx, size_t batch_size, size_t state_offset, const Column** columns,
+    void update(FunctionContext* ctx, const Column** columns, AggDataPtr __restrict state,
+                size_t row_num) const override {
+        DCHECK(false) << "Shouldn't call this method for window function!";
+    }
+
+    void update_batch(FunctionContext* ctx, size_t chunk_size, size_t state_offset, const Column** columns,
                       AggDataPtr* states) const override {
         DCHECK(false) << "Shouldn't call this method for window function!";
     }
 
-    void update_batch_selectively(FunctionContext* ctx, size_t batch_size, size_t state_offset, const Column** column,
+    void update_batch_selectively(FunctionContext* ctx, size_t chunk_size, size_t state_offset, const Column** column,
                                   AggDataPtr* states, const std::vector<uint8_t>& filter) const override {
         DCHECK(false) << "Shouldn't call this method for window function!";
     }
 
-    void update_batch_single_state(FunctionContext* ctx, size_t batch_size, const Column** columns,
-                                   AggDataPtr state) const override {
+    void update_batch_single_state(FunctionContext* ctx, size_t chunk_size, const Column** columns,
+                                   AggDataPtr __restrict state) const override {
         DCHECK(false) << "Shouldn't call this method for window function!";
     }
 
-    void serialize_to_column(FunctionContext* ctx, ConstAggDataPtr state, Column* to) const override {
+    void serialize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
         DCHECK(false) << "Shouldn't call this method for window function!";
     }
 
-    void finalize_to_column(FunctionContext* ctx, ConstAggDataPtr state, Column* to) const override {
+    void finalize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
         DCHECK(false) << "Shouldn't call this method for window function!";
     }
 
-    void batch_serialize(size_t batch_size, const Buffer<AggDataPtr>& agg_states, size_t state_offset,
-                         Column* to) const override {
+    void batch_serialize(FunctionContext* ctx, size_t chunk_size, const Buffer<AggDataPtr>& agg_states,
+                         size_t state_offset, Column* to) const override {
         DCHECK(false) << "Shouldn't call this method for window function!";
     }
 
-    void batch_finalize(FunctionContext* ctx, size_t batch_size, const Buffer<AggDataPtr>& agg_states,
-                        size_t state_offset, Column* to) const {
+    void batch_finalize(FunctionContext* ctx, size_t chunk_size, const Buffer<AggDataPtr>& agg_states,
+                        size_t state_offset, Column* to) const override {
         DCHECK(false) << "Shouldn't call this method for window function!";
     }
 
-    void convert_to_serialize_format(const Columns& src, size_t chunk_size, ColumnPtr* dst) const override {
+    void convert_to_serialize_format(FunctionContext* ctx, const Columns& src, size_t chunk_size,
+                                     ColumnPtr* dst) const override {
         DCHECK(false) << "Shouldn't call this method for window function!";
     }
 
 protected:
     // BinaryColumn column is special, the underlying _bytes and _offsets column don't resize
-    void get_slice_values(ConstAggDataPtr state, Column* dst, size_t start, size_t end) const {
+    void get_slice_values(ConstAggDataPtr __restrict state, Column* dst, size_t start, size_t end) const {
         DCHECK_GT(end, start);
         DCHECK(dst->is_nullable());
         auto* nullable_column = down_cast<NullableColumn*>(dst);
@@ -112,7 +100,7 @@ public:
     using InputColumnType = RunTimeColumnType<PT>;
 
     // The dst column has been resized.
-    void get_values_helper(ConstAggDataPtr state, Column* dst, size_t start, size_t end) const {
+    void get_values_helper(ConstAggDataPtr __restrict state, Column* dst, size_t start, size_t end) const {
         DCHECK_GT(end, start);
         DCHECK(dst->is_nullable());
         auto* nullable_column = down_cast<NullableColumn*>(dst);
@@ -138,17 +126,18 @@ struct RowNumberState {
 };
 
 class RowNumberWindowFunction final : public WindowFunction<RowNumberState> {
-    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr state) const override {
+    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr __restrict state) const override {
         this->data(state).cur_positon = 0;
     }
 
-    void update_batch_single_state(FunctionContext* ctx, AggDataPtr state, const Column** columns,
+    void update_batch_single_state(FunctionContext* ctx, AggDataPtr __restrict state, const Column** columns,
                                    int64_t peer_group_start, int64_t peer_group_end, int64_t frame_start,
                                    int64_t frame_end) const override {
         this->data(state).cur_positon++;
     }
 
-    void get_values(FunctionContext* ctx, ConstAggDataPtr state, Column* dst, size_t start, size_t end) const {
+    void get_values(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* dst, size_t start,
+                    size_t end) const override {
         DCHECK_GT(end, start);
         Int64Column* column = down_cast<Int64Column*>(dst);
         column->get_data()[start] = this->data(state).cur_positon;
@@ -164,13 +153,13 @@ struct RankState {
 };
 
 class RankWindowFunction final : public WindowFunction<RankState> {
-    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr state) const override {
+    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr __restrict state) const override {
         this->data(state).rank = 0;
         this->data(state).count = 1;
         this->data(state).peer_group_start = -1;
     }
 
-    void update_batch_single_state(FunctionContext* ctx, AggDataPtr state, const Column** columns,
+    void update_batch_single_state(FunctionContext* ctx, AggDataPtr __restrict state, const Column** columns,
                                    int64_t peer_group_start, int64_t peer_group_end, int64_t frame_start,
                                    int64_t frame_end) const override {
         int64_t peer_group_count = peer_group_end - peer_group_start;
@@ -181,7 +170,8 @@ class RankWindowFunction final : public WindowFunction<RankState> {
         this->data(state).count = peer_group_count;
     }
 
-    void get_values(FunctionContext* ctx, ConstAggDataPtr state, Column* dst, size_t start, size_t end) const {
+    void get_values(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* dst, size_t start,
+                    size_t end) const override {
         DCHECK_GT(end, start);
         Int64Column* column = down_cast<Int64Column*>(dst);
         for (size_t i = start; i < end; ++i) {
@@ -198,12 +188,12 @@ struct DenseRankState {
 };
 
 class DenseRankWindowFunction final : public WindowFunction<DenseRankState> {
-    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr state) const override {
+    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr __restrict state) const override {
         this->data(state).rank = 0;
         this->data(state).peer_group_start = -1;
     }
 
-    void update_batch_single_state(FunctionContext* ctx, AggDataPtr state, const Column** columns,
+    void update_batch_single_state(FunctionContext* ctx, AggDataPtr __restrict state, const Column** columns,
                                    int64_t peer_group_start, int64_t peer_group_end, int64_t frame_start,
                                    int64_t frame_end) const override {
         if (this->data(state).peer_group_start != peer_group_start) {
@@ -212,7 +202,8 @@ class DenseRankWindowFunction final : public WindowFunction<DenseRankState> {
         }
     }
 
-    void get_values(FunctionContext* ctx, ConstAggDataPtr state, Column* dst, size_t start, size_t end) const {
+    void get_values(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* dst, size_t start,
+                    size_t end) const override {
         DCHECK_GT(end, start);
         Int64Column* column = down_cast<Int64Column*>(dst);
         for (size_t i = start; i < end; ++i) {
@@ -221,6 +212,71 @@ class DenseRankWindowFunction final : public WindowFunction<DenseRankState> {
     }
 
     std::string get_name() const override { return "dense_rank"; }
+};
+
+// The NTILE window function divides ordered rows in the partition into `num_buckets` ranked groups
+// of as equal size as possible and returns the group id of each row starting from 1.
+//
+// It can not been used with the windowing clause.
+// And for the implementation, it uses `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
+//
+// The size of buckets could be `num_partition_rows/num_buckets` (small bucket)
+// or `num_partition_rows/num_buckets+1` (large bucket).
+// The top `num_partition_rows%num_buckets` buckets are the large buckets.
+struct NtileState {
+    int64_t num_buckets = 0;
+
+    int64_t large_bucket_size = 0;
+    int64_t small_bucket_size = 0;
+
+    int64_t num_large_buckets = 0;
+    int64_t num_large_bucket_rows = 0;
+
+    // Start from 0.
+    int64_t cur_position = -1;
+};
+
+class NtileWindowFunction final : public WindowFunction<NtileState> {
+    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr __restrict state) const override {
+        this->data(state).num_buckets = args[0]->get(0).get_int64();
+
+        // Start from 0 and used after increment, so set -1 before the first increment.
+        this->data(state).cur_position = -1;
+    }
+
+    void update_batch_single_state(FunctionContext* ctx, AggDataPtr __restrict state, const Column** columns,
+                                   int64_t peer_group_start, int64_t peer_group_end, int64_t frame_start,
+                                   int64_t frame_end) const override {
+        auto& s = this->data(state);
+
+        if (-1 == s.cur_position) {
+            int64_t num_rows = peer_group_end - peer_group_start;
+
+            s.small_bucket_size = num_rows / s.num_buckets;
+            s.large_bucket_size = s.small_bucket_size + 1;
+
+            s.num_large_buckets = num_rows % s.num_buckets;
+            s.num_large_bucket_rows = s.num_large_buckets * s.large_bucket_size;
+        }
+
+        ++s.cur_position;
+    }
+
+    void get_values(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* dst, size_t start,
+                    size_t end) const override {
+        DCHECK_EQ(end, start + 1);
+        auto* column = down_cast<Int64Column*>(dst);
+        const auto& s = this->data(state);
+
+        if (s.cur_position < s.num_large_bucket_rows) {
+            column->get_data()[start] = s.cur_position / s.large_bucket_size + 1;
+        } else {
+            column->get_data()[start] =
+                    (s.cur_position - s.num_large_bucket_rows) / s.small_bucket_size + s.num_large_buckets + 1;
+        }
+    }
+
+    std::string get_name() const override { return "ntile"; }
 };
 
 template <PrimitiveType PT, typename = guard::Guard>
@@ -235,13 +291,13 @@ template <PrimitiveType PT, typename T = RunTimeCppType<PT>, typename = guard::G
 class FirstValueWindowFunction final : public ValueWindowFunction<PT, FirstValueState<PT>, T> {
     using InputColumnType = typename ValueWindowFunction<PT, FirstValueState<PT>, T>::InputColumnType;
 
-    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr state) const override {
+    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr __restrict state) const override {
         this->data(state).value = {};
         this->data(state).has_value = false;
         this->data(state).is_null = false;
     }
 
-    void update_batch_single_state(FunctionContext* ctx, AggDataPtr state, const Column** columns,
+    void update_batch_single_state(FunctionContext* ctx, AggDataPtr __restrict state, const Column** columns,
                                    int64_t peer_group_start, int64_t peer_group_end, int64_t frame_start,
                                    int64_t frame_end) const override {
         if (this->data(state).has_value) {
@@ -260,7 +316,8 @@ class FirstValueWindowFunction final : public ValueWindowFunction<PT, FirstValue
         this->data(state).has_value = true;
     }
 
-    void get_values(FunctionContext* ctx, ConstAggDataPtr state, Column* dst, size_t start, size_t end) const {
+    void get_values(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* dst, size_t start,
+                    size_t end) const override {
         this->get_values_helper(state, dst, start, end);
     }
 
@@ -278,12 +335,12 @@ template <PrimitiveType PT, typename T = RunTimeCppType<PT>, typename = guard::G
 class LastValueWindowFunction final : public ValueWindowFunction<PT, LastValueState<PT>, T> {
     using InputColumnType = typename ValueWindowFunction<PT, FirstValueState<PT>, T>::InputColumnType;
 
-    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr state) const override {
+    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr __restrict state) const override {
         this->data(state).value = {};
         this->data(state).is_null = false;
     }
 
-    void update_batch_single_state(FunctionContext* ctx, AggDataPtr state, const Column** columns,
+    void update_batch_single_state(FunctionContext* ctx, AggDataPtr __restrict state, const Column** columns,
                                    int64_t peer_group_start, int64_t peer_group_end, int64_t frame_start,
                                    int64_t frame_end) const override {
         if (columns[0]->is_null(frame_end - 1)) {
@@ -297,7 +354,8 @@ class LastValueWindowFunction final : public ValueWindowFunction<PT, LastValueSt
         this->data(state).value = column->get_data()[frame_end - 1];
     }
 
-    void get_values(FunctionContext* ctx, ConstAggDataPtr state, Column* dst, size_t start, size_t end) const {
+    void get_values(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* dst, size_t start,
+                    size_t end) const override {
         this->get_values_helper(state, dst, start, end);
     }
 
@@ -317,7 +375,7 @@ template <PrimitiveType PT, typename T = RunTimeCppType<PT>, typename = guard::G
 class LeadLagWindowFunction final : public ValueWindowFunction<PT, LeadLagState<PT>, T> {
     using InputColumnType = typename ValueWindowFunction<PT, FirstValueState<PT>, T>::InputColumnType;
 
-    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr state) const override {
+    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr __restrict state) const override {
         this->data(state).value = {};
         this->data(state).is_null = false;
         const Column* arg2 = args[2].get();
@@ -330,7 +388,7 @@ class LeadLagWindowFunction final : public ValueWindowFunction<PT, LeadLagState<
         }
     }
 
-    void update_batch_single_state(FunctionContext* ctx, AggDataPtr state, const Column** columns,
+    void update_batch_single_state(FunctionContext* ctx, AggDataPtr __restrict state, const Column** columns,
                                    int64_t peer_group_start, int64_t peer_group_end, int64_t frame_start,
                                    int64_t frame_end) const override {
         // frame_end <= frame_start is for lag function
@@ -355,7 +413,8 @@ class LeadLagWindowFunction final : public ValueWindowFunction<PT, LeadLagState<
         this->data(state).value = column->get_data()[frame_end - 1];
     }
 
-    void get_values(FunctionContext* ctx, ConstAggDataPtr state, Column* dst, size_t start, size_t end) const {
+    void get_values(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* dst, size_t start,
+                    size_t end) const override {
         this->get_values_helper(state, dst, start, end);
     }
 
@@ -373,13 +432,13 @@ struct FirstValueState<PT, BinaryPTGuard<PT>> {
 
 template <PrimitiveType PT>
 class FirstValueWindowFunction<PT, Slice, BinaryPTGuard<PT>> final : public WindowFunction<FirstValueState<PT>> {
-    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr state) const override {
+    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr __restrict state) const override {
         this->data(state).buffer.clear();
         this->data(state).has_value = false;
         this->data(state).is_null = false;
     }
 
-    void update_batch_single_state(FunctionContext* ctx, AggDataPtr state, const Column** columns,
+    void update_batch_single_state(FunctionContext* ctx, AggDataPtr __restrict state, const Column** columns,
                                    int64_t peer_group_start, int64_t peer_group_end, int64_t frame_start,
                                    int64_t frame_end) const override {
         if (this->data(state).has_value) {
@@ -400,7 +459,8 @@ class FirstValueWindowFunction<PT, Slice, BinaryPTGuard<PT>> final : public Wind
         this->data(state).has_value = true;
     }
 
-    void get_values(FunctionContext* ctx, ConstAggDataPtr state, Column* dst, size_t start, size_t end) const {
+    void get_values(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* dst, size_t start,
+                    size_t end) const override {
         this->get_slice_values(state, dst, start, end);
     }
 
@@ -417,12 +477,12 @@ struct LastValueState<PT, BinaryPTGuard<PT>> {
 
 template <PrimitiveType PT>
 class LastValueWindowFunction<PT, Slice, BinaryPTGuard<PT>> final : public WindowFunction<LastValueState<PT>> {
-    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr state) const override {
+    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr __restrict state) const override {
         this->data(state).buffer.clear();
         this->data(state).is_null = false;
     }
 
-    void update_batch_single_state(FunctionContext* ctx, AggDataPtr state, const Column** columns,
+    void update_batch_single_state(FunctionContext* ctx, AggDataPtr __restrict state, const Column** columns,
                                    int64_t peer_group_start, int64_t peer_group_end, int64_t frame_start,
                                    int64_t frame_end) const override {
         if (columns[0]->is_null(frame_end - 1)) {
@@ -439,7 +499,8 @@ class LastValueWindowFunction<PT, Slice, BinaryPTGuard<PT>> final : public Windo
         this->data(state).buffer.insert(this->data(state).buffer.end(), p, p + slice.size);
     }
 
-    void get_values(FunctionContext* ctx, ConstAggDataPtr state, Column* dst, size_t start, size_t end) const {
+    void get_values(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* dst, size_t start,
+                    size_t end) const override {
         this->get_slice_values(state, dst, start, end);
     }
 
@@ -458,7 +519,7 @@ struct LeadLagState<PT, BinaryPTGuard<PT>> {
 
 template <PrimitiveType PT>
 class LeadLagWindowFunction<PT, Slice, BinaryPTGuard<PT>> final : public WindowFunction<LeadLagState<PT>> {
-    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr state) const override {
+    void reset(FunctionContext* ctx, const Columns& args, AggDataPtr __restrict state) const override {
         this->data(state).value.clear();
         this->data(state).is_null = false;
         const Column* arg2 = args[2].get();
@@ -474,7 +535,7 @@ class LeadLagWindowFunction<PT, Slice, BinaryPTGuard<PT>> final : public WindowF
         }
     }
 
-    void update_batch_single_state(FunctionContext* ctx, AggDataPtr state, const Column** columns,
+    void update_batch_single_state(FunctionContext* ctx, AggDataPtr __restrict state, const Column** columns,
                                    int64_t peer_group_start, int64_t peer_group_end, int64_t frame_start,
                                    int64_t frame_end) const override {
         // frame_end <= frame_start is for lag function
@@ -500,7 +561,8 @@ class LeadLagWindowFunction<PT, Slice, BinaryPTGuard<PT>> final : public WindowF
         this->data(state).value.insert(this->data(state).value.end(), p, p + slice.size);
     }
 
-    void get_values(FunctionContext* ctx, ConstAggDataPtr state, Column* dst, size_t start, size_t end) const {
+    void get_values(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* dst, size_t start,
+                    size_t end) const override {
         this->get_slice_values(state, dst, start, end);
     }
 

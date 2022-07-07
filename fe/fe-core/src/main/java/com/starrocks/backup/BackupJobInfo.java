@@ -152,7 +152,6 @@ public class BackupJobInfo implements Writable {
         public String name;
         public long id;
         public long version;
-        public long versionHash;
         public Map<String, BackupIndexInfo> indexes = Maps.newHashMap();
 
         public BackupIndexInfo getIdx(String idxName) {
@@ -253,7 +252,6 @@ public class BackupJobInfo implements Writable {
                 partitionInfo.id = partition.getId();
                 partitionInfo.name = partition.getName();
                 partitionInfo.version = partition.getVisibleVersion();
-                partitionInfo.versionHash = partition.getVisibleVersionHash();
                 tableInfo.partitions.put(partitionInfo.name, partitionInfo);
                 // indexes
                 for (MaterializedIndex index : partition.getMaterializedIndices(IndexExtState.VISIBLE)) {
@@ -306,7 +304,7 @@ public class BackupJobInfo implements Writable {
          *                               "10008": ["__10029_seg1.dat", "__10029_seg2.dat"],
          *                               "10007": ["__10029_seg1.dat", "__10029_seg2.dat"]
          *                           },
-         *                           "tablets_order": ["10029", "10030"]
+         *                           "tablets_order": ["10007", "10008"]
          *                       },
          *                       "table1": {
          *                           "id": 10008,
@@ -315,12 +313,11 @@ public class BackupJobInfo implements Writable {
          *                               "10004": ["__10027_seg1.dat", "__10027_seg2.dat"],
          *                               "10005": ["__10028_seg1.dat", "__10028_seg2.dat"]
          *                           },
-         *                           "tablets_order": ["10027, "10028"]
+         *                           "tablets_order": ["10004, "10005"]
          *                       }
          *                   },
          *                   "id": 10007
          *                   "version": 10
-         *                   "version_hash": 1273047329538
          *               },
          *           },
          *           "id": 10001
@@ -362,7 +359,6 @@ public class BackupJobInfo implements Writable {
                 JSONObject part = parts.getJSONObject(partName);
                 partInfo.id = part.getLong("id");
                 partInfo.version = part.getLong("version");
-                partInfo.versionHash = part.getLong("version_hash");
                 JSONObject indexes = part.getJSONObject("indexes");
                 String[] indexNames = JSONObject.getNames(indexes);
                 for (String idxName : indexNames) {
@@ -413,7 +409,9 @@ public class BackupJobInfo implements Writable {
             tmpList.sort((o1, o2) -> Long.valueOf(o1).compareTo(Long.valueOf(o2)));
             return tmpList.toArray(new String[0]);
         } else {
-            return (String[]) tabletsOrder.toList().toArray(new String[0]);
+            // StarRocks uses string to deserialize tablets_order and apache doris uses long to deserialize.
+            // for compatibility with apache doris.
+            return tabletsOrder.toList().stream().map(Object::toString).toArray(String[]::new);
         }
     }
 
@@ -457,7 +455,8 @@ public class BackupJobInfo implements Writable {
                 if (verbose) {
                     part.put("id", partInfo.id);
                     part.put("version", partInfo.version);
-                    part.put("version_hash", partInfo.versionHash);
+                    // write a version_hash for compatibility
+                    part.put("version_hash", 0);
                     JSONObject indexes = new JSONObject();
                     part.put("indexes", indexes);
                     for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
@@ -465,8 +464,9 @@ public class BackupJobInfo implements Writable {
                         idx.put("id", idxInfo.id);
                         idx.put("schema_hash", idxInfo.schemaHash);
                         JSONObject tablets = new JSONObject();
-                        JSONArray tabletsOrder = new JSONArray();
                         idx.put("tablets", tablets);
+                        JSONArray tabletsOrder = new JSONArray();
+                        idx.put("tablets_order", tabletsOrder);
                         for (BackupTabletInfo tabletInfo : idxInfo.tablets) {
                             JSONArray files = new JSONArray();
                             tablets.put(String.valueOf(tabletInfo.id), files);

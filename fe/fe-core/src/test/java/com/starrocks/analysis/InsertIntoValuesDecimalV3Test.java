@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.analysis;
 
@@ -6,20 +6,22 @@ import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.common.Config;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.sql.StatementPlanner;
+import com.starrocks.sql.ast.QueryStatement;
+import com.starrocks.sql.ast.ValuesRelation;
+import com.starrocks.sql.plan.ExecPlan;
+import com.starrocks.thrift.TExplainLevel;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
-import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
 
-import java.util.ArrayList;
-import java.util.UUID;
+import java.util.List;
 
 public class InsertIntoValuesDecimalV3Test {
-    private static String runningDir = "fe/mocked/InsertIntoValuesDecimalV3/" + UUID.randomUUID().toString() + "/";
     private static StarRocksAssert starRocksAssert;
 
     @Rule
@@ -27,14 +29,9 @@ public class InsertIntoValuesDecimalV3Test {
 
     private static ConnectContext ctx;
 
-    @AfterClass
-    public static void tearDown() throws Exception {
-        UtFrameUtils.cleanStarRocksFeDir(runningDir);
-    }
-
     @BeforeClass
     public static void setUp() throws Exception {
-        UtFrameUtils.createMinStarRocksCluster(runningDir);
+        UtFrameUtils.createMinStarRocksCluster();
         String createTblStmtStr =
                 "CREATE TABLE if not exists test_table (\n" +
                         "\tcol_int INT NOT NULL, \n" +
@@ -46,8 +43,6 @@ public class InsertIntoValuesDecimalV3Test {
                         "PROPERTIES( \"replication_num\" = \"1\", \"in_memory\" = \"false\", \"storage_format\" = \"DEFAULT\" )";
 
         ctx = UtFrameUtils.createDefaultCtx();
-        Config.enable_decimal_v3 = true;
-        ctx.getSessionVariable().disableNewPlanner();
         starRocksAssert = new StarRocksAssert(ctx);
         starRocksAssert.withDatabase("db1").useDatabase("db1");
         starRocksAssert.withTable(createTblStmtStr);
@@ -77,10 +72,10 @@ public class InsertIntoValuesDecimalV3Test {
                 "  (5, 9180620),\n" +
                 "  (6, 0.681794072),\n" +
                 "  (\"99\", \"1724.069658963\");";
-        InsertStmt stmt = (InsertStmt) UtFrameUtils.parseAndAnalyzeStmt(sql1, ctx);
-        stmt.rewriteExprs(new Analyzer(ctx.getCatalog(), ctx).getExprRewriter());
-        SelectStmt selectStmt = (SelectStmt) stmt.getQueryStmt();
-        for (ArrayList<Expr> exprs : selectStmt.getValueList().getRows()) {
+        InsertStmt stmt = (InsertStmt) UtFrameUtils.parseStmtWithNewParser(sql1, ctx);
+        QueryStatement selectStmt = stmt.getQueryStatement();
+        ExecPlan execPlan = new StatementPlanner().plan(stmt, ctx);
+        for (List<Expr> exprs : ((ValuesRelation) selectStmt.getQueryRelation()).getRows()) {
             Assert.assertEquals(
                     exprs.get(1).getType(),
                     ScalarType.createDecimalV3Type(PrimitiveType.DECIMAL128, 20, 9));
@@ -89,9 +84,13 @@ public class InsertIntoValuesDecimalV3Test {
 
     @Test
     public void testInsertArray() throws Exception {
-        String sql = "explain insert into tarray values (1, 2, []) ";
-        String plan = UtFrameUtils.getSQLPlanOrErrorMsg(ctx, sql);
-        Assert.assertFalse(plan.contains("Unexpected exception: null"));
+        String sql = "insert into tarray values (1, 2, []) ";
+        InsertStmt stmt = (InsertStmt) UtFrameUtils.parseStmtWithNewParser(sql, ctx);
+        ExecPlan execPlan = new StatementPlanner().plan(stmt, ctx);
+        String plan = execPlan.getExplainString(TExplainLevel.NORMAL);
+
+        Assert.assertTrue(plan.contains("constant exprs: \n" +
+                "         1 | 2 | ARRAY<bigint(20)>[]"));
     }
 }
 

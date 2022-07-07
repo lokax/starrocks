@@ -1,12 +1,12 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
-#include "exec/vectorized/hdfs_scan_node.h"
-
+// #include "exec/vectorized/hdfs_scan_node.h"
 #include <gtest/gtest.h>
 
 #include <memory>
 
 #include "column/column_helper.h"
+#include "exec/vectorized/connector_scan_node.h"
 #include "runtime/descriptor_helper.h"
 #include "runtime/exec_env.h"
 #include "runtime/runtime_state.h"
@@ -25,7 +25,6 @@ public:
 
         _exec_env = ExecEnv::GetInstance();
         auto* engine = StorageEngine::instance();
-        ExecEnv::init(_exec_env, engine->engine_options()->store_paths);
         _exec_env->set_storage_engine(engine);
 
         _create_runtime_state();
@@ -82,6 +81,7 @@ std::vector<TScanRangeParams> HdfsScanNodeTest::_create_scan_ranges() {
     hdfs_scan_range.__set_length(_file_size);
     hdfs_scan_range.__set_partition_id(0);
     hdfs_scan_range.__set_relative_path(_file);
+    hdfs_scan_range.__set_file_format(THdfsFileFormat::PARQUET);
 
     TScanRange scan_range;
     scan_range.__set_hdfs_scan_range(hdfs_scan_range);
@@ -100,6 +100,7 @@ std::vector<TScanRangeParams> HdfsScanNodeTest::_create_scan_ranges_for_filter_p
     hdfs_scan_range.__set_length(_file_size);
     hdfs_scan_range.__set_partition_id(0);
     hdfs_scan_range.__set_relative_path(_file);
+    hdfs_scan_range.__set_file_format(THdfsFileFormat::PARQUET);
 
     TScanRange scan_range;
     scan_range.__set_hdfs_scan_range(hdfs_scan_range);
@@ -114,6 +115,7 @@ std::vector<TScanRangeParams> HdfsScanNodeTest::_create_scan_ranges_for_filter_p
     hdfs_scan_range2.__set_length(_file_2_size);
     hdfs_scan_range2.__set_partition_id(1);
     hdfs_scan_range2.__set_relative_path(_file_2);
+    hdfs_scan_range2.__set_file_format(THdfsFileFormat::PARQUET);
 
     TScanRange scan_range2;
     scan_range2.__set_hdfs_scan_range(hdfs_scan_range2);
@@ -131,8 +133,7 @@ void HdfsScanNodeTest::_create_runtime_state() {
     _runtime_state = std::make_shared<RuntimeState>(fragment_id, query_options, query_globals, _exec_env);
     TUniqueId id;
     _mem_tracker = std::make_shared<MemTracker>(-1, "olap scanner test");
-    _runtime_state->set_fragment_mem_tracker(_mem_tracker.get());
-    Status status = _runtime_state->init_mem_trackers(id);
+    _runtime_state->init_mem_trackers(id);
 }
 
 std::shared_ptr<TPlanNode> HdfsScanNodeTest::_create_tplan_node() {
@@ -147,6 +148,10 @@ std::shared_ptr<TPlanNode> HdfsScanNodeTest::_create_tplan_node() {
     tnode->__set_nullable_tuples(nullable_tuples);
     tnode->__set_use_vectorized(true);
     tnode->__set_limit(-1);
+
+    TConnectorScanNode connector_scan_node;
+    connector_scan_node.connector_name = connector::Connector::HIVE;
+    tnode->__set_connector_scan_node(connector_scan_node);
 
     return tnode;
 }
@@ -206,6 +211,10 @@ std::shared_ptr<TPlanNode> HdfsScanNodeTest::_create_tplan_node_for_filter_parti
 
     tnode->hdfs_scan_node.__set_partition_conjuncts({t_expr});
 
+    TConnectorScanNode connector_scan_node;
+    connector_scan_node.connector_name = connector::Connector::HIVE;
+    tnode->__set_connector_scan_node(connector_scan_node);
+
     return tnode;
 }
 
@@ -229,7 +238,7 @@ DescriptorTbl* HdfsScanNodeTest::_create_table_desc() {
     tuple_desc_builder.add_slot(slot4);
     tuple_desc_builder.build(&table_desc_builder);
     DescriptorTbl* tbl = nullptr;
-    DescriptorTbl::create(_pool, table_desc_builder.desc_tbl(), &tbl);
+    DescriptorTbl::create(_pool, table_desc_builder.desc_tbl(), &tbl, config::vector_chunk_size);
 
     THdfsPartition partition;
     std::map<int64_t, THdfsPartition> p_map;
@@ -265,7 +274,7 @@ DescriptorTbl* HdfsScanNodeTest::_create_table_desc_for_filter_partition() {
     tuple_desc_builder.add_slot(slot4);
     tuple_desc_builder.build(&table_desc_builder);
     DescriptorTbl* tbl = nullptr;
-    DescriptorTbl::create(_pool, table_desc_builder.desc_tbl(), &tbl);
+    DescriptorTbl::create(_pool, table_desc_builder.desc_tbl(), &tbl, config::vector_chunk_size);
 
     // hdfs table
     THdfsTable t_hdfs_table;
@@ -336,7 +345,7 @@ DescriptorTbl* HdfsScanNodeTest::_create_table_desc_for_filter_partition() {
     TTableDescriptor tdesc;
     tdesc.__set_hdfsTable(t_hdfs_table);
     _table_desc = _pool->add(new HdfsTableDescriptor(tdesc, _pool));
-    _table_desc->create_key_exprs(_pool);
+    _table_desc->create_key_exprs(_pool, _runtime_state->chunk_size());
     tbl->get_tuple_descriptor(0)->set_table_desc(_table_desc);
 
     return tbl;
@@ -347,16 +356,16 @@ TEST_F(HdfsScanNodeTest, TestBasic) {
         auto tnode = _create_tplan_node();
         auto* descs = _create_table_desc();
         _runtime_state->set_desc_tbl(descs);
-        auto hdfs_scan_node = std::make_shared<HdfsScanNode>(_pool, *tnode, *descs);
+        auto hdfs_scan_node = std::make_shared<ConnectorScanNode>(_pool, *tnode, *descs);
 
         Status status = hdfs_scan_node->init(*tnode, _runtime_state.get());
         ASSERT_TRUE(status.ok());
 
-        auto scan_ranges = _create_scan_ranges();
-        status = hdfs_scan_node->set_scan_ranges(scan_ranges);
+        status = hdfs_scan_node->prepare(_runtime_state.get());
         ASSERT_TRUE(status.ok());
 
-        status = hdfs_scan_node->prepare(_runtime_state.get());
+        auto scan_ranges = _create_scan_ranges();
+        status = hdfs_scan_node->set_scan_ranges(scan_ranges);
         ASSERT_TRUE(status.ok());
 
         status = hdfs_scan_node->open(_runtime_state.get());
@@ -379,16 +388,16 @@ TEST_F(HdfsScanNodeTest, TestBasic) {
         auto tnode = _create_tplan_node_for_filter_partition();
         auto* descs = _create_table_desc_for_filter_partition();
         _runtime_state->set_desc_tbl(descs);
-        auto hdfs_scan_node = std::make_shared<HdfsScanNode>(_pool, *tnode, *descs);
+        auto hdfs_scan_node = std::make_shared<ConnectorScanNode>(_pool, *tnode, *descs);
 
         Status status = hdfs_scan_node->init(*tnode, _runtime_state.get());
         ASSERT_TRUE(status.ok());
 
-        auto scan_ranges = _create_scan_ranges_for_filter_partition();
-        status = hdfs_scan_node->set_scan_ranges(scan_ranges);
+        status = hdfs_scan_node->prepare(_runtime_state.get());
         ASSERT_TRUE(status.ok());
 
-        status = hdfs_scan_node->prepare(_runtime_state.get());
+        auto scan_ranges = _create_scan_ranges_for_filter_partition();
+        status = hdfs_scan_node->set_scan_ranges(scan_ranges);
         ASSERT_TRUE(status.ok());
 
         status = hdfs_scan_node->open(_runtime_state.get());

@@ -20,8 +20,7 @@
  * limitations under the License.
  */
 
-#ifndef MEMORYPOOL_HH_
-#define MEMORYPOOL_HH_
+#pragma once
 
 #include <memory>
 
@@ -50,8 +49,8 @@ private:
     uint64_t currentCapacity;
 
     // not implemented
-    DataBuffer(DataBuffer& buffer);
-    DataBuffer& operator=(DataBuffer& buffer);
+    DataBuffer(DataBuffer& buffer) = delete;
+    DataBuffer& operator=(DataBuffer& buffer) = delete;
 
 public:
     DataBuffer(MemoryPool& pool, uint64_t _size = 0);
@@ -141,5 +140,3 @@ extern template class DataBuffer<unsigned char>;
 #pragma clang diagnostic pop
 #endif
 } // namespace orc
-
-#endif /* MEMORYPOOL_HH_ */

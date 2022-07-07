@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/analysis/SetNamesVarTest.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -22,41 +18,35 @@
 package com.starrocks.analysis;
 
 import com.starrocks.common.AnalysisException;
+import com.starrocks.sql.analyzer.SemanticException;
 import org.junit.Assert;
-import org.junit.Before;
 import org.junit.Test;
 
 public class SetNamesVarTest {
-    private Analyzer analyzer;
-
-    @Before
-    public void setUp() {
-        analyzer = AccessTestUtil.fetchAdminAnalyzer(false);
-    }
 
     @Test
     public void testNormal() throws AnalysisException {
         SetNamesVar var = new SetNamesVar(null, null);
-        var.analyze(analyzer);
+        var.analyze();
         Assert.assertEquals("utf8", var.getCharset().toLowerCase());
 
         Assert.assertEquals("NAMES 'utf8' COLLATE DEFAULT", var.toString());
 
         var = new SetNamesVar("UTf8", null);
-        var.analyze(analyzer);
+        var.analyze();
         Assert.assertEquals("utf8", var.getCharset().toLowerCase());
         Assert.assertEquals("NAMES 'utf8' COLLATE DEFAULT", var.toString());
 
         var = new SetNamesVar("UTf8", "aBc");
-        var.analyze(analyzer);
+        var.analyze();
         Assert.assertEquals("utf8", var.getCharset().toLowerCase());
         Assert.assertEquals("NAMES 'utf8' COLLATE 'abc'", var.toString());
     }
 
-    @Test(expected = AnalysisException.class)
-    public void testUnsupported() throws AnalysisException {
+    @Test(expected = SemanticException.class)
+    public void testUnsupported()  {
         SetNamesVar var = new SetNamesVar("gbk");
-        var.analyze(analyzer);
+        var.analyze();
         Assert.fail("No exception throws.");
     }
 }

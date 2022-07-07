@@ -1,11 +1,13 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.plan;
 
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.OlapTable;
+import com.starrocks.common.DdlException;
 import com.starrocks.common.FeConstants;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.utframe.UtFrameUtils;
+import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -14,24 +16,35 @@ public class DistributedEnvTPCDSPlanTest extends TPCDSPlanTestBase {
     @BeforeClass
     public static void beforeClass() throws Exception {
         TPCDSPlanTest.beforeClass();
-        Catalog catalog = connectContext.getCatalog();
-        OlapTable customer_address = (OlapTable) catalog.getDb("default_cluster:test").getTable("customer_address");
+        GlobalStateMgr globalStateMgr = connectContext.getGlobalStateMgr();
+        OlapTable customer_address =
+                (OlapTable) globalStateMgr.getDb("default_cluster:test").getTable("customer_address");
         setTableStatistics(customer_address, 1000000);
 
-        OlapTable customer = (OlapTable) catalog.getDb("default_cluster:test").getTable("customer");
+        OlapTable customer = (OlapTable) globalStateMgr.getDb("default_cluster:test").getTable("customer");
         setTableStatistics(customer, 2000000);
 
-        OlapTable store_sales = (OlapTable) catalog.getDb("default_cluster:test").getTable("store_sales");
+        OlapTable store_sales = (OlapTable) globalStateMgr.getDb("default_cluster:test").getTable("store_sales");
         setTableStatistics(store_sales, 287997024);
 
-        OlapTable date_dim = (OlapTable) catalog.getDb("default_cluster:test").getTable("date_dim");
+        OlapTable date_dim = (OlapTable) globalStateMgr.getDb("default_cluster:test").getTable("date_dim");
         setTableStatistics(date_dim, 73048);
 
-        OlapTable item = (OlapTable) catalog.getDb("default_cluster:test").getTable("item");
+        OlapTable item = (OlapTable) globalStateMgr.getDb("default_cluster:test").getTable("item");
         setTableStatistics(item, 203999);
 
         UtFrameUtils.addMockBackend(10002);
         UtFrameUtils.addMockBackend(10003);
+    }
+
+    @AfterClass
+    public static void afterClass() {
+        try {
+            UtFrameUtils.dropMockBackend(10002);
+            UtFrameUtils.dropMockBackend(10003);
+        } catch (DdlException e) {
+            e.printStackTrace();
+        }
     }
 
     @Test

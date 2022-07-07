@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include <algorithm>
 
@@ -7,9 +7,9 @@
 #include "column/column_helper.h"
 #include "column/column_viewer.h"
 #include "exprs/vectorized/string_functions.h"
+#include "udf/udf.h"
 
-namespace starrocks {
-namespace vectorized {
+namespace starrocks::vectorized {
 
 /**
  * @param: [haystack, delimiter, part_number]
@@ -32,8 +32,8 @@ ColumnPtr StringFunctions::split_part(FunctionContext* context, const starrocks:
     ColumnViewer delimiter_viewer = ColumnViewer<TYPE_VARCHAR>(columns[1]);
     ColumnViewer part_number_viewer = ColumnViewer<TYPE_INT>(columns[2]);
 
-    ColumnBuilder<TYPE_VARCHAR> res;
     size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> res(size);
     for (int i = 0; i < size; ++i) {
         if (haystack_viewer.is_null(i) || delimiter_viewer.is_null(i) || part_number_viewer.is_null(i)) {
             res.append_null();
@@ -49,8 +49,12 @@ ColumnPtr StringFunctions::split_part(FunctionContext* context, const starrocks:
         Slice haystack = haystack_viewer.value(i);
         Slice delimiter = delimiter_viewer.value(i);
         if (delimiter.size == 0) {
-            // if delimiter is a empty char, return empty char directly
-            res.append(Slice("", 0));
+            // Keep Consistent with split.
+            if (part_number > haystack.size) {
+                res.append_null();
+            } else {
+                res.append(Slice(haystack.data + part_number - 1, 1));
+            }
         } else if (delimiter.size == 1) {
             // if delimiter is a char, use memchr to split
             // Record the two adjacent offsets when matching delimiter.
@@ -108,5 +112,4 @@ ColumnPtr StringFunctions::split_part(FunctionContext* context, const starrocks:
     return res.build(ColumnHelper::is_all_const(columns));
 }
 
-} // namespace vectorized
-} // namespace starrocks
+} // namespace starrocks::vectorized

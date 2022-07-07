@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exec/vectorized/orc_scanner.h"
 
@@ -7,14 +7,13 @@
 
 #include "column/array_column.h"
 #include "column/column_helper.h"
-#include "env/env.h"
-#include "exec/vectorized/orc_scanner_adapter.h"
 #include "exprs/expr.h"
+#include "formats/orc/orc_chunk_reader.h"
+#include "fs/fs.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/broker_mgr.h"
 #include "runtime/descriptors.h"
 #include "runtime/exec_env.h"
-#include "runtime/mem_tracker.h"
 #include "runtime/runtime_state.h"
 
 namespace starrocks::vectorized {
@@ -30,8 +29,8 @@ public:
      * Get the total length of the file in bytes.
      */
     uint64_t getLength() const override {
-        uint64_t len = 0;
-        return _file->size(&len).ok() ? len : 0;
+        const auto status_or = _file->get_size();
+        return status_or.ok() ? status_or.value() : 0;
     }
 
     /**
@@ -53,9 +52,9 @@ public:
             throw orc::ParseError("Buffer is null");
         }
 
-        Status status = _file->read_at(offset, Slice((char*)buf, length));
+        Status status = _file->read_at_fully(offset, buf, length);
         if (!status.ok()) {
-            auto msg = strings::Substitute("Failed to read $0: $1", _file->file_name(), status.to_string());
+            auto msg = strings::Substitute("Failed to read $0: $1", _file->filename(), status.to_string());
             throw orc::ParseError(msg);
         }
     }
@@ -63,7 +62,7 @@ public:
     /**
      * Get the name of the stream for error messages.
      */
-    const std::string& getName() const override { return _file->file_name(); }
+    const std::string& getName() const override { return _file->filename(); }
 
 private:
     std::shared_ptr<RandomAccessFile> _file;
@@ -74,7 +73,7 @@ ORCScanner::ORCScanner(starrocks::RuntimeState* state, starrocks::RuntimeProfile
                        const TBrokerScanRange& scan_range, starrocks::vectorized::ScannerCounter* counter)
         : FileScanner(state, profile, scan_range.params, counter),
           _scan_range(scan_range),
-          _max_chunk_size(config::vector_chunk_size ? config::vector_chunk_size : 4096),
+          _max_chunk_size(_state->chunk_size() ? _state->chunk_size() : 4096),
           _next_range(0),
           _error_counter(0),
           _status_eof(false) {}
@@ -106,11 +105,11 @@ Status ORCScanner::open() {
     for (int i = 0; i < num_columns_from_orc; ++i) {
         _orc_slot_descriptors[i] = _src_slot_descriptors[i];
     }
-    _orc_adapter = std::make_unique<OrcScannerAdapter>(_orc_slot_descriptors);
-    _orc_adapter->set_broker_load_mode(_strict_mode);
-    _orc_adapter->set_timezone(_state->timezone());
-    _orc_adapter->drop_nanoseconds_in_datetime();
-    _orc_adapter->set_runtime_state(_state);
+    _orc_reader = std::make_unique<OrcChunkReader>(_state, _orc_slot_descriptors);
+    _orc_reader->set_broker_load_mode(_strict_mode);
+    _orc_reader->set_timezone(_state->timezone());
+    _orc_reader->drop_nanoseconds_in_datetime();
+    _orc_reader->set_runtime_state(_state);
     RETURN_IF_ERROR(_open_next_orc_reader());
 
     return Status::OK();
@@ -162,12 +161,16 @@ StatusOr<ChunkPtr> ORCScanner::_next_orc_chunk() {
 
 ChunkPtr ORCScanner::_transfer_chunk(starrocks::vectorized::ChunkPtr& src) {
     SCOPED_RAW_TIMER(&_counter->cast_chunk_ns);
-    ChunkPtr cast_chunk = _orc_adapter->cast_chunk(&src);
+    ChunkPtr cast_chunk = _orc_reader->cast_chunk(&src);
     auto range = _scan_range.ranges.at(_next_range - 1);
     if (range.__isset.num_of_columns_from_file) {
         for (int i = 0; i < range.columns_from_path.size(); ++i) {
             auto slot = _src_slot_descriptors[range.num_of_columns_from_file + i];
-            cast_chunk->append_column(src->get_column_by_slot_id(slot->id()), slot->id());
+            // This happens when there are extra fields in broker load specification
+            // but those extra fields don't match any fields in native table.
+            if (slot != nullptr) {
+                cast_chunk->append_column(src->get_column_by_slot_id(slot->id()), slot->id());
+            }
         }
     }
     return cast_chunk;
@@ -175,17 +178,17 @@ ChunkPtr ORCScanner::_transfer_chunk(starrocks::vectorized::ChunkPtr& src) {
 
 ChunkPtr ORCScanner::_create_src_chunk() {
     SCOPED_RAW_TIMER(&_counter->init_chunk_ns);
-    ChunkPtr chunk = _orc_adapter->create_chunk();
+    ChunkPtr chunk = _orc_reader->create_chunk();
     return chunk;
 }
 
 Status ORCScanner::_next_orc_batch(ChunkPtr* result) {
     {
         SCOPED_RAW_TIMER(&_counter->read_batch_ns);
-        Status status = _orc_adapter->read_next();
+        Status status = _orc_reader->read_next();
         while (status.is_end_of_file()) {
             RETURN_IF_ERROR(_open_next_orc_reader());
-            status = _orc_adapter->read_next();
+            status = _orc_reader->read_next();
             if (status.is_end_of_file()) {
                 continue;
             }
@@ -195,8 +198,8 @@ Status ORCScanner::_next_orc_batch(ChunkPtr* result) {
     }
     {
         SCOPED_RAW_TIMER(&_counter->fill_ns);
-        RETURN_IF_ERROR(_orc_adapter->fill_chunk(result));
-        _counter->num_rows_filtered += _orc_adapter->get_num_rows_filtered();
+        RETURN_IF_ERROR(_orc_reader->fill_chunk(result));
+        _counter->num_rows_filtered += _orc_reader->get_num_rows_filtered();
     }
     return Status::OK();
 }
@@ -211,17 +214,17 @@ Status ORCScanner::_open_next_orc_reader() {
         Status st = create_random_access_file(range_desc, _scan_range.broker_addresses[0], _scan_range.params,
                                               CompressionTypePB::NO_COMPRESSION, &file);
         if (!st.ok()) {
-            LOG(WARNING) << "Failed to create random-access files: " << st.to_string();
+            LOG(WARNING) << "Failed to create random-access files. status: " << st.to_string();
             return st;
         }
-        const std::string& file_name = file->file_name();
+        const std::string& file_name = file->filename();
         auto inStream = std::make_unique<ORCFileStream>(file, _counter);
         _next_range++;
-        _orc_adapter->set_read_chunk_size(_max_chunk_size);
-        _orc_adapter->set_current_file_name(file_name);
-        st = _orc_adapter->init(std::move(inStream));
+        _orc_reader->set_read_chunk_size(_max_chunk_size);
+        _orc_reader->set_current_file_name(file_name);
+        st = _orc_reader->init(std::move(inStream));
         if (st.is_end_of_file()) {
-            LOG(WARNING) << "Failed to init orc adapter. file_name: " << file_name << ", st: " << st.to_string();
+            LOG(WARNING) << "Failed to init orc reader. filename: " << file_name << ", status: " << st.to_string();
             continue;
         }
         return st;
@@ -229,7 +232,8 @@ Status ORCScanner::_open_next_orc_reader() {
 }
 
 void ORCScanner::close() {
-    _orc_adapter.reset(nullptr);
+    FileScanner::close();
+    _orc_reader.reset(nullptr);
 }
 
 } // namespace starrocks::vectorized

@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_UTIL_DEFER_OP_H
-#define STARROCKS_BE_UTIL_DEFER_OP_H
+#pragma once
 
 #include <functional>
 #include <utility>
@@ -28,9 +27,9 @@
 namespace starrocks {
 
 // This class is used to defer a function when this object is deconstruct
+template <class DeferFunction>
 class DeferOp {
 public:
-    typedef std::function<void()> DeferFunction;
     explicit DeferOp(DeferFunction func) : _func(std::move(func)) {}
 
     ~DeferOp() { _func(); };
@@ -40,5 +39,3 @@ private:
 };
 
 } // namespace starrocks
-
-#endif

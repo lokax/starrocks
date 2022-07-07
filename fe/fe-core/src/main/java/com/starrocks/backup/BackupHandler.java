@@ -37,8 +37,8 @@ import com.starrocks.analysis.TableRef;
 import com.starrocks.backup.AbstractJob.JobType;
 import com.starrocks.backup.BackupJob.BackupJobState;
 import com.starrocks.backup.BackupJobInfo.BackupTableInfo;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.KeysType;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
@@ -49,9 +49,11 @@ import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
+import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.Pair;
 import com.starrocks.common.io.Writable;
 import com.starrocks.common.util.MasterDaemon;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.task.DirMoveTask;
 import com.starrocks.task.DownloadTask;
 import com.starrocks.task.SnapshotTask;
@@ -62,7 +64,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
+import java.io.DataInputStream;
 import java.io.DataOutput;
+import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -95,24 +99,24 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
     private boolean isInit = false;
 
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
 
     public BackupHandler() {
         // for persist
     }
 
-    public BackupHandler(Catalog catalog) {
+    public BackupHandler(GlobalStateMgr globalStateMgr) {
         super("backupHandler", 3000L);
-        this.catalog = catalog;
+        this.globalStateMgr = globalStateMgr;
     }
 
-    public void setCatalog(Catalog catalog) {
-        this.catalog = catalog;
+    public void setGlobalStateMgr(GlobalStateMgr globalStateMgr) {
+        this.globalStateMgr = globalStateMgr;
     }
 
     @Override
     public synchronized void start() {
-        Preconditions.checkNotNull(catalog);
+        Preconditions.checkNotNull(globalStateMgr);
         super.start();
         repoMgr.start();
     }
@@ -166,20 +170,20 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
 
         for (AbstractJob job : dbIdToBackupOrRestoreJob.values()) {
-            job.setCatalog(catalog);
+            job.setGlobalStateMgr(globalStateMgr);
             job.run();
         }
     }
 
     // handle create repository stmt
     public void createRepository(CreateRepositoryStmt stmt) throws DdlException {
-        if (!catalog.getBrokerMgr().containsBroker(stmt.getBrokerName())) {
+        if (!globalStateMgr.getBrokerMgr().containsBroker(stmt.getBrokerName())) {
             ErrorReport
                     .reportDdlException(ErrorCode.ERR_COMMON_ERROR, "broker does not exist: " + stmt.getBrokerName());
         }
 
         BlobStorage storage = new BlobStorage(stmt.getBrokerName(), stmt.getProperties());
-        long repoId = catalog.getNextId();
+        long repoId = globalStateMgr.getNextId();
         Repository repo = new Repository(repoId, stmt.getName(), stmt.isReadOnly(), stmt.getLocation(), storage);
 
         Status st = repoMgr.addAndInitRepoIfNotExist(repo, false);
@@ -227,7 +231,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
         // check if db exist
         String dbName = stmt.getDbName();
-        Database db = catalog.getDb(dbName);
+        Database db = globalStateMgr.getDb(dbName);
         if (db == null) {
             ErrorReport.reportDdlException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
         }
@@ -292,6 +296,10 @@ public class BackupHandler extends MasterDaemon implements Writable {
                 }
 
                 OlapTable olapTbl = (OlapTable) tbl;
+                if (olapTbl.getKeysType() == KeysType.PRIMARY_KEYS) {
+                    ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
+                            "backup do not support primary key table: " + tblName);
+                }
                 if (olapTbl.existTempPartitions()) {
                     ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
                             "Do not support backup table with temp partitions");
@@ -365,9 +373,9 @@ public class BackupHandler extends MasterDaemon implements Writable {
         BackupJob backupJob = new BackupJob(stmt.getLabel(), db.getId(),
                 ClusterNamespace.getNameFromFullName(db.getFullName()),
                 tblRefs, stmt.getTimeoutMs(),
-                catalog, repository.getId());
+                globalStateMgr, repository.getId());
         // write log
-        catalog.getEditLog().logBackupJob(backupJob);
+        globalStateMgr.getEditLog().logBackupJob(backupJob);
 
         // must put to dbIdToBackupOrRestoreJob after edit log, otherwise the state of job may be changed.
         dbIdToBackupOrRestoreJob.put(db.getId(), backupJob);
@@ -394,8 +402,9 @@ public class BackupHandler extends MasterDaemon implements Writable {
         // Create a restore job
         RestoreJob restoreJob = new RestoreJob(stmt.getLabel(), stmt.getBackupTimestamp(),
                 db.getId(), db.getFullName(), jobInfo, stmt.allowLoad(), stmt.getReplicationNum(),
-                stmt.getTimeoutMs(), stmt.getMetaVersion(), stmt.getStarRocksMetaVersion(), catalog, repository.getId());
-        catalog.getEditLog().logRestoreJob(restoreJob);
+                stmt.getTimeoutMs(), stmt.getMetaVersion(), stmt.getStarRocksMetaVersion(), globalStateMgr,
+                repository.getId());
+        globalStateMgr.getEditLog().logRestoreJob(restoreJob);
 
         // must put to dbIdToBackupOrRestoreJob after edit log, otherwise the state of job may be changed.
         dbIdToBackupOrRestoreJob.put(db.getId(), restoreJob);
@@ -445,7 +454,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
     public void cancel(CancelBackupStmt stmt) throws DdlException {
         String dbName = stmt.getDbName();
-        Database db = catalog.getDb(dbName);
+        Database db = globalStateMgr.getDb(dbName);
         if (db == null) {
             ErrorReport.reportDdlException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
         }
@@ -536,7 +545,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
                         existingJob, job);
                 return;
             }
-            existingJob.setCatalog(catalog);
+            existingJob.setGlobalStateMgr(globalStateMgr);
             existingJob.replayCancel();
         } else if (!job.isPending()) {
             AbstractJob existingJob = dbIdToBackupOrRestoreJob.get(job.getDbId());
@@ -594,6 +603,20 @@ public class BackupHandler extends MasterDaemon implements Writable {
             AbstractJob job = AbstractJob.read(in);
             dbIdToBackupOrRestoreJob.put(job.getDbId(), job);
         }
+    }
+
+    public long saveBackupHandler(DataOutputStream dos, long checksum) throws IOException {
+        write(dos);
+        return checksum;
+    }
+
+    public long loadBackupHandler(DataInputStream dis, long checksum, GlobalStateMgr globalStateMgr) throws IOException {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_42) {
+            readFields(dis);
+        }
+        setGlobalStateMgr(globalStateMgr);
+        LOG.info("finished replay backupHandler from image");
+        return checksum;
     }
 }
 

@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.operator.scalar;
 
@@ -55,7 +55,7 @@ public class CastOperator extends CallOperator {
             return false;
         }
         CastOperator that = (CastOperator) o;
-        return isImplicit == that.isImplicit && type == that.type;
+        return isImplicit == that.isImplicit && type.equals(that.type);
     }
 
     @Override

@@ -21,7 +21,6 @@
 
 #include "util/threadpool.h"
 
-#include <cstdint>
 #include <limits>
 #include <ostream>
 
@@ -84,19 +83,19 @@ Status ThreadPoolBuilder::build(std::unique_ptr<ThreadPool>* pool) const {
 }
 
 ThreadPoolToken::ThreadPoolToken(ThreadPool* pool, ThreadPool::ExecutionMode mode)
-        : _mode(mode), _pool(pool), _state(State::IDLE), _not_running_cond(), _active_threads(0) {}
+        : _mode(mode), _pool(pool), _state(State::IDLE), _active_threads(0) {}
 
 ThreadPoolToken::~ThreadPoolToken() {
     shutdown();
     _pool->release_token(this);
 }
 
-Status ThreadPoolToken::submit(std::shared_ptr<Runnable> r) {
-    return _pool->do_submit(std::move(r), this);
+Status ThreadPoolToken::submit(std::shared_ptr<Runnable> r, ThreadPool::Priority pri) {
+    return _pool->do_submit(std::move(r), this, pri);
 }
 
-Status ThreadPoolToken::submit_func(std::function<void()> f) {
-    return submit(std::make_shared<FunctionRunnable>(std::move(f)));
+Status ThreadPoolToken::submit_func(std::function<void()> f, ThreadPool::Priority pri) {
+    return submit(std::make_shared<FunctionRunnable>(std::move(f)), pri);
 }
 
 void ThreadPoolToken::shutdown() {
@@ -107,7 +106,7 @@ void ThreadPoolToken::shutdown() {
     // outside the lock, in case there are concurrent threads wanting to access
     // the ThreadPool. The task's destructors may acquire locks, etc, so this
     // also prevents lock inversions.
-    std::deque<ThreadPool::Task> to_release = std::move(_entries);
+    PriorityQueue<ThreadPool::NUM_PRIORITY, ThreadPool::Task> to_release = std::move(_entries);
     _pool->_total_queued_tasks -= to_release.size();
 
     switch (state()) {
@@ -229,8 +228,7 @@ ThreadPool::ThreadPool(const ThreadPoolBuilder& builder)
           _max_queue_size(builder._max_queue_size),
           _idle_timeout(builder._idle_timeout),
           _pool_status(Status::Uninitialized("The pool was not initialized.")),
-          _idle_cond(),
-          _no_threads_cond(),
+
           _num_threads(0),
           _num_threads_pending_start(0),
           _active_threads(0),
@@ -275,7 +273,7 @@ void ThreadPool::shutdown() {
     // wanting to access the ThreadPool. The task's destructors may acquire
     // locks, etc, so this also prevents lock inversions.
     _queue.clear();
-    std::deque<std::deque<Task>> to_release;
+    std::deque<PriorityQueue<NUM_PRIORITY, Task>> to_release;
     for (auto* t : _tokens) {
         if (!t->_entries.empty()) {
             to_release.emplace_back(std::move(t->_entries));
@@ -328,15 +326,15 @@ void ThreadPool::release_token(ThreadPoolToken* t) {
     CHECK_EQ(1, _tokens.erase(t));
 }
 
-Status ThreadPool::submit(std::shared_ptr<Runnable> r) {
-    return do_submit(std::move(r), _tokenless.get());
+Status ThreadPool::submit(std::shared_ptr<Runnable> r, Priority pri) {
+    return do_submit(std::move(r), _tokenless.get(), pri);
 }
 
-Status ThreadPool::submit_func(std::function<void()> f) {
-    return submit(std::make_shared<FunctionRunnable>(std::move(f)));
+Status ThreadPool::submit_func(std::function<void()> f, Priority pri) {
+    return submit(std::make_shared<FunctionRunnable>(std::move(f)), pri);
 }
 
-Status ThreadPool::do_submit(std::shared_ptr<Runnable> r, ThreadPoolToken* token) {
+Status ThreadPool::do_submit(std::shared_ptr<Runnable> r, ThreadPoolToken* token, Priority pri) {
     DCHECK(token);
     MonoTime submit_time = MonoTime::Now();
 
@@ -390,7 +388,7 @@ Status ThreadPool::do_submit(std::shared_ptr<Runnable> r, ThreadPoolToken* token
     // Add the task to the token's queue.
     ThreadPoolToken::State state = token->state();
     DCHECK(state == ThreadPoolToken::State::IDLE || state == ThreadPoolToken::State::RUNNING);
-    token->_entries.emplace_back(std::move(task));
+    token->_entries.emplace_back(pri, std::move(task));
     if (state == ThreadPoolToken::State::IDLE || token->mode() == ExecutionMode::CONCURRENT) {
         _queue.emplace_back(token);
         if (state == ThreadPoolToken::State::IDLE) {
@@ -562,8 +560,7 @@ void ThreadPool::dispatch_thread() {
 }
 
 Status ThreadPool::create_thread() {
-    return Thread::create("thread pool", strings::Substitute("$0 [worker]", _name), &ThreadPool::dispatch_thread, this,
-                          nullptr);
+    return Thread::create("thread pool", _name, &ThreadPool::dispatch_thread, this, nullptr);
 }
 
 void ThreadPool::check_not_pool_thread_unlocked() {

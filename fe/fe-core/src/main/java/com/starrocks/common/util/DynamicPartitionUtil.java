@@ -24,7 +24,6 @@ package com.starrocks.common.util;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.starrocks.analysis.TimestampArithmeticExpr.TimeUnit;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.DynamicPartitionProperty;
 import com.starrocks.catalog.OlapTable;
@@ -40,6 +39,7 @@ import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.FeNameFormat;
+import com.starrocks.server.GlobalStateMgr;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -70,7 +70,7 @@ public class DynamicPartitionUtil {
         }
     }
 
-    private static void checkPrefix(String prefix) throws DdlException {
+    public static void checkPrefix(String prefix) throws DdlException {
         try {
             FeNameFormat.checkPartitionName(prefix);
         } catch (AnalysisException e) {
@@ -122,7 +122,7 @@ public class DynamicPartitionUtil {
         }
     }
 
-    private static void checkStartDayOfMonth(String val) throws DdlException {
+    public static void checkStartDayOfMonth(String val) throws DdlException {
         if (Strings.isNullOrEmpty(val)) {
             throw new DdlException("Invalid properties: " + DynamicPartitionProperty.START_DAY_OF_MONTH);
         }
@@ -138,7 +138,7 @@ public class DynamicPartitionUtil {
         }
     }
 
-    private static void checkStartDayOfWeek(String val) throws DdlException {
+    public static void checkStartDayOfWeek(String val) throws DdlException {
         if (Strings.isNullOrEmpty(val)) {
             throw new DdlException("Invalid properties: " + DynamicPartitionProperty.START_DAY_OF_WEEK);
         }
@@ -232,10 +232,10 @@ public class DynamicPartitionUtil {
         if (olapTable.getTableProperty() != null
                 && olapTable.getTableProperty().getDynamicPartitionProperty() != null) {
             if (olapTable.getTableProperty().getDynamicPartitionProperty().getEnable()) {
-                Catalog.getCurrentCatalog().getDynamicPartitionScheduler()
+                GlobalStateMgr.getCurrentState().getDynamicPartitionScheduler()
                         .registerDynamicPartitionTable(dbId, olapTable.getId());
             } else {
-                Catalog.getCurrentCatalog().getDynamicPartitionScheduler()
+                GlobalStateMgr.getCurrentState().getDynamicPartitionScheduler()
                         .removeDynamicPartitionTable(dbId, olapTable.getId());
             }
         }
@@ -353,12 +353,21 @@ public class DynamicPartitionUtil {
         }
     }
 
+    public static void checkAndSetDynamicPartitionBuckets(Map<String, String> properties, int bucketNum) {
+        if (properties == null || properties.isEmpty()) {
+            return;
+        }
+        if (!Strings.isNullOrEmpty(properties.get(DynamicPartitionProperty.ENABLE))) {
+            properties.putIfAbsent(DynamicPartitionProperty.BUCKETS, String.valueOf(bucketNum));
+        }
+    }
+
     public static String getPartitionFormat(Column column) throws DdlException {
         if (column.getPrimitiveType().equals(PrimitiveType.DATE)) {
             return DATE_FORMAT;
         } else if (column.getPrimitiveType().equals(PrimitiveType.DATETIME)) {
             return DATETIME_FORMAT;
-        } else if (PrimitiveType.getIntegerTypes().contains(column.getPrimitiveType())) {
+        } else if (PrimitiveType.getIntegerTypeList().contains(column.getPrimitiveType())) {
             // TODO: For Integer Type, only support format it as yyyyMMdd now
             return TIMESTAMP_FORMAT;
         } else {

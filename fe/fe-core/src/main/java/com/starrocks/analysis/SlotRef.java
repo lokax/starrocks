@@ -29,8 +29,8 @@ import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.io.Text;
-import com.starrocks.sql.analyzer.ExprVisitor;
 import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.thrift.TExprNode;
 import com.starrocks.thrift.TExprNodeType;
 import com.starrocks.thrift.TSlotRef;
@@ -41,13 +41,7 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.TreeSet;
 
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public class SlotRef extends Expr {
     private static final Logger LOG = LogManager.getLogger(SlotRef.class);
     private TableName tblName;
@@ -70,16 +64,22 @@ public class SlotRef extends Expr {
         this.label = "`" + col + "`";
     }
 
+    public SlotRef(TableName tblName, String col, String label) {
+        super();
+        this.tblName = tblName;
+        this.col = col;
+        this.label = label;
+    }
+
     // C'tor for a "pre-analyzed" ref to slot that doesn't correspond to
     // a table's column.
     public SlotRef(SlotDescriptor desc) {
         super();
         this.tblName = null;
-        this.col = null;
+        this.col = desc.getLabel();
         this.desc = desc;
         this.type = desc.getType();
         this.originType = desc.getOriginType();
-        // TODO(zc): label is meaningful
         this.label = null;
         if (this.type.isChar()) {
             this.type = Type.VARCHAR;
@@ -125,8 +125,6 @@ public class SlotRef extends Expr {
         }
     }
 
-    // NOTE: this is used to set tblName to null,
-    // so we can to get the only column name when calling toSql
     public void setTblName(TableName name) {
         this.tblName = name;
     }
@@ -148,20 +146,6 @@ public class SlotRef extends Expr {
 
     @Override
     public void analyzeImpl(Analyzer analyzer) throws AnalysisException {
-        desc = analyzer.registerColumnRef(tblName, col);
-        type = desc.getType();
-        originType = desc.getOriginType();
-        if (this.type.isChar()) {
-            this.type = Type.VARCHAR;
-        }
-        if (!type.isSupported()) {
-            throw new AnalysisException(
-                    "Unsupported type '" + type.toString() + "' in '" + toSql() + "'.");
-        }
-        numDistinctValues = desc.getStats().getNumDistinctValues();
-        if (type.isBoolean()) {
-            selectivity = DEFAULT_SELECTIVITY;
-        }
     }
 
     @Override
@@ -178,7 +162,7 @@ public class SlotRef extends Expr {
     public String toSqlImpl() {
         StringBuilder sb = new StringBuilder();
         if (tblName != null) {
-            return tblName.toSql() + "." + label + sb.toString();
+            return tblName.toSql() + "." + "`" + col + "`";
         } else if (label != null) {
             return label + sb.toString();
         } else if (desc.getSourceExprs() != null) {
@@ -215,6 +199,15 @@ public class SlotRef extends Expr {
         }
     }
 
+    @Override
+    public String toJDBCSQL(boolean isMySQL) {
+        if (col != null) {
+            return isMySQL ? "`" + col + "`" : col;
+        } else {
+            return "<slot " + Integer.toString(desc.getId().asInt()) + ">";
+        }
+    }
+
     public TableName getTableName() {
         Preconditions.checkState(isAnalyzed);
         Preconditions.checkNotNull(desc);
@@ -230,20 +223,25 @@ public class SlotRef extends Expr {
 
     @Override
     public String toColumnLabel() {
-        // return tblName == null ? col : tblName.getTbl() + "." + col;
-        return col;
+        return label;
     }
 
     @Override
     protected void toThrift(TExprNode msg) {
         msg.node_type = TExprNodeType.SLOT_REF;
-        msg.slot_ref = new TSlotRef(desc.getId().asInt(), desc.getParent().getId().asInt());
-        msg.setOutput_column(outputColumn);
-    }
+        if (desc != null) {
+            if (desc.getParent() != null) {
+                msg.slot_ref = new TSlotRef(desc.getId().asInt(), desc.getParent().getId().asInt());
+            } else {
+                // tuple id is meaningless here
+                msg.slot_ref = new TSlotRef(desc.getId().asInt(), 0);
+            }
+        } else {
+            // slot id and tuple id are meaningless here
+            msg.slot_ref = new TSlotRef(0,0);
+        }
 
-    @Override
-    public void markAgg() {
-        desc.setIsAgg(true);
+        msg.setOutput_column(outputColumn);
     }
 
     @Override
@@ -321,32 +319,6 @@ public class SlotRef extends Expr {
         }
     }
 
-    @Override
-    public void getTableIdToColumnNames(Map<Long, Set<String>> tableIdToColumnNames) {
-        Preconditions.checkState(desc != null);
-        if (!desc.isMaterialized()) {
-            return;
-        }
-        if (col == null) {
-            for (Expr expr : desc.getSourceExprs()) {
-                expr.getTableIdToColumnNames(tableIdToColumnNames);
-            }
-        } else {
-            Table table = desc.getParent().getTable();
-            if (table == null) {
-                // Maybe this column comes from inline view.
-                return;
-            }
-            Long tableId = table.getId();
-            Set<String> columnNames = tableIdToColumnNames.get(tableId);
-            if (columnNames == null) {
-                columnNames = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
-                tableIdToColumnNames.put(tableId, columnNames);
-            }
-            columnNames.add(desc.getColumn().getName());
-        }
-    }
-
     public Table getTable() {
         Preconditions.checkState(desc != null);
         Table table = desc.getParent().getTable();
@@ -357,8 +329,16 @@ public class SlotRef extends Expr {
         return col;
     }
 
+    public void setColumnName(String columnName) {
+        this.col = columnName;
+    }
+
     public void setCol(String col) {
         this.col = col;
+    }
+
+    public String getLabel() {
+        return label;
     }
 
     @Override
@@ -392,20 +372,20 @@ public class SlotRef extends Expr {
         return slotRef;
     }
 
-    @Override
-    public boolean isVectorized() {
-        return true;
-    }
-
     /**
      * Below function is added by new analyzer
      */
     @Override
-    public <R, C> R accept(ExprVisitor<R, C> visitor, C context) throws SemanticException {
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) throws SemanticException {
         return visitor.visitSlot(this, context);
     }
 
     public TableName getTblNameWithoutAnalyzed() {
         return tblName;
+    }
+
+    @Override
+    public boolean isSelfMonotonic() {
+        return true;
     }
 }

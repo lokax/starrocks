@@ -41,18 +41,14 @@ enum TPartitionType {
 
   // unordered partition on a set of exprs
   // (only use in bucket shuffle join)
-  BUCKET_SHFFULE_HASH_PARTITIONED
+  BUCKET_SHUFFLE_HASH_PARTITIONED
 }
 
 enum TDistributionType {
-  UNPARTITIONED,
-
-  // round-robin partition
-  RANDOM,
-
-  // unordered partition on a set of exprs
-  // (partition bounds overlap)
-  HASH_PARTITIONED
+  ANY,
+  BROADCAST,
+  SHUFFLE,
+  GATHER
 }
 
 // TODO(zc): Refine

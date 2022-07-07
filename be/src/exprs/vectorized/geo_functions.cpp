@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/geo_functions.h"
 
@@ -8,22 +8,21 @@
 #include "common/logging.h"
 #include "geo/geo_types.h"
 
-namespace starrocks {
-namespace vectorized {
+namespace starrocks::vectorized {
 
 struct StConstructState {
-    StConstructState() : is_null(false) {}
-    ~StConstructState() {}
+    StConstructState() {}
+    ~StConstructState() = default;
 
-    bool is_null;
+    bool is_null{false};
     std::string encoded_buf;
 };
 
 ColumnPtr GeoFunctions::st_from_wkt_common(FunctionContext* ctx, const Columns& columns, GeoShapeType shape_type) {
     ColumnViewer<TYPE_VARCHAR> wkt_viewer(columns[0]);
-    ColumnBuilder<TYPE_VARCHAR> result;
 
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
 
     StConstructState* state = (StConstructState*)ctx->get_function_state(FunctionContext::FRAGMENT_LOCAL);
     if (state == nullptr) {
@@ -90,8 +89,7 @@ Status GeoFunctions::st_circle_prepare(FunctionContext* ctx, FunctionContext::Fu
     auto lng = ctx->get_constant_column(0);
     auto lat = ctx->get_constant_column(1);
     auto radius = ctx->get_constant_column(2);
-    if (lng->only_null() || lng->is_null(0) || lat->only_null() || lat->is_null(0) || radius->only_null() ||
-        radius->is_null(0)) {
+    if (lng->only_null() || lat->only_null() || radius->only_null()) {
         state->is_null = true;
     } else {
         std::unique_ptr<GeoCircle> circle(new GeoCircle());
@@ -115,9 +113,9 @@ ColumnPtr GeoFunctions::st_circle(FunctionContext* context, const Columns& colum
     ColumnViewer<TYPE_DOUBLE> lng_viewer(columns[0]);
     ColumnViewer<TYPE_DOUBLE> lat_viewer(columns[1]);
     ColumnViewer<TYPE_DOUBLE> radius_viewer(columns[2]);
-    ColumnBuilder<TYPE_VARCHAR> result;
 
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
     StConstructState* state = (StConstructState*)context->get_function_state(FunctionContext::FRAGMENT_LOCAL);
     if (state == nullptr) {
         for (int row = 0; row < size; ++row) {
@@ -156,9 +154,9 @@ ColumnPtr GeoFunctions::st_circle(FunctionContext* context, const Columns& colum
 ColumnPtr GeoFunctions::st_point(FunctionContext* context, const Columns& columns) {
     auto x_column = ColumnViewer<TYPE_DOUBLE>(columns[0]);
     auto y_column = ColumnViewer<TYPE_DOUBLE>(columns[1]);
-    ColumnBuilder<TYPE_VARCHAR> result;
 
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
     for (int row = 0; row < size; ++row) {
         if (x_column.is_null(row) || y_column.is_null(row)) {
             result.append_null();
@@ -184,9 +182,9 @@ ColumnPtr GeoFunctions::st_point(FunctionContext* context, const Columns& column
 
 ColumnPtr GeoFunctions::st_x(FunctionContext* context, const Columns& columns) {
     ColumnViewer<TYPE_VARCHAR> encode(columns[0]);
-    ColumnBuilder<TYPE_DOUBLE> result;
 
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_DOUBLE> result(size);
     for (int row = 0; row < size; ++row) {
         if (encode.is_null(row)) {
             result.append_null();
@@ -209,9 +207,9 @@ ColumnPtr GeoFunctions::st_x(FunctionContext* context, const Columns& columns) {
 
 ColumnPtr GeoFunctions::st_y(FunctionContext* context, const Columns& columns) {
     ColumnViewer<TYPE_VARCHAR> encode(columns[0]);
-    ColumnBuilder<TYPE_DOUBLE> result;
 
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_DOUBLE> result(size);
     for (int row = 0; row < size; ++row) {
         if (encode.is_null(row)) {
             result.append_null();
@@ -237,9 +235,9 @@ ColumnPtr GeoFunctions::st_distance_sphere(FunctionContext* context, const Colum
     ColumnViewer<TYPE_DOUBLE> x_lat(columns[1]);
     ColumnViewer<TYPE_DOUBLE> y_lng(columns[2]);
     ColumnViewer<TYPE_DOUBLE> y_lat(columns[3]);
-    ColumnBuilder<TYPE_DOUBLE> result;
 
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_DOUBLE> result(size);
     for (int row = 0; row < size; ++row) {
         if (x_lng.is_null(row) || x_lat.is_null(row) || y_lng.is_null(row) || y_lat.is_null(row)) {
             result.append_null();
@@ -265,9 +263,9 @@ ColumnPtr GeoFunctions::st_distance_sphere(FunctionContext* context, const Colum
 
 ColumnPtr GeoFunctions::st_as_wkt(FunctionContext* context, const Columns& columns) {
     ColumnViewer<TYPE_VARCHAR> shape_viewer(columns[0]);
-    ColumnBuilder<TYPE_VARCHAR> result;
 
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
     for (int row = 0; row < size; ++row) {
         if (shape_viewer.is_null(row)) {
             result.append_null();
@@ -289,12 +287,12 @@ ColumnPtr GeoFunctions::st_as_wkt(FunctionContext* context, const Columns& colum
 }
 
 struct StContainsState {
-    StContainsState() : is_null(false), shapes{nullptr, nullptr} {}
+    StContainsState() : shapes{nullptr, nullptr} {}
     ~StContainsState() {
         delete shapes[0];
         delete shapes[1];
     }
-    bool is_null;
+    bool is_null{false};
     GeoShape* shapes[2];
 };
 
@@ -320,7 +318,7 @@ Status GeoFunctions::st_contains_prepare(FunctionContext* ctx, FunctionContext::
     for (int i = 0; !contains_ctx->is_null && i < 2; ++i) {
         if (ctx->is_constant_column(i)) {
             auto str_column = ctx->get_constant_column(i);
-            if (str_column->only_null() || str_column->is_null(0)) {
+            if (str_column->only_null()) {
                 contains_ctx->is_null = true;
             } else {
                 auto str_value = ColumnHelper::get_const_value<TYPE_VARCHAR>(str_column);
@@ -339,7 +337,6 @@ Status GeoFunctions::st_contains_prepare(FunctionContext* ctx, FunctionContext::
 ColumnPtr GeoFunctions::st_contains(FunctionContext* context, const Columns& columns) {
     ColumnViewer<TYPE_VARCHAR> lhs_viewer(columns[0]);
     ColumnViewer<TYPE_VARCHAR> rhs_viewer(columns[1]);
-    ColumnBuilder<TYPE_BOOLEAN> result;
 
     const StContainsState* state =
             reinterpret_cast<StContainsState*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
@@ -348,6 +345,7 @@ ColumnPtr GeoFunctions::st_contains(FunctionContext* context, const Columns& col
     }
 
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_BOOLEAN> result(size);
     for (int row = 0; row < size; ++row) {
         if (lhs_viewer.is_null(row) || rhs_viewer.is_null(row)) {
             result.append_null();
@@ -394,7 +392,7 @@ Status GeoFunctions::st_from_wkt_prepare_common(FunctionContext* ctx, FunctionCo
 
     auto state = new StConstructState();
     auto str_column = ctx->get_constant_column(0);
-    if (str_column->only_null() || str_column->is_null(0)) {
+    if (str_column->only_null()) {
         state->is_null = true;
     } else {
         auto str_value = ColumnHelper::get_const_value<TYPE_VARCHAR>(str_column);
@@ -423,5 +421,4 @@ Status GeoFunctions::st_polygon_prepare(FunctionContext* ctx, FunctionContext::F
     return st_from_wkt_prepare_common(ctx, scope, GEO_SHAPE_POLYGON);
 }
 
-} // namespace vectorized
-} // namespace starrocks
+} // namespace starrocks::vectorized

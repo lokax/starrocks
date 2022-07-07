@@ -1,17 +1,18 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "storage/update_manager.h"
 
 #include <limits>
+#include <memory>
+#include <numeric>
 
 #include "gutil/endian.h"
+#include "storage/chunk_helper.h"
 #include "storage/del_vector.h"
-#include "storage/olap_meta.h"
+#include "storage/kv_store.h"
 #include "storage/rowset_update_state.h"
 #include "storage/tablet.h"
 #include "storage/tablet_meta_manager.h"
-#include "storage/vectorized/chunk_helper.h"
-#include "util/coding.h"
 #include "util/pretty_printer.h"
 #include "util/starrocks_metrics.h"
 #include "util/time.h"
@@ -21,16 +22,22 @@ namespace starrocks {
 UpdateManager::UpdateManager(MemTracker* mem_tracker)
         : _index_cache(std::numeric_limits<size_t>::max()), _update_state_cache(std::numeric_limits<size_t>::max()) {
     _update_mem_tracker = mem_tracker;
-    _update_state_mem_tracker.reset(new MemTracker(-1, "rowset_update_state", mem_tracker));
-    _index_cache_mem_tracker.reset(new MemTracker(-1, "index_cache", mem_tracker));
-    _del_vec_cache_mem_tracker.reset(new MemTracker(-1, "del_vec_cache", mem_tracker));
-    _compaction_state_mem_tracker.reset(new MemTracker(-1, "compaction_state", mem_tracker));
+    _update_state_mem_tracker = std::make_unique<MemTracker>(-1, "rowset_update_state", mem_tracker);
+    _index_cache_mem_tracker = std::make_unique<MemTracker>(-1, "index_cache", mem_tracker);
+    _del_vec_cache_mem_tracker = std::make_unique<MemTracker>(-1, "del_vec_cache", mem_tracker);
+    _compaction_state_mem_tracker = std::make_unique<MemTracker>(-1, "compaction_state", mem_tracker);
 
     _index_cache.set_mem_tracker(_index_cache_mem_tracker.get());
     _update_state_cache.set_mem_tracker(_update_state_mem_tracker.get());
 }
 
 UpdateManager::~UpdateManager() {
+    if (_apply_thread_pool != nullptr) {
+        // DynamicCache may be still used by apply thread.
+        // Before deconstrut the DynamicCache, apply thread
+        // should be shutdown.
+        _apply_thread_pool->shutdown();
+    }
     clear_cache();
     if (_compaction_state_mem_tracker) {
         _compaction_state_mem_tracker.reset();
@@ -47,21 +54,21 @@ UpdateManager::~UpdateManager() {
 }
 
 Status UpdateManager::init() {
-    auto st = ThreadPoolBuilder("UpdateApplyThreadPool").build(&_apply_thread_pool);
+    auto st = ThreadPoolBuilder("update_apply").build(&_apply_thread_pool);
     return st;
 }
 
-Status UpdateManager::get_del_vec_in_meta(OlapMeta* meta, const TabletSegmentId& tsid, int64_t version,
+Status UpdateManager::get_del_vec_in_meta(KVStore* meta, const TabletSegmentId& tsid, int64_t version,
                                           DelVector* delvec, int64_t* latest_version) {
     return TabletMetaManager::get_del_vector(meta, tsid.tablet_id, tsid.segment_id, version, delvec, latest_version);
 }
 
-Status UpdateManager::set_del_vec_in_meta(OlapMeta* meta, const TabletSegmentId& tsid, const DelVector& delvec) {
+Status UpdateManager::set_del_vec_in_meta(KVStore* meta, const TabletSegmentId& tsid, const DelVector& delvec) {
     // TODO: support batch transaction with tablet/rowset meta save
     return TabletMetaManager::set_del_vector(meta, tsid.tablet_id, tsid.segment_id, delvec);
 }
 
-Status UpdateManager::get_del_vec(OlapMeta* meta, const TabletSegmentId& tsid, int64_t version, DelVectorPtr* pdelvec) {
+Status UpdateManager::get_del_vec(KVStore* meta, const TabletSegmentId& tsid, int64_t version, DelVectorPtr* pdelvec) {
     {
         std::lock_guard<std::mutex> lg(_del_vec_cache_lock);
         auto itr = _del_vec_cache.find(tsid);
@@ -164,7 +171,41 @@ string UpdateManager::memory_stats() {
                       PrettyPrinter::print_bytes(_update_mem_tracker->limit()));
 }
 
-Status UpdateManager::get_latest_del_vec(OlapMeta* meta, const TabletSegmentId& tsid, DelVectorPtr* pdelvec) {
+string UpdateManager::detail_memory_stats() {
+    auto primary_index_stats = _index_cache.get_entry_sizes();
+    std::sort(primary_index_stats.begin(), primary_index_stats.end(),
+              [](const std::pair<uint64_t, size_t>& lhs, const std::pair<uint64_t, size_t>& rhs) {
+                  return lhs.second > rhs.second;
+              });
+    size_t total_memory = 0;
+    for (const auto& e : primary_index_stats) {
+        total_memory += e.second;
+    }
+    string ret;
+    StringAppendF(&ret, "primary index stats: total:%zu memory:%zu\n  tabletid       memory\n",
+                  primary_index_stats.size(), total_memory);
+    for (size_t i = 0; i < std::min(primary_index_stats.size(), (size_t)200); i++) {
+        auto& e = primary_index_stats[i];
+        StringAppendF(&ret, "%10lu %12zu\n", (unsigned long)e.first, e.second);
+    }
+    return ret;
+}
+
+string UpdateManager::topn_memory_stats(size_t topn) {
+    auto primary_index_stats = _index_cache.get_entry_sizes();
+    std::sort(primary_index_stats.begin(), primary_index_stats.end(),
+              [](const std::pair<uint64_t, size_t>& lhs, const std::pair<uint64_t, size_t>& rhs) {
+                  return lhs.second > rhs.second;
+              });
+    string ret;
+    for (size_t i = 0; i < std::min(primary_index_stats.size(), topn); i++) {
+        auto& e = primary_index_stats[i];
+        StringAppendF(&ret, "%lu(%zuM)", (unsigned long)e.first, e.second / (1024 * 1024));
+    }
+    return ret;
+}
+
+Status UpdateManager::get_latest_del_vec(KVStore* meta, const TabletSegmentId& tsid, DelVectorPtr* pdelvec) {
     std::lock_guard<std::mutex> lg(_del_vec_cache_lock);
     auto itr = _del_vec_cache.find(tsid);
     if (itr != _del_vec_cache.end()) {
@@ -181,7 +222,7 @@ Status UpdateManager::get_latest_del_vec(OlapMeta* meta, const TabletSegmentId& 
     return Status::OK();
 }
 
-Status UpdateManager::set_cached_del_vec(const TabletSegmentId& tsid, DelVectorPtr delvec) {
+Status UpdateManager::set_cached_del_vec(const TabletSegmentId& tsid, const DelVectorPtr& delvec) {
     VLOG(1) << "set_cached_del_vec tablet:" << tsid.tablet_id << " rss:" << tsid.segment_id
             << " version:" << delvec->version() << " #del:" << delvec->cardinality();
     std::lock_guard<std::mutex> lg(_del_vec_cache_lock);
@@ -205,6 +246,10 @@ Status UpdateManager::set_cached_del_vec(const TabletSegmentId& tsid, DelVectorP
 }
 
 Status UpdateManager::on_rowset_finished(Tablet* tablet, Rowset* rowset) {
+    if (!rowset->has_data_files() || tablet->tablet_state() == TABLET_NOTREADY) {
+        // if rowset is empty or tablet is in schemachange, we can skip preparing updatestates and pre-loading primary index
+        return Status::OK();
+    }
     string rowset_unique_id = rowset->rowset_id().to_string();
     VLOG(1) << "UpdateManager::on_rowset_finished start tablet:" << tablet->tablet_id()
             << " rowset:" << rowset_unique_id;
@@ -213,12 +258,13 @@ Status UpdateManager::on_rowset_finished(Tablet* tablet, Rowset* rowset) {
     // before used in apply process, in that case, these will be loaded again in apply
     // process.
     auto state_entry = _update_state_cache.get_or_create(Substitute("$0_$1", tablet->tablet_id(), rowset_unique_id));
-    auto st = state_entry->value().load(tablet->tablet_id(), rowset);
+    auto st = state_entry->value().load(tablet, rowset);
     state_entry->update_expire_time(MonotonicMillis() + _cache_expire_ms);
     _update_state_cache.update_object_size(state_entry, state_entry->value().memory_usage());
     if (st.ok()) {
         _update_state_cache.release(state_entry);
     } else {
+        LOG(WARNING) << "load RowsetUpdateState error: " << st << " tablet: " << tablet->tablet_id();
         _update_state_cache.remove(state_entry);
     }
     if (st.ok()) {
@@ -229,12 +275,23 @@ Status UpdateManager::on_rowset_finished(Tablet* tablet, Rowset* rowset) {
         if (st.ok()) {
             _index_cache.release(index_entry);
         } else {
+            LOG(WARNING) << "load primary index error: " << st << " tablet: " << tablet->tablet_id();
             _index_cache.remove(index_entry);
         }
     }
     VLOG(1) << "UpdateManager::on_rowset_finished finish tablet:" << tablet->tablet_id()
             << " rowset:" << rowset_unique_id;
     return st;
+}
+
+void UpdateManager::on_rowset_cancel(Tablet* tablet, Rowset* rowset) {
+    string rowset_unique_id = rowset->rowset_id().to_string();
+    VLOG(1) << "UpdateManager::on_rowset_error remove state tablet:" << tablet->tablet_id()
+            << " rowset:" << rowset_unique_id;
+    auto state_entry = _update_state_cache.get(Substitute("$0_$1", tablet->tablet_id(), rowset_unique_id));
+    if (state_entry != nullptr) {
+        _update_state_cache.remove(state_entry);
+    }
 }
 
 } // namespace starrocks

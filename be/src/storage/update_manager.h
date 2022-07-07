@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -16,15 +16,10 @@ using std::string;
 
 class DelVector;
 using DelVectorPtr = std::shared_ptr<DelVector>;
-class EditVersion;
 class MemTracker;
-class OlapMeta;
-class Rowset;
-using RowsetSharedPtr = std::shared_ptr<Rowset>;
+class KVStore;
 class RowsetUpdateState;
-using TabletSharedPtr = std::shared_ptr<Tablet>;
 class Tablet;
-class TabletMeta;
 
 // UpdateManager maintain update feature related data structures, including
 // PrimaryIndexe cache, RowsetUpdateState cache, DelVector cache and
@@ -40,18 +35,20 @@ public:
 
     int64_t get_cache_expire_ms() const { return _cache_expire_ms; }
 
-    Status get_del_vec_in_meta(OlapMeta* meta, const TabletSegmentId& tsid, int64_t version, DelVector* delvec,
+    Status get_del_vec_in_meta(KVStore* meta, const TabletSegmentId& tsid, int64_t version, DelVector* delvec,
                                int64_t* latest_version);
 
-    Status set_del_vec_in_meta(OlapMeta* meta, const TabletSegmentId& tsid, const DelVector& delvec);
+    Status set_del_vec_in_meta(KVStore* meta, const TabletSegmentId& tsid, const DelVector& delvec);
 
-    Status get_del_vec(OlapMeta* meta, const TabletSegmentId& tsid, int64_t version, DelVectorPtr* pdelvec);
+    Status get_del_vec(KVStore* meta, const TabletSegmentId& tsid, int64_t version, DelVectorPtr* pdelvec);
 
-    Status get_latest_del_vec(OlapMeta* meta, const TabletSegmentId& tsid, DelVectorPtr* pdelvec);
+    Status get_latest_del_vec(KVStore* meta, const TabletSegmentId& tsid, DelVectorPtr* pdelvec);
 
-    Status set_cached_del_vec(const TabletSegmentId& tsid, DelVectorPtr delvec);
+    Status set_cached_del_vec(const TabletSegmentId& tsid, const DelVectorPtr& delvec);
 
     Status on_rowset_finished(Tablet* tablet, Rowset* rowset);
+
+    void on_rowset_cancel(Tablet* tablet, Rowset* rowset);
 
     ThreadPool* apply_thread_pool() { return _apply_thread_pool.get(); }
 
@@ -70,6 +67,10 @@ public:
     MemTracker* mem_tracker() const { return _update_mem_tracker; }
 
     string memory_stats();
+
+    string detail_memory_stats();
+
+    string topn_memory_stats(size_t topn);
 
 private:
     // default 6min
@@ -94,7 +95,8 @@ private:
 
     std::unique_ptr<ThreadPool> _apply_thread_pool;
 
-    DISALLOW_COPY_AND_ASSIGN(UpdateManager);
+    UpdateManager(const UpdateManager&) = delete;
+    const UpdateManager& operator=(const UpdateManager&) = delete;
 };
 
 } // namespace starrocks

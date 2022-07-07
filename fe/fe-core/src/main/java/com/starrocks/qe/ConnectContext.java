@@ -22,94 +22,108 @@
 package com.starrocks.qe;
 
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 import com.starrocks.analysis.UserIdentity;
-import com.starrocks.catalog.Catalog;
+import com.starrocks.catalog.InternalCatalog;
+import com.starrocks.catalog.WorkGroup;
 import com.starrocks.cluster.ClusterNamespace;
+import com.starrocks.common.util.TimeUtils;
 import com.starrocks.mysql.MysqlCapability;
 import com.starrocks.mysql.MysqlChannel;
 import com.starrocks.mysql.MysqlCommand;
 import com.starrocks.mysql.MysqlSerializer;
 import com.starrocks.plugin.AuditEvent.AuditEventBuilder;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.PlannerProfile;
 import com.starrocks.sql.optimizer.dump.DumpInfo;
 import com.starrocks.sql.optimizer.dump.QueryDumpInfo;
-import com.starrocks.thrift.TResourceInfo;
 import com.starrocks.thrift.TUniqueId;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.nio.channels.SocketChannel;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 // When one client connect in, we create a connect context for it.
 // We store session information here. Meanwhile ConnectScheduler all
 // connect with its connection id.
-// Use `volatile` to make the reference change atomic.
 public class ConnectContext {
     private static final Logger LOG = LogManager.getLogger(ConnectContext.class);
-    protected static ThreadLocal<ConnectContext> threadLocalInfo = new ThreadLocal<ConnectContext>();
+    protected static ThreadLocal<ConnectContext> threadLocalInfo = new ThreadLocal<>();
 
     // set this id before analyze
-    protected volatile long stmtId;
-    protected volatile long forwardedStmtId;
+    protected long stmtId;
+    protected long forwardedStmtId;
 
     // The queryId of the last query processed by this session.
     // In some scenarios, the user can get the output of a request by queryId,
     // such as Insert, export requests
-    protected volatile UUID lastQueryId;
+    protected UUID lastQueryId;
 
     // The queryId is used to track a user's request. A user request will only have one queryId
     // in the entire StarRocks system. in some scenarios, a user request may be forwarded to multiple
     // nodes for processing or be processed repeatedly, but each execution instance will have
     // the same queryId
-    protected volatile UUID queryId;
+    protected UUID queryId;
 
     // A request will be executed multiple times because of retry or redirect.
     // This id is used to distinguish between different execution instances
-    protected volatile TUniqueId executionId;
+    protected TUniqueId executionId;
 
     // id for this connection
-    protected volatile int connectionId;
+    protected int connectionId;
+    // Time when the connection is make
+    protected long connectionStartTime;
+
     // mysql net
-    protected volatile MysqlChannel mysqlChannel;
+    protected MysqlChannel mysqlChannel;
     // state
-    protected volatile QueryState state;
-    protected volatile long returnRows;
+    protected QueryState state;
+    protected long returnRows;
+
+    // error code
+    protected String errorCode = "";
+
     // the protocol capability which server say it can support
-    protected volatile MysqlCapability serverCapability;
+    protected MysqlCapability serverCapability;
     // the protocol capability after server and client negotiate
-    protected volatile MysqlCapability capability;
+    protected MysqlCapability capability;
     // Indicate if this client is killed.
-    protected volatile boolean isKilled;
+    protected boolean isKilled;
+    // catalog
+    protected volatile String currentCatalog = InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME;
     // Db
-    protected volatile String currentDb = "";
+    protected String currentDb = "";
+
     // cluster name
-    protected volatile String clusterName = "";
+    protected String clusterName = "";
     // username@host of current login user
-    protected volatile String qualifiedUser;
+    protected String qualifiedUser;
     // username@host combination for the StarRocks account
     // that the server used to authenticate the current client.
     // In other word, currentUserIdentity is the entry that matched in StarRocks auth table.
     // This account determines user's access privileges.
-    protected volatile UserIdentity currentUserIdentity;
+    protected UserIdentity currentUserIdentity;
     // Serializer used to pack MySQL packet.
-    protected volatile MysqlSerializer serializer;
+    protected MysqlSerializer serializer;
     // Variables belong to this session.
-    protected volatile SessionVariable sessionVariable;
+    protected SessionVariable sessionVariable;
     // Scheduler this connection belongs to
-    protected volatile ConnectScheduler connectScheduler;
+    protected ConnectScheduler connectScheduler;
     // Executor
-    protected volatile StmtExecutor executor;
+    protected StmtExecutor executor;
     // Command this connection is processing.
-    protected volatile MysqlCommand command;
+    protected MysqlCommand command;
     // Timestamp in millisecond last command starts at
-    protected volatile long startTime;
+    protected long startTime = System.currentTimeMillis();
     // Cache thread info for this connection.
-    protected volatile ThreadInfo threadInfo;
+    protected ThreadInfo threadInfo;
 
-    // Catalog: put catalog here is convenient for unit test,
-    // because catalog is singleton, hard to mock
-    protected Catalog catalog;
+    // GlobalStateMgr: put globalStateMgr here is convenient for unit test,
+    // because globalStateMgr is singleton, hard to mock
+    protected GlobalStateMgr globalStateMgr;
     protected boolean isSend;
 
     protected AuditEventBuilder auditEventBuilder = new AuditEventBuilder();
@@ -131,16 +145,19 @@ public class ConnectContext {
 
     protected DumpInfo dumpInfo;
 
+    // The related db ids for current sql
+    protected Set<Long> currentSqlDbIds = Sets.newHashSet();
+
+    protected PlannerProfile plannerProfile;
+
+    protected WorkGroup workGroup;
+
     public static ConnectContext get() {
         return threadLocalInfo.get();
     }
 
     public static void remove() {
         threadLocalInfo.remove();
-    }
-
-    public void setIsSend(boolean isSend) {
-        this.isSend = isSend;
     }
 
     public boolean isSend() {
@@ -156,6 +173,8 @@ public class ConnectContext {
         sessionVariable = VariableMgr.newSessionVariable();
         command = MysqlCommand.COM_SLEEP;
         dumpInfo = new QueryDumpInfo(sessionVariable);
+        plannerProfile = new PlannerProfile();
+        plannerProfile.init(this);
     }
 
     public ConnectContext(SocketChannel channel) {
@@ -172,6 +191,8 @@ public class ConnectContext {
         }
         queryDetail = null;
         dumpInfo = new QueryDumpInfo(sessionVariable);
+        plannerProfile = new PlannerProfile();
+        plannerProfile.init(this);
     }
 
     public long getStmtId() {
@@ -214,16 +235,12 @@ public class ConnectContext {
         threadLocalInfo.set(this);
     }
 
-    public TResourceInfo toResourceCtx() {
-        return new TResourceInfo(qualifiedUser, sessionVariable.getResourceGroup());
+    public void setGlobalStateMgr(GlobalStateMgr globalStateMgr) {
+        this.globalStateMgr = globalStateMgr;
     }
 
-    public void setCatalog(Catalog catalog) {
-        this.catalog = catalog;
-    }
-
-    public Catalog getCatalog() {
-        return catalog;
+    public GlobalStateMgr getGlobalStateMgr() {
+        return globalStateMgr;
     }
 
     public String getQualifiedUser() {
@@ -252,10 +269,7 @@ public class ConnectContext {
     }
 
     public void resetSessionVariable() {
-        // user resource group shouldn't be reset
-        String resourceGroup = this.sessionVariable.getResourceGroup();
         this.sessionVariable = VariableMgr.newSessionVariable();
-        this.sessionVariable.setResourceGroup(resourceGroup);
     }
 
     public void setSessionVariable(SessionVariable sessionVariable) {
@@ -311,6 +325,14 @@ public class ConnectContext {
         this.connectionId = connectionId;
     }
 
+    public void resetConnectionStartTime() {
+        this.connectionStartTime = System.currentTimeMillis();
+    }
+
+    public long getConnectionStartTime() {
+        return connectionStartTime;
+    }
+
     public MysqlChannel getMysqlChannel() {
         return mysqlChannel;
     }
@@ -321,6 +343,20 @@ public class ConnectContext {
 
     public void setState(QueryState state) {
         this.state = state;
+    }
+
+    public String getErrorCode() {
+        return errorCode;
+    }
+
+    public void setErrorCode(String errorCode) {
+        this.errorCode = errorCode;
+    }
+
+    public void setErrorCodeOnce(String errorCode) {
+        if (this.errorCode == null || this.errorCode.isEmpty()) {
+            this.errorCode = errorCode;
+        }
     }
 
     public MysqlCapability getCapability() {
@@ -426,6 +462,34 @@ public class ConnectContext {
         this.dumpInfo = dumpInfo;
     }
 
+    public Set<Long> getCurrentSqlDbIds() {
+        return currentSqlDbIds;
+    }
+
+    public void setCurrentSqlDbIds(Set<Long> currentSqlDbIds) {
+        this.currentSqlDbIds = currentSqlDbIds;
+    }
+
+    public PlannerProfile getPlannerProfile() {
+        return plannerProfile;
+    }
+
+    public WorkGroup getWorkGroup() {
+        return workGroup;
+    }
+
+    public void setWorkGroup(WorkGroup workGroup) {
+        this.workGroup = workGroup;
+    }
+
+    public String getCurrentCatalog() {
+        return currentCatalog;
+    }
+
+    public void setCurrentCatalog(String currentCatalog) {
+        this.currentCatalog = currentCatalog;
+    }
+
     // kill operation with no protect.
     public void kill(boolean killConnection) {
         LOG.warn("kill timeout query, {}, kill connection: {}",
@@ -492,6 +556,8 @@ public class ConnectContext {
             row.add(ClusterNamespace.getNameFromFullName(currentDb));
             // Command
             row.add(command.toString());
+            // connection start Time
+            row.add(TimeUtils.longToTimeString(connectionStartTime));
             // Time
             row.add("" + (nowMs - startTime) / 1000);
             // State

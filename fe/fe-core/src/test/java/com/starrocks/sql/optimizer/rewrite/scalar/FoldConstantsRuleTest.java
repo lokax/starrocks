@@ -1,9 +1,12 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.rewrite.scalar;
 
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.FunctionName;
 import com.starrocks.catalog.Function;
+import com.starrocks.catalog.FunctionSet;
+import com.starrocks.catalog.PrimitiveType;
+import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.Type;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
@@ -18,6 +21,7 @@ import com.starrocks.sql.optimizer.rewrite.ScalarOperatorRewriteContext;
 import mockit.Expectations;
 import org.junit.Test;
 
+import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
 import static org.junit.Assert.assertEquals;
@@ -32,13 +36,14 @@ public class FoldConstantsRuleTest {
     @Test
     public void applyCall() {
 
-        CallOperator root = new CallOperator("concat", Type.VARCHAR, Lists.newArrayList(
+        CallOperator root = new CallOperator(FunctionSet.CONCAT, Type.VARCHAR, Lists.newArrayList(
                 ConstantOperator.createVarchar("1"),
                 ConstantOperator.createVarchar("2"),
                 ConstantOperator.createVarchar("3")
         ));
 
-        Function fn = new Function(new FunctionName("concat"), new Type[] {Type.VARCHAR}, Type.VARCHAR, false);
+        Function fn =
+                new Function(new FunctionName(FunctionSet.CONCAT), new Type[] {Type.VARCHAR}, Type.VARCHAR, false);
 
         new Expectations(root) {
             {
@@ -128,6 +133,12 @@ public class FoldConstantsRuleTest {
 
         CastOperator cast6 = new CastOperator(Type.BIGINT, ConstantOperator.createDate(LocalDateTime.now()));
         assertEquals(cast6, rule.apply(cast6, null));
+
+        CastOperator cast7 = new CastOperator(ScalarType.createDecimalV3Type(PrimitiveType.DECIMAL64, 1, 1)
+                , ConstantOperator.createDecimal(BigDecimal.valueOf(0.00008),
+                ScalarType.createDecimalV3Type(PrimitiveType.DECIMAL64, 6, 6))
+        );
+        assertEquals("0.0", rule.apply(cast7, null).toString());
     }
 
     @Test

@@ -24,20 +24,19 @@ package com.starrocks.http;
 import com.google.common.collect.Lists;
 import com.starrocks.alter.MaterializedViewHandler;
 import com.starrocks.alter.SchemaChangeHandler;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.DataProperty;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.EsTable;
+import com.starrocks.catalog.HashDistributionInfo;
 import com.starrocks.catalog.KeysType;
+import com.starrocks.catalog.LocalTablet;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.PartitionInfo;
-import com.starrocks.catalog.RandomDistributionInfo;
 import com.starrocks.catalog.Replica;
 import com.starrocks.catalog.SinglePartitionInfo;
-import com.starrocks.catalog.Tablet;
 import com.starrocks.catalog.TabletInvertedIndex;
 import com.starrocks.catalog.TabletMeta;
 import com.starrocks.catalog.Type;
@@ -49,6 +48,7 @@ import com.starrocks.load.Load;
 import com.starrocks.mysql.privilege.Auth;
 import com.starrocks.persist.EditLog;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.thrift.TStorageMedium;
@@ -102,10 +102,7 @@ abstract public class StarRocksHttpTestCase {
     private static long tabletId = 400L;
 
     public static long testStartVersion = 12;
-    public static long testStartVersionHash = 12312;
     public static int testSchemaHash = 93423942;
-    public static long testPartitionCurrentVersionHash = 12312;
-    public static long testPartitionNextVersionHash = 123123123;
 
     public static int HTTP_PORT;
 
@@ -117,7 +114,7 @@ abstract public class StarRocksHttpTestCase {
     private static EditLog editLog;
 
     public static OlapTable newTable(String name) {
-        Catalog.getCurrentInvertedIndex().clear();
+        GlobalStateMgr.getCurrentInvertedIndex().clear();
         Column k1 = new Column("k1", Type.BIGINT);
         Column k2 = new Column("k2", Type.DOUBLE);
         List<Column> columns = new ArrayList<>();
@@ -125,20 +122,20 @@ abstract public class StarRocksHttpTestCase {
         columns.add(k2);
 
         Replica replica1 =
-                new Replica(testReplicaId1, testBackendId1, testStartVersion, testStartVersionHash, testSchemaHash,
+                new Replica(testReplicaId1, testBackendId1, testStartVersion, testSchemaHash,
                         1024000L, 2000L,
-                        Replica.ReplicaState.NORMAL, -1, 0, 0, 0);
+                        Replica.ReplicaState.NORMAL, -1, 0);
         Replica replica2 =
-                new Replica(testReplicaId2, testBackendId2, testStartVersion, testStartVersionHash, testSchemaHash,
+                new Replica(testReplicaId2, testBackendId2, testStartVersion, testSchemaHash,
                         1024000L, 2000L,
-                        Replica.ReplicaState.NORMAL, -1, 0, 0, 0);
+                        Replica.ReplicaState.NORMAL, -1, 0);
         Replica replica3 =
-                new Replica(testReplicaId3, testBackendId3, testStartVersion, testStartVersionHash, testSchemaHash,
+                new Replica(testReplicaId3, testBackendId3, testStartVersion, testSchemaHash,
                         1024000L, 2000L,
-                        Replica.ReplicaState.NORMAL, -1, 0, 0, 0);
+                        Replica.ReplicaState.NORMAL, -1, 0);
 
         // tablet
-        Tablet tablet = new Tablet(tabletId);
+        LocalTablet tablet = new LocalTablet(tabletId);
 
         // index
         MaterializedIndex baseIndex = new MaterializedIndex(testIndexId, MaterializedIndex.IndexState.NORMAL);
@@ -151,11 +148,10 @@ abstract public class StarRocksHttpTestCase {
         tablet.addReplica(replica3);
 
         // partition
-        RandomDistributionInfo distributionInfo = new RandomDistributionInfo(2);
+        HashDistributionInfo distributionInfo = new HashDistributionInfo(10, Lists.newArrayList(k1));
         Partition partition = new Partition(testPartitionId, "testPartition", baseIndex, distributionInfo);
-        partition.updateVisibleVersionAndVersionHash(testStartVersion, testStartVersionHash);
+        partition.updateVisibleVersion(testStartVersion);
         partition.setNextVersion(testStartVersion + 1);
-        partition.setNextVersionHash(testPartitionNextVersionHash, testPartitionCurrentVersionHash);
 
         // table
         PartitionInfo partitionInfo = new SinglePartitionInfo();
@@ -164,8 +160,8 @@ abstract public class StarRocksHttpTestCase {
         OlapTable table = new OlapTable(testTableId, name, columns, KeysType.AGG_KEYS, partitionInfo,
                 distributionInfo);
         table.addPartition(partition);
-        table.setIndexMeta(testIndexId, "testIndex", columns, 0, testSchemaHash, (short) 1, TStorageType.COLUMN,
-                KeysType.AGG_KEYS);
+        table.setIndexMeta(testIndexId, "testIndex", columns, 0, testSchemaHash, (short) 1,
+                TStorageType.COLUMN, KeysType.AGG_KEYS);
         table.setBaseIndexId(testIndexId);
         return table;
     }
@@ -194,11 +190,11 @@ abstract public class StarRocksHttpTestCase {
         return table;
     }
 
-    private static Catalog newDelegateCatalog() {
+    private static GlobalStateMgr newDelegateCatalog() {
         try {
-            Catalog catalog = Deencapsulation.newInstance(Catalog.class);
+            GlobalStateMgr globalStateMgr = Deencapsulation.newInstance(GlobalStateMgr.class);
             Auth auth = new Auth();
-            //EasyMock.expect(catalog.getAuth()).andReturn(starrocksAuth).anyTimes();
+            //EasyMock.expect(globalStateMgr.getAuth()).andReturn(starrocksAuth).anyTimes();
             Database db = new Database(testDbId, "default_cluster:testDb");
             OlapTable table = newTable(TABLE_NAME);
             db.createTable(table);
@@ -206,63 +202,132 @@ abstract public class StarRocksHttpTestCase {
             db.createTable(table1);
             EsTable esTable = newEsTable("es_table");
             db.createTable(esTable);
-            new Expectations(catalog) {
+            new Expectations(globalStateMgr) {
                 {
-                    catalog.getAuth();
+                    globalStateMgr.getAuth();
                     minTimes = 0;
                     result = auth;
 
-                    catalog.getDb(db.getId());
+                    globalStateMgr.getDb(db.getId());
                     minTimes = 0;
                     result = db;
 
-                    catalog.getDb("default_cluster:" + DB_NAME);
+                    globalStateMgr.getDb("default_cluster:" + DB_NAME);
                     minTimes = 0;
                     result = db;
 
-                    catalog.isMaster();
+                    globalStateMgr.isMaster();
                     minTimes = 0;
                     result = true;
 
-                    catalog.getDb("default_cluster:emptyDb");
+                    globalStateMgr.getDb("default_cluster:emptyDb");
                     minTimes = 0;
                     result = null;
 
-                    catalog.getDb(anyString);
+                    globalStateMgr.getDb(anyString);
                     minTimes = 0;
                     result = new Database();
 
-                    catalog.getDbNames();
+                    globalStateMgr.getDbNames();
                     minTimes = 0;
                     result = Lists.newArrayList("default_cluster:testDb");
 
-                    catalog.getLoadInstance();
+                    globalStateMgr.getLoadInstance();
                     minTimes = 0;
                     result = new Load();
 
-                    catalog.getEditLog();
+                    globalStateMgr.getEditLog();
                     minTimes = 0;
                     result = editLog;
 
-                    catalog.getClusterDbNames("default_cluster");
-                    minTimes = 0;
-                    result = Lists.newArrayList("default_cluster:testDb");
-
-                    catalog.changeDb((ConnectContext) any, "blockDb");
+                    globalStateMgr.changeCatalogDb((ConnectContext) any, "blockDb");
                     minTimes = 0;
 
-                    catalog.changeDb((ConnectContext) any, anyString);
+                    globalStateMgr.changeCatalogDb((ConnectContext) any, anyString);
                     minTimes = 0;
 
-                    catalog.initDefaultCluster();
+                    globalStateMgr.initDefaultCluster();
                     minTimes = 0;
                 }
             };
 
-            return catalog;
+            return globalStateMgr;
         } catch (DdlException e) {
             return null;
-        } catch (AnalysisException e) {
+        }
+    }
+
+    private static GlobalStateMgr newDelegateGlobalStateMgr() {
+        try {
+            GlobalStateMgr globalStateMgr = Deencapsulation.newInstance(GlobalStateMgr.class);
+            Auth auth = new Auth();
+            //EasyMock.expect(globalStateMgr.getAuth()).andReturn(starrocksAuth).anyTimes();
+            Database db = new Database(testDbId, "default_cluster:testDb");
+            OlapTable table = newTable(TABLE_NAME);
+            db.createTable(table);
+            OlapTable table1 = newTable(TABLE_NAME + 1);
+            db.createTable(table1);
+            EsTable esTable = newEsTable("es_table");
+            db.createTable(esTable);
+            new Expectations(globalStateMgr) {
+                {
+                    globalStateMgr.getAuth();
+                    minTimes = 0;
+                    result = auth;
+
+                    globalStateMgr.getDb(db.getId());
+                    minTimes = 0;
+                    result = db;
+
+                    globalStateMgr.getDb("default_cluster:" + DB_NAME);
+                    minTimes = 0;
+                    result = db;
+
+                    globalStateMgr.isMaster();
+                    minTimes = 0;
+                    result = true;
+
+                    globalStateMgr.getDb("default_cluster:emptyDb");
+                    minTimes = 0;
+                    result = null;
+
+                    globalStateMgr.getDb(anyString);
+                    minTimes = 0;
+                    result = new Database();
+
+                    globalStateMgr.getDbNames();
+                    minTimes = 0;
+                    result = Lists.newArrayList("default_cluster:testDb");
+
+                    globalStateMgr.getLoadInstance();
+                    minTimes = 0;
+                    result = new Load();
+
+                    globalStateMgr.getEditLog();
+                    minTimes = 0;
+                    result = editLog;
+
+                    globalStateMgr.changeCatalogDb((ConnectContext) any, "blockDb");
+                    minTimes = 0;
+
+                    globalStateMgr.changeCatalogDb((ConnectContext) any, anyString);
+                    minTimes = 0;
+
+                    globalStateMgr.initDefaultCluster();
+                    minTimes = 0;
+
+                    globalStateMgr.getMetadataMgr().getDb("default_catalog", "default_cluster:testDb");
+                    minTimes = 0;
+                    result = db;
+
+                    globalStateMgr.getMetadataMgr().getTable("default_catalog", "default_cluster:testDb", "testTbl");
+                    minTimes = 0;
+                    result = table;
+                }
+            };
+
+            return globalStateMgr;
+        } catch (DdlException e) {
             return null;
         }
     }
@@ -274,9 +339,9 @@ abstract public class StarRocksHttpTestCase {
         backend2.setBePort(9300);
         Backend backend3 = new Backend(testBackendId3, "node-3", 9308);
         backend3.setBePort(9300);
-        Catalog.getCurrentSystemInfo().addBackend(backend1);
-        Catalog.getCurrentSystemInfo().addBackend(backend2);
-        Catalog.getCurrentSystemInfo().addBackend(backend3);
+        GlobalStateMgr.getCurrentSystemInfo().addBackend(backend1);
+        GlobalStateMgr.getCurrentSystemInfo().addBackend(backend2);
+        GlobalStateMgr.getCurrentSystemInfo().addBackend(backend3);
     }
 
     @BeforeClass
@@ -309,10 +374,10 @@ abstract public class StarRocksHttpTestCase {
 
     @Before
     public void setUp() {
-        Catalog catalog = newDelegateCatalog();
+        GlobalStateMgr globalStateMgr = newDelegateCatalog();
         SystemInfoService systemInfoService = new SystemInfoService();
         TabletInvertedIndex tabletInvertedIndex = new TabletInvertedIndex();
-        new MockUp<Catalog>() {
+        new MockUp<GlobalStateMgr>() {
             @Mock
             SchemaChangeHandler getSchemaChangeHandler() {
                 return new SchemaChangeHandler();
@@ -324,8 +389,42 @@ abstract public class StarRocksHttpTestCase {
             }
 
             @Mock
-            Catalog getCurrentCatalog() {
-                return catalog;
+            GlobalStateMgr getCurrentState() {
+                return globalStateMgr;
+            }
+
+            @Mock
+            SystemInfoService getCurrentSystemInfo() {
+                return systemInfoService;
+            }
+
+            @Mock
+            TabletInvertedIndex getCurrentInvertedIndex() {
+                return tabletInvertedIndex;
+            }
+        };
+        assignBackends();
+        doSetUp();
+    }
+
+    public void setUpWithCatalog() {
+        GlobalStateMgr globalStateMgr = newDelegateGlobalStateMgr();
+        SystemInfoService systemInfoService = new SystemInfoService();
+        TabletInvertedIndex tabletInvertedIndex = new TabletInvertedIndex();
+        new MockUp<GlobalStateMgr>() {
+            @Mock
+            SchemaChangeHandler getSchemaChangeHandler() {
+                return new SchemaChangeHandler();
+            }
+
+            @Mock
+            MaterializedViewHandler getRollupHandler() {
+                return new MaterializedViewHandler();
+            }
+
+            @Mock
+            GlobalStateMgr getCurrentState() {
+                return globalStateMgr;
             }
 
             @Mock

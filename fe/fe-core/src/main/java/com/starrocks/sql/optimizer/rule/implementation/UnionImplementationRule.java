@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.rule.implementation;
 
 import com.google.common.collect.Lists;
@@ -22,9 +22,13 @@ public class UnionImplementationRule extends ImplementationRule {
     @Override
     public List<OptExpression> transform(OptExpression input, OptimizerContext context) {
         LogicalUnionOperator union = (LogicalUnionOperator) input.getOp();
-        PhysicalUnionOperator physicalUnion =
-                new PhysicalUnionOperator(union.getOutputColumnRefOp(), union.getChildOutputColumns(), union.isUnionAll());
-        physicalUnion.setLimit(union.getLimit());
+        PhysicalUnionOperator physicalUnion = new PhysicalUnionOperator(
+                union.getOutputColumnRefOp(),
+                union.getChildOutputColumns(),
+                union.isUnionAll(),
+                union.getLimit(),
+                union.getPredicate(),
+                union.getProjection());
         return Lists.newArrayList(OptExpression.create(physicalUnion, input.getInputs()));
     }
 }

@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/util/url_coding.cpp
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -21,13 +17,10 @@
 
 #include "util/url_coding.h"
 
-#include <math.h>
-
+#include <cmath>
 #include <exception>
 #include <memory>
 #include <sstream>
-
-#include "common/logging.h"
 
 namespace starrocks {
 
@@ -160,7 +153,7 @@ static int mod_table[] = {0, 2, 1};
 size_t base64_encode(const unsigned char* data, size_t length, unsigned char* encoded_data) {
     size_t output_length = (size_t)(4.0 * ceil((double)length / 3.0));
 
-    if (encoded_data == NULL) {
+    if (encoded_data == nullptr) {
         return 0;
     }
 

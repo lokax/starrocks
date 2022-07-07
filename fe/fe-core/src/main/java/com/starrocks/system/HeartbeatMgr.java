@@ -24,16 +24,16 @@ package com.starrocks.system;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.FsBroker;
 import com.starrocks.common.ClientPool;
 import com.starrocks.common.Config;
-import com.starrocks.common.FeConstants;
 import com.starrocks.common.ThreadPoolManager;
+import com.starrocks.common.Version;
 import com.starrocks.common.util.MasterDaemon;
 import com.starrocks.common.util.Util;
 import com.starrocks.http.rest.BootstrapFinishAction;
 import com.starrocks.persist.HbPackage;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.FrontendOptions;
 import com.starrocks.system.HeartbeatResponse.HbStatus;
 import com.starrocks.thrift.HeartbeatService;
@@ -67,13 +67,13 @@ public class HeartbeatMgr extends MasterDaemon {
     private static final Logger LOG = LogManager.getLogger(HeartbeatMgr.class);
 
     private final ExecutorService executor;
-    private SystemInfoService nodeMgr;
-    private HeartbeatFlags heartbeatFlags;
+    private final SystemInfoService nodeMgr;
+    private final HeartbeatFlags heartbeatFlags;
 
-    private static volatile AtomicReference<TMasterInfo> masterInfo = new AtomicReference<>();
+    private static AtomicReference<TMasterInfo> masterInfo = new AtomicReference<>();
 
     public HeartbeatMgr(SystemInfoService nodeMgr, boolean needRegisterMetric) {
-        super("heartbeat mgr", FeConstants.heartbeat_interval_second * 1000);
+        super("heartbeat mgr", Config.heartbeat_timeout_second * 1000);
         this.nodeMgr = nodeMgr;
         this.executor = ThreadPoolManager.newDaemonFixedThreadPool(Config.heartbeat_mgr_threads_num,
                 Config.heartbeat_mgr_blocking_queue_size, "heartbeat-mgr-pool", needRegisterMetric);
@@ -105,22 +105,28 @@ public class HeartbeatMgr extends MasterDaemon {
             hbResponses.add(executor.submit(handler));
         }
 
+        // send compute node heartbeat
+        for (ComputeNode computeNode : nodeMgr.getIdComputeNode().values()) {
+            BackendHeartbeatHandler handler = new BackendHeartbeatHandler(computeNode);
+            hbResponses.add(executor.submit(handler));
+        }
+
         // send frontend heartbeat
-        List<Frontend> frontends = Catalog.getCurrentCatalog().getFrontends(null);
+        List<Frontend> frontends = GlobalStateMgr.getCurrentState().getFrontends(null);
         String masterFeNodeName = "";
         for (Frontend frontend : frontends) {
             if (frontend.getHost().equals(masterInfo.get().getNetwork_address().getHostname())) {
                 masterFeNodeName = frontend.getNodeName();
             }
             FrontendHeartbeatHandler handler = new FrontendHeartbeatHandler(frontend,
-                    Catalog.getCurrentCatalog().getClusterId(),
-                    Catalog.getCurrentCatalog().getToken());
+                    GlobalStateMgr.getCurrentState().getClusterId(),
+                    GlobalStateMgr.getCurrentState().getToken());
             hbResponses.add(executor.submit(handler));
         }
 
         // send broker heartbeat;
         Map<String, List<FsBroker>> brokerMap = Maps.newHashMap(
-                Catalog.getCurrentCatalog().getBrokerMgr().getBrokerListMap());
+                GlobalStateMgr.getCurrentState().getBrokerMgr().getBrokerListMap());
         for (Map.Entry<String, List<FsBroker>> entry : brokerMap.entrySet()) {
             for (FsBroker brokerAddress : entry.getValue()) {
                 BrokerHeartbeatHandler handler = new BrokerHeartbeatHandler(entry.getKey(), brokerAddress,
@@ -153,35 +159,48 @@ public class HeartbeatMgr extends MasterDaemon {
         } // end for all results
 
         // we also add a 'mocked' master Frontends heartbeat response to synchronize master info to other Frontends.
-        hbPackage.addHbResponse(new FrontendHbResponse(masterFeNodeName,
-                Config.query_port, Config.rpc_port, Catalog.getCurrentCatalog().getEditLog().getMaxJournalId(),
-                System.currentTimeMillis()));
+        hbPackage.addHbResponse(new FrontendHbResponse(masterFeNodeName, Config.query_port, Config.rpc_port,
+                GlobalStateMgr.getCurrentState().getMaxJournalId(),
+                System.currentTimeMillis(), GlobalStateMgr.getCurrentState().getFeStartTime(),
+                Version.STARROCKS_VERSION + "-" + Version.STARROCKS_COMMIT_HASH));
 
         // write edit log
-        Catalog.getCurrentCatalog().getEditLog().logHeartbeat(hbPackage);
+        GlobalStateMgr.getCurrentState().getEditLog().logHeartbeat(hbPackage);
     }
 
     private boolean handleHbResponse(HeartbeatResponse response, boolean isReplay) {
         switch (response.getType()) {
             case FRONTEND: {
                 FrontendHbResponse hbResponse = (FrontendHbResponse) response;
-                Frontend fe = Catalog.getCurrentCatalog().getFeByName(hbResponse.getName());
+                Frontend fe = GlobalStateMgr.getCurrentState().getFeByName(hbResponse.getName());
                 if (fe != null) {
-                    return fe.handleHbResponse(hbResponse);
+                    return fe.handleHbResponse(hbResponse, isReplay);
                 }
                 break;
             }
             case BACKEND: {
                 BackendHbResponse hbResponse = (BackendHbResponse) response;
-                Backend be = nodeMgr.getBackend(hbResponse.getBeId());
-                if (be != null) {
-                    boolean isChanged = be.handleHbResponse(hbResponse);
+                ComputeNode computeNode = nodeMgr.getBackend(hbResponse.getBeId());
+                if (computeNode == null) {
+                    computeNode = nodeMgr.getComputeNode(hbResponse.getBeId());
+                }
+                if (computeNode != null) {
+                    boolean isChanged = computeNode.handleHbResponse(hbResponse);
                     if (hbResponse.getStatus() != HbStatus.OK) {
                         // invalid all connections cached in ClientPool
-                        ClientPool.backendPool.clearPool(new TNetworkAddress(be.getHost(), be.getBePort()));
+                        ClientPool.backendPool.clearPool(new TNetworkAddress(computeNode.getHost(), computeNode.getBePort()));
                         if (!isReplay) {
-                            Catalog.getCurrentCatalog().getGlobalTransactionMgr()
-                                    .abortTxnWhenCoordinateBeDown(be.getHost(), 100);
+                            GlobalStateMgr.getCurrentState().getGlobalTransactionMgr()
+                                    .abortTxnWhenCoordinateBeDown(computeNode.getHost(), 100);
+                        }
+                    } else {
+                        if (Config.integrate_starmgr && !isReplay) {
+                            // addWorker
+                            int starletPort = computeNode.getStarletPort();
+                            if (starletPort != 0) {
+                                String workerAddr = computeNode.getHost() + ":" + starletPort;
+                                GlobalStateMgr.getCurrentState().getStarOSAgent().addWorker(computeNode.getId(), workerAddr);
+                            }
                         }
                     }
                     return isChanged;
@@ -190,7 +209,7 @@ public class HeartbeatMgr extends MasterDaemon {
             }
             case BROKER: {
                 BrokerHbResponse hbResponse = (BrokerHbResponse) response;
-                FsBroker broker = Catalog.getCurrentCatalog().getBrokerMgr().getBroker(
+                FsBroker broker = GlobalStateMgr.getCurrentState().getBrokerMgr().getBroker(
                         hbResponse.getName(), hbResponse.getHost(), hbResponse.getPort());
                 if (broker != null) {
                     boolean isChanged = broker.handleHbResponse(hbResponse);
@@ -210,26 +229,26 @@ public class HeartbeatMgr extends MasterDaemon {
 
     // backend heartbeat
     private class BackendHeartbeatHandler implements Callable<HeartbeatResponse> {
-        private Backend backend;
+        private ComputeNode computeNode;
 
-        public BackendHeartbeatHandler(Backend backend) {
-            this.backend = backend;
+        public BackendHeartbeatHandler(ComputeNode computeNode) {
+            this.computeNode = computeNode;
         }
 
         @Override
         public HeartbeatResponse call() {
-            long backendId = backend.getId();
+            long computeNodeId = computeNode.getId();
             HeartbeatService.Client client = null;
-            TNetworkAddress beAddr = new TNetworkAddress(backend.getHost(), backend.getHeartbeatPort());
+            TNetworkAddress beAddr = new TNetworkAddress(computeNode.getHost(), computeNode.getHeartbeatPort());
             boolean ok = false;
             try {
                 client = ClientPool.heartbeatPool.borrowObject(beAddr);
 
                 TMasterInfo copiedMasterInfo = new TMasterInfo(masterInfo.get());
-                copiedMasterInfo.setBackend_ip(backend.getHost());
+                copiedMasterInfo.setBackend_ip(computeNode.getHost());
                 long flags = heartbeatFlags.getHeartbeatFlags();
                 copiedMasterInfo.setHeartbeat_flags(flags);
-                copiedMasterInfo.setBackend_id(backendId);
+                copiedMasterInfo.setBackend_id(computeNodeId);
                 THeartbeatResult result = client.heartbeat(copiedMasterInfo);
 
                 ok = true;
@@ -238,25 +257,35 @@ public class HeartbeatMgr extends MasterDaemon {
                     int bePort = tBackendInfo.getBe_port();
                     int httpPort = tBackendInfo.getHttp_port();
                     int brpcPort = -1;
+                    int starletPort = 0;
                     if (tBackendInfo.isSetBrpc_port()) {
                         brpcPort = tBackendInfo.getBrpc_port();
+                    }
+                    if (tBackendInfo.isSetStarlet_port()) {
+                        starletPort = tBackendInfo.getStarlet_port();
                     }
                     String version = "";
                     if (tBackendInfo.isSetVersion()) {
                         version = tBackendInfo.getVersion();
                     }
 
+                    // Update number of hardare of cores of corresponding backend.
+                    int cpuCores = tBackendInfo.isSetNum_hardware_cores() ? tBackendInfo.getNum_hardware_cores() : 0;
+                    if (tBackendInfo.isSetNum_hardware_cores()) {
+                        BackendCoreStat.setNumOfHardwareCoresOfBe(computeNodeId, cpuCores);
+                    }
+
                     // backend.updateOnce(bePort, httpPort, beRpcPort, brpcPort);
-                    return new BackendHbResponse(backendId, bePort, httpPort, brpcPort, System.currentTimeMillis(),
-                            version);
+                    return new BackendHbResponse(computeNodeId, bePort, httpPort, brpcPort, starletPort,
+                            System.currentTimeMillis(), version, cpuCores);
                 } else {
-                    return new BackendHbResponse(backendId,
+                    return new BackendHbResponse(computeNodeId,
                             result.getStatus().getError_msgs().isEmpty() ? "Unknown error"
                                     : result.getStatus().getError_msgs().get(0));
                 }
             } catch (Exception e) {
                 LOG.warn("backend heartbeat got exception", e);
-                return new BackendHbResponse(backendId,
+                return new BackendHbResponse(computeNodeId,
                         Strings.isNullOrEmpty(e.getMessage()) ? "got exception" : e.getMessage());
             } finally {
                 if (ok) {
@@ -282,11 +311,13 @@ public class HeartbeatMgr extends MasterDaemon {
 
         @Override
         public HeartbeatResponse call() {
-            if (fe.getHost().equals(Catalog.getCurrentCatalog().getSelfNode().first)) {
+            if (fe.getHost().equals(GlobalStateMgr.getCurrentState().getSelfNode().first)) {
                 // heartbeat to self
-                if (Catalog.getCurrentCatalog().isReady()) {
+                if (GlobalStateMgr.getCurrentState().isReady()) {
                     return new FrontendHbResponse(fe.getNodeName(), Config.query_port, Config.rpc_port,
-                            Catalog.getCurrentCatalog().getReplayedJournalId(), System.currentTimeMillis());
+                            GlobalStateMgr.getCurrentState().getReplayedJournalId(), System.currentTimeMillis(),
+                            GlobalStateMgr.getCurrentState().getFeStartTime(),
+                            Version.STARROCKS_VERSION + "-" + Version.STARROCKS_COMMIT_HASH);
                 } else {
                     return new FrontendHbResponse(fe.getNodeName(), "not ready");
                 }
@@ -309,8 +340,10 @@ public class HeartbeatMgr extends MasterDaemon {
                     long replayedJournalId = root.getLong(BootstrapFinishAction.REPLAYED_JOURNAL_ID);
                     int queryPort = root.getInt(BootstrapFinishAction.QUERY_PORT);
                     int rpcPort = root.getInt(BootstrapFinishAction.RPC_PORT);
+                    long feStartTime = root.getLong(BootstrapFinishAction.FE_START_TIME);
+                    String feVersion = root.getString(BootstrapFinishAction.FE_VERSION);
                     return new FrontendHbResponse(fe.getNodeName(), queryPort, rpcPort, replayedJournalId,
-                            System.currentTimeMillis());
+                            System.currentTimeMillis(), feStartTime, feVersion);
                 }
             } catch (Exception e) {
                 return new FrontendHbResponse(fe.getNodeName(),

@@ -23,7 +23,6 @@ package com.starrocks.analysis;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.cluster.ClusterNamespace;
@@ -37,6 +36,7 @@ import com.starrocks.common.proc.UserPropertyProcNode;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.ShowResultSetMetaData;
+import com.starrocks.server.GlobalStateMgr;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -63,9 +63,10 @@ public class ShowUserPropertyStmt extends ShowStmt {
             user = analyzer.getQualifiedUser();
             // user can see itself's property, no need to check privs
         } else {
-            user = ClusterNamespace.getFullName(getClusterName(), user);
+            user = ClusterNamespace.getFullName(user);
 
-            if (!Catalog.getCurrentCatalog().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
+            if (!GlobalStateMgr.getCurrentState().getAuth()
+                    .checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "GRANT");
             }
         }
@@ -74,7 +75,7 @@ public class ShowUserPropertyStmt extends ShowStmt {
     }
 
     public List<List<String>> getRows() throws AnalysisException {
-        List<List<String>> rows = Catalog.getCurrentCatalog().getAuth().getUserProperties(user);
+        List<List<String>> rows = GlobalStateMgr.getCurrentState().getAuth().getUserProperties(user);
 
         if (pattern == null) {
             return rows;

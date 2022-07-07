@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/snapshot_loader.h
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -19,11 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_RUNTIME_SNAPSHOT_LOADER_H
-#define STARROCKS_BE_SRC_RUNTIME_SNAPSHOT_LOADER_H
+#pragma once
 
-#include <stdint.h>
-
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -47,20 +41,20 @@ struct FileStat {
  * Upload:
  * upload() will upload the specified snapshot
  * to remote storage via broker.
- * Each call of upload() is reponsible for severval tablet snapshots.
+ * Each call of upload() is responsible for several tablet snapshots.
  *
  * It will try to get the existing files in remote storage,
  * and only upload the incremental part of files.
  *
  * Download:
- * download() will download the romote tablet snapshot files 
+ * download() will download the remote tablet snapshot files
  * to local snapshot dir via broker.
  * It will also only download files which does not exist in local dir.
  *
  * Move:
  * move() is the final step of restore process. it will replace the 
  * old tablet data dir with the newly downloaded snapshot dir.
- * and reload the tablet header to take this tablet on line.
+ * and reload the tablet header to take this tablet online.
  * 
  */
 class SnapshotLoader {
@@ -76,7 +70,7 @@ public:
     Status download(const std::map<std::string, std::string>& src_to_dest_path, const TNetworkAddress& broker_addr,
                     const std::map<std::string, std::string>& broker_prop, std::vector<int64_t>* downloaded_tablet_ids);
 
-    Status move(const std::string& snapshot_path, TabletSharedPtr tablet, bool overwrite);
+    Status move(const std::string& snapshot_path, const TabletSharedPtr& tablet, bool overwrite);
 
 private:
     Status _get_tablet_id_and_schema_hash_from_file_path(const std::string& src_path, int64_t* tablet_id,
@@ -97,7 +91,7 @@ private:
 
     void _assemble_file_name(const std::string& snapshot_path, const std::string& tablet_path, int64_t tablet_id,
                              int64_t start_version, int64_t end_version, int64_t vesion_hash, int32_t seg_num,
-                             const std::string suffix, std::string* snapshot_file, std::string* tablet_file);
+                             const std::string& suffix, std::string* snapshot_file, std::string* tablet_file);
 
     Status _replace_tablet_id(const std::string& file_name, int64_t tablet_id, std::string* new_file_name);
 
@@ -112,5 +106,3 @@ private:
 };
 
 } // end namespace starrocks
-
-#endif // STARROCKS_BE_SRC_RUNTIME_SNAPSHOT_LOADER_H

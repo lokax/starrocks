@@ -20,11 +20,11 @@
 // under the License.
 package com.starrocks.mysql.nio;
 
-import com.starrocks.catalog.Catalog;
 import com.starrocks.mysql.MysqlProto;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.ConnectProcessor;
 import com.starrocks.qe.ConnectScheduler;
+import com.starrocks.server.GlobalStateMgr;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.xnio.ChannelListener;
@@ -37,7 +37,7 @@ import java.io.IOException;
  * listener for accept mysql connections.
  */
 public class AcceptListener implements ChannelListener<AcceptingChannel<StreamConnection>> {
-    private final Logger LOG = LogManager.getLogger(this.getClass());
+    private static final Logger LOG = LogManager.getLogger(AcceptListener.class);
     private ConnectScheduler connectScheduler;
 
     public AcceptListener(ConnectScheduler connectScheduler) {
@@ -55,41 +55,57 @@ public class AcceptListener implements ChannelListener<AcceptingChannel<StreamCo
             // connection has been established, so need to call context.cleanup()
             // if exception happens.
             NConnectContext context = new NConnectContext(connection);
-            context.setCatalog(Catalog.getCurrentCatalog());
+            context.setGlobalStateMgr(GlobalStateMgr.getCurrentState());
             connectScheduler.submit(context);
 
-            channel.getWorker().execute(() -> {
-                try {
-                    // Set thread local info
-                    context.setThreadLocalInfo();
-                    context.setConnectScheduler(connectScheduler);
-                    // authenticate check failed.
-                    if (!MysqlProto.negotiate(context)) {
-                        throw new AfterConnectedException("mysql negotiate failed");
+            try {
+                channel.getWorker().execute(() -> {
+                    try {
+                        // Set thread local info
+                        context.setThreadLocalInfo();
+                        context.setConnectScheduler(connectScheduler);
+                        // authenticate check failed.
+                        if (!MysqlProto.negotiate(context)) {
+                            throw new AfterConnectedException("mysql negotiate failed");
+                        }
+                        if (connectScheduler.registerConnection(context)) {
+                            MysqlProto.sendResponsePacket(context);
+                            connection.setCloseListener(
+                                    streamConnection -> connectScheduler.unregisterConnection(context));
+                        } else {
+                            context.getState().setError("Reach limit of connections");
+                            MysqlProto.sendResponsePacket(context);
+                            throw new AfterConnectedException("Reach limit of connections");
+                        }
+                        context.setStartTime();
+                        ConnectProcessor processor = new ConnectProcessor(context);
+                        context.startAcceptQuery(processor);
+                    } catch (AfterConnectedException e) {
+                        // do not need to print log for this kind of exception.
+                        // just clean up the context;
+                        context.cleanup();
+                    } catch (Throwable e) {
+                        if (e instanceof Error) {
+                            LOG.error("connect processor exception because ", e);
+                        } else {
+                            // should be unexpected exception, so print warn log
+                            LOG.warn("connect processor exception because ", e);
+                        }
+                        context.cleanup();
+                    } finally {
+                        ConnectContext.remove();
                     }
-                    if (connectScheduler.registerConnection(context)) {
-                        MysqlProto.sendResponsePacket(context);
-                        connection.setCloseListener(streamConnection -> connectScheduler.unregisterConnection(context));
-                    } else {
-                        context.getState().setError("Reach limit of connections");
-                        MysqlProto.sendResponsePacket(context);
-                        throw new AfterConnectedException("Reach limit of connections");
-                    }
-                    context.setStartTime();
-                    ConnectProcessor processor = new ConnectProcessor(context);
-                    context.startAcceptQuery(processor);
-                } catch (AfterConnectedException e) {
-                    // do not need to print log for this kind of exception.
-                    // just clean up the context;
-                    context.cleanup();
-                } catch (Exception e) {
+                });
+            } catch (Throwable e) {
+                if (e instanceof Error) {
+                    LOG.error("connect processor exception because ", e);
+                } else {
                     // should be unexpected exception, so print warn log
                     LOG.warn("connect processor exception because ", e);
-                    context.cleanup();
-                } finally {
-                    ConnectContext.remove();
                 }
-            });
+                context.cleanup();
+                ConnectContext.remove();
+            }
         } catch (IOException e) {
             LOG.warn("Connection accept failed.", e);
         }

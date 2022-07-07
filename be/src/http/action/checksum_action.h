@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_HTTP_CHECKSUM_ACTION_H
-#define STARROCKS_BE_SRC_HTTP_CHECKSUM_ACTION_H
+#pragma once
 
 #include <cstdint>
 
@@ -34,17 +33,15 @@ class ChecksumAction : public HttpHandler {
 public:
     explicit ChecksumAction(ExecEnv* exec_env);
 
-    virtual ~ChecksumAction() {}
+    ~ChecksumAction() override = default;
 
     void handle(HttpRequest* req) override;
 
 private:
-    std::int64_t do_checksum(std::int64_t tablet_id, std::int64_t version, std::int64_t version_hash,
-                             std::int32_t schema_hash, HttpRequest* req);
+    std::int64_t do_checksum(std::int64_t tablet_id, std::int64_t version, std::int32_t schema_hash, HttpRequest* req);
 
     ExecEnv* _exec_env;
 
 }; // end class ChecksumAction
 
 } // end namespace starrocks
-#endif // STARROCKS_BE_SRC_COMMON_UTIL_DOWNLOAD_ACTION_H

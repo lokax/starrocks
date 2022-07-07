@@ -19,19 +19,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_EXEC_FILE_WRITER_H
-#define STARROCKS_BE_SRC_EXEC_FILE_WRITER_H
+#pragma once
 
-#include <stdint.h>
+#include <cstdint>
 
 #include "common/status.h"
 
 namespace starrocks {
 
-// NOTE: Deprecated, use `Env::WritableFile` instead.
+// NOTE: Deprecated, use `FileSystem::WritableFile` instead.
 class FileWriter {
 public:
-    virtual ~FileWriter() {}
+    virtual ~FileWriter() = default;
 
     virtual Status open() = 0;
 
@@ -43,5 +42,3 @@ public:
 };
 
 } // end namespace starrocks
-
-#endif // STARROCKS_BE_SRC_EXEC_FILE_WRITER_H

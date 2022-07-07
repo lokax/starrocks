@@ -21,9 +21,8 @@
 
 #include "util/uid_util.h"
 
-#include <algorithm>
-
 #include "gutil/endian.h"
+#include "util/uuid_generator.h"
 
 namespace starrocks {
 
@@ -48,6 +47,28 @@ std::string print_id(const PUniqueId& id) {
     memcpy(uuid.data + 0, &hi, 8);
     memcpy(uuid.data + 8, &lo, 8);
     return boost::uuids::to_string(uuid);
+}
+
+UniqueId UniqueId::gen_uid() {
+    UniqueId uid(0, 0);
+    auto uuid = ThreadLocalUUIDGenerator::next_uuid();
+    memcpy(&uid.hi, uuid.data, sizeof(int64_t));
+    memcpy(&uid.lo, uuid.data + sizeof(int64_t), sizeof(int64_t));
+    return uid;
+}
+
+/// generates a 16 byte
+std::string generate_uuid_string() {
+    return boost::uuids::to_string(ThreadLocalUUIDGenerator::next_uuid());
+}
+
+/// generates a 16 byte UUID
+TUniqueId generate_uuid() {
+    auto uuid = ThreadLocalUUIDGenerator::next_uuid();
+    TUniqueId uid;
+    memcpy(&uid.hi, uuid.data, sizeof(int64_t));
+    memcpy(&uid.lo, uuid.data + sizeof(int64_t), sizeof(int64_t));
+    return uid;
 }
 
 } // namespace starrocks

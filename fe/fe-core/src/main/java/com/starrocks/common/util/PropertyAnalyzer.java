@@ -32,7 +32,6 @@ import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
-import com.starrocks.common.Pair;
 import com.starrocks.thrift.TStorageFormat;
 import com.starrocks.thrift.TStorageMedium;
 import com.starrocks.thrift.TStorageType;
@@ -81,12 +80,18 @@ public class PropertyAnalyzer {
 
     public static final String PROPERTIES_INMEMORY = "in_memory";
 
+    public static final String PROPERTIES_ENABLE_PERSISTENT_INDEX = "enable_persistent_index";
+
     public static final String PROPERTIES_TABLET_TYPE = "tablet_type";
 
     public static final String PROPERTIES_STRICT_RANGE = "strict_range";
     public static final String PROPERTIES_USE_TEMP_PARTITION_NAME = "use_temp_partition_name";
 
     public static final String PROPERTIES_TYPE = "type";
+
+    public static final String ENABLE_LOW_CARD_DICT_TYPE = "enable_low_card_dict";
+    public static final String ABLE_LOW_CARD_DICT = "1";
+    public static final String DISABLE_LOW_CARD_DICT = "0";
 
     public static DataProperty analyzeDataProperty(Map<String, String> properties, DataProperty oldDataProperty)
             throws AnalysisException {
@@ -152,7 +157,7 @@ public class PropertyAnalyzer {
     public static short analyzeShortKeyColumnCount(Map<String, String> properties) throws AnalysisException {
         short shortKeyColumnCount = (short) -1;
         if (properties != null && properties.containsKey(PROPERTIES_SHORT_KEY)) {
-            // check and use speciefied short key
+            // check and use specified short key
             try {
                 shortKeyColumnCount = Short.parseShort(properties.get(PROPERTIES_SHORT_KEY));
             } catch (NumberFormatException e) {
@@ -255,21 +260,14 @@ public class PropertyAnalyzer {
         return tTabletType;
     }
 
-    public static Pair<Long, Long> analyzeVersionInfo(Map<String, String> properties) throws AnalysisException {
-        Pair<Long, Long> versionInfo = new Pair<>(Partition.PARTITION_INIT_VERSION,
-                Partition.PARTITION_INIT_VERSION_HASH);
+    public static Long analyzeVersionInfo(Map<String, String> properties) throws AnalysisException {
+        Long versionInfo = Partition.PARTITION_INIT_VERSION;
         if (properties != null && properties.containsKey(PROPERTIES_VERSION_INFO)) {
             String versionInfoStr = properties.get(PROPERTIES_VERSION_INFO);
-            String[] versionInfoArr = versionInfoStr.split(COMMA_SEPARATOR);
-            if (versionInfoArr.length == 2) {
-                try {
-                    versionInfo.first = Long.parseLong(versionInfoArr[0]);
-                    versionInfo.second = Long.parseLong(versionInfoArr[1]);
-                } catch (NumberFormatException e) {
-                    throw new AnalysisException("version info number format error");
-                }
-            } else {
-                throw new AnalysisException("version info format error. format: version,version_hash");
+            try {
+                versionInfo = Long.parseLong(versionInfoStr);
+            } catch (NumberFormatException e) {
+                throw new AnalysisException("version info format error.");
             }
 
             properties.remove(PROPERTIES_VERSION_INFO);
@@ -294,8 +292,8 @@ public class PropertyAnalyzer {
         return schemaVersion;
     }
 
-    public static Set<String> analyzeBloomFilterColumns(Map<String, String> properties, List<Column> columns)
-            throws AnalysisException {
+    public static Set<String> analyzeBloomFilterColumns(Map<String, String> properties, List<Column> columns,
+                                                        boolean isPrimaryKey) throws AnalysisException {
         Set<String> bfColumns = null;
         if (properties != null && properties.containsKey(PROPERTIES_BF_COLUMNS)) {
             bfColumns = Sets.newHashSet();
@@ -320,17 +318,16 @@ public class PropertyAnalyzer {
                 Type type = column.getType();
 
                 // tinyint/float/double columns don't support
-                if (!type.isScalarType() || type.isFloatingPointType() || type.isTinyint() ||
-                        type.isBoolean() || type.isDecimalV3()) {
+                if (!type.supportBloomFilter()) {
                     throw new AnalysisException(String.format("Invalid bloom filter column '%s': unsupported type %s",
                             bfColumn, type));
                 }
 
-                // Only support create bloom filter on duplicate table or key columns of UNIQUE/AGGREGATE table.
-                if (!(column.isKey() || column.getAggregationType() == AggregateType.NONE)) {
-                    // Although the implementation supports bf for replace non-key column,
+                // Only support create bloom filter on DUPLICATE/PRIMARY table or key columns of UNIQUE/AGGREGATE table.
+                if (!(column.isKey() || isPrimaryKey || column.getAggregationType() == AggregateType.NONE)) {
+                    // Although the implementation supports bloom filter for replace non-key column,
                     // for simplicity and unity, we don't expose that to user.
-                    throw new AnalysisException("Bloom filter index only used in columns of DUP_KEYS table or "
+                    throw new AnalysisException("Bloom filter index only used in columns of DUP_KEYS/PRIMARY table or "
                             + "key columns of UNIQUE_KEYS/AGG_KEYS table. invalid column: " + bfColumn);
                 }
 

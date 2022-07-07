@@ -32,9 +32,6 @@ import java.io.DataOutput;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public class NullLiteral extends LiteralExpr {
 
     private static final LiteralExpr INT_EXPR;
@@ -122,11 +119,6 @@ public class NullLiteral extends LiteralExpr {
     }
 
     @Override
-    protected boolean canCastTo(Type targetType) {
-        return true;
-    }
-
-    @Override
     public Expr uncheckedCastTo(Type targetType) throws AnalysisException {
         Preconditions.checkState(targetType.isValid());
         if (!type.equals(targetType)) {
@@ -155,10 +147,5 @@ public class NullLiteral extends LiteralExpr {
         NullLiteral literal = new NullLiteral();
         literal.readFields(in);
         return literal;
-    }
-
-    @Override
-    public boolean isVectorized() {
-        return true;
     }
 }

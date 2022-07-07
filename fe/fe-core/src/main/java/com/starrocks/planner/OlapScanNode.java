@@ -21,6 +21,7 @@
 
 package com.starrocks.planner;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
@@ -29,23 +30,15 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
 import com.starrocks.analysis.Analyzer;
-import com.starrocks.analysis.BaseTableRef;
-import com.starrocks.analysis.BinaryPredicate;
-import com.starrocks.analysis.CastExpr;
-import com.starrocks.analysis.Expr;
-import com.starrocks.analysis.InPredicate;
 import com.starrocks.analysis.PartitionNames;
 import com.starrocks.analysis.SlotDescriptor;
-import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TupleDescriptor;
-import com.starrocks.analysis.TupleId;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.DistributionInfo;
 import com.starrocks.catalog.HashDistributionInfo;
 import com.starrocks.catalog.KeysType;
+import com.starrocks.catalog.LocalTablet;
 import com.starrocks.catalog.MaterializedIndex;
-import com.starrocks.catalog.MaterializedIndexMeta;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.PartitionInfo;
@@ -54,17 +47,20 @@ import com.starrocks.catalog.PartitionType;
 import com.starrocks.catalog.RangePartitionInfo;
 import com.starrocks.catalog.Replica;
 import com.starrocks.catalog.Tablet;
+import com.starrocks.catalog.lake.LakeTablet;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.UserException;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.qe.SessionVariable;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.FrontendOptions;
+import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.system.Backend;
 import com.starrocks.thrift.TExplainLevel;
 import com.starrocks.thrift.TInternalScanRange;
+import com.starrocks.thrift.TLakeScanNode;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TOlapScanNode;
 import com.starrocks.thrift.TPlanNode;
@@ -73,7 +69,6 @@ import com.starrocks.thrift.TPrimitiveType;
 import com.starrocks.thrift.TScanRange;
 import com.starrocks.thrift.TScanRangeLocation;
 import com.starrocks.thrift.TScanRangeLocations;
-import com.starrocks.thrift.TStorageFormat;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -86,13 +81,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public class OlapScanNode extends ScanNode {
     private static final Logger LOG = LogManager.getLogger(OlapScanNode.class);
 
-    private List<TScanRangeLocations> result = new ArrayList<>();
+    private final List<TScanRangeLocations> result = new ArrayList<>();
     /*
      * When the field value is ON, the storage engine can return the data directly without pre-aggregation.
      * When the field value is OFF, the storage engine needs to aggregate the data before returning to scan node.
@@ -112,22 +104,19 @@ public class OlapScanNode extends ScanNode {
      */
     private boolean isPreAggregation = false;
     private String reasonOfPreAggregation = null;
-    private boolean canTurnOnPreAggr = true;
-    private boolean forceOpenPreAgg = false;
     private OlapTable olapTable = null;
     private long selectedTabletsNum = 0;
     private long totalTabletsNum = 0;
     private long selectedIndexId = -1;
     private int selectedPartitionNum = 0;
     private Collection<Long> selectedPartitionIds = Lists.newArrayList();
-    private long totalBytes = 0;
     private long actualRows = 0;
 
     // List of tablets will be scanned by current olap_scan_node
     private ArrayList<Long> scanTabletIds = Lists.newArrayList();
     private boolean isFinalized = false;
 
-    private HashSet<Long> scanBackendIds = new HashSet<>();
+    private final HashSet<Long> scanBackendIds = new HashSet<>();
 
     private Map<Long, Integer> tabletId2BucketSeq = Maps.newHashMap();
     // a bucket seq may map to many tablets, and each tablet has a TScanRangeLocations.
@@ -152,124 +141,42 @@ public class OlapScanNode extends ScanNode {
         return isPreAggregation;
     }
 
-    public boolean getCanTurnOnPreAggr() {
-        return canTurnOnPreAggr;
-    }
-
     public void setCanTurnOnPreAggr(boolean canChangePreAggr) {
-        this.canTurnOnPreAggr = canChangePreAggr;
-    }
-
-    public boolean getForceOpenPreAgg() {
-        return forceOpenPreAgg;
-    }
-
-    public void setForceOpenPreAgg(boolean forceOpenPreAgg) {
-        this.forceOpenPreAgg = forceOpenPreAgg;
     }
 
     public Collection<Long> getSelectedPartitionIds() {
         return selectedPartitionIds;
     }
 
-    /**
-     * This method is mainly used to update scan range info in OlapScanNode by the new materialized selector.
-     * Situation1:
-     * If the new scan range is same as the old scan range which determined by the old materialized selector,
-     * the scan range will not be changed.
-     * <p>
-     * Situation2: Scan range is difference. The type of table is duplicated.
-     * The new scan range is used directly.
-     * The reason is that the old selector does not support SPJ<->SPJG, so the result of old one must be incorrect.
-     * <p>
-     * Situation3: Scan range is difference. The type of table is aggregated.
-     * The new scan range is different from the old one.
-     * If the test_materialized_view is set to true, an error will be reported.
-     * The query will be cancelled.
-     * <p>
-     * Situation4: Scan range is difference. The type of table is aggregated. `test_materialized_view` is set to false.
-     * The result of the old version selector will be selected. Print the warning log
-     *
-     * @param selectedIndexId
-     * @param isPreAggregation
-     * @param reasonOfDisable
-     * @throws UserException
-     */
-    public void updateScanRangeInfoByNewMVSelector(long selectedIndexId, boolean isPreAggregation,
-                                                   String reasonOfDisable)
-            throws UserException {
-        if (selectedIndexId == this.selectedIndexId && isPreAggregation == this.isPreAggregation) {
-            return;
-        }
-        StringBuilder stringBuilder = new StringBuilder("The new selected index id ")
-                .append(selectedIndexId)
-                .append(", pre aggregation tag ").append(isPreAggregation)
-                .append(", reason ").append(reasonOfDisable == null ? "null" : reasonOfDisable)
-                .append(". The old selected index id ").append(this.selectedIndexId)
-                .append(" pre aggregation tag ").append(this.isPreAggregation)
-                .append(" reason ").append(this.reasonOfPreAggregation == null ? "null" : this.reasonOfPreAggregation);
-        String scanRangeInfo = stringBuilder.toString();
-        String situation;
-        boolean update;
-        CHECK:
-        {
-            if (olapTable.getKeysType() == KeysType.DUP_KEYS) {
-                situation = "The key type of table is duplicate.";
-                update = true;
-                break CHECK;
-            }
-            if (ConnectContext.get() == null) {
-                situation = "Connection context is null";
-                update = true;
-                break CHECK;
-            }
-            SessionVariable sessionVariable = ConnectContext.get().getSessionVariable();
-            if (sessionVariable.getTestMaterializedView()) {
-                throw new AnalysisException("The old scan range info is different from the new one when "
-                        + "test_materialized_view is true. "
-                        + scanRangeInfo);
-            }
-            situation = "The key type of table is aggregated.";
-            update = false;
-            break CHECK;
-        }
+    // The dict id int column ids to dict string column ids
+    private Map<Integer, Integer> dictStringIdToIntIds = Maps.newHashMap();
 
-        if (update) {
-            this.selectedIndexId = selectedIndexId;
-            this.isPreAggregation = isPreAggregation;
-            this.reasonOfPreAggregation = reasonOfDisable;
-            updateColumnType();
-            LOG.info("Using the new scan range info instead of the old one. {}, {}", situation, scanRangeInfo);
-        } else {
-            LOG.warn("Using the old scan range info instead of the new one. {}, {}", situation, scanRangeInfo);
+    public void setDictStringIdToIntIds(Map<Integer, Integer> dictStringIdToIntIds) {
+        this.dictStringIdToIntIds = dictStringIdToIntIds;
+    }
+
+    // The column names applied dict optimization
+    // used for explain
+    private final List<String> appliedDictStringColumns = new ArrayList<>();
+
+    public void updateAppliedDictStringColumns(Set<Integer> appliedColumnIds) {
+        for (SlotDescriptor slot : desc.getSlots()) {
+            if (appliedColumnIds.contains(slot.getId().asInt())) {
+                appliedDictStringColumns.add(slot.getColumn().getName());
+            }
         }
     }
 
-    /**
-     * In some situation, the column type between base and mv is different.
-     * If mv selector selects the mv index, the type of column should be changed to the type of mv column.
-     * For example:
-     * base table: k1 int, k2 int
-     * mv table: k1 int, k2 bigint sum
-     * The type of `k2` column between base and mv is different.
-     * When mv selector selects the mv table to scan, the type of column should be changed to bigint in here.
-     * Currently, only `SUM` aggregate type could match this changed.
-     */
-    private void updateColumnType() {
-        if (selectedIndexId == olapTable.getBaseIndexId()) {
-            return;
-        }
-        MaterializedIndexMeta meta = olapTable.getIndexMetaByIndexId(selectedIndexId);
-        for (SlotDescriptor slotDescriptor : desc.getSlots()) {
-            if (!slotDescriptor.isMaterialized()) {
+    private final List<String> unUsedOutputStringColumns = new ArrayList<>();
+
+    public void setUnUsedOutputStringColumns(Set<Integer> unUsedOutputColumnIds, Set<String> aggTableValueColumnNames) {
+        for (SlotDescriptor slot : desc.getSlots()) {
+            if (!slot.isMaterialized()) {
                 continue;
             }
-            Column baseColumn = slotDescriptor.getColumn();
-            Preconditions.checkNotNull(baseColumn);
-            Column mvColumn = meta.getColumnByName(baseColumn.getName());
-            Preconditions.checkNotNull(mvColumn);
-            if (mvColumn.getType().getPrimitiveType() != baseColumn.getType().getPrimitiveType()) {
-                slotDescriptor.setColumn(mvColumn);
+            if (unUsedOutputColumnIds.contains(slot.getId().asInt()) &&
+                    !aggTableValueColumnNames.contains(slot.getColumn().getName())) {
+                unUsedOutputStringColumns.add(slot.getColumn().getName());
             }
         }
     }
@@ -293,7 +200,7 @@ public class OlapScanNode extends ScanNode {
     }
 
     @Override
-    public void finalize(Analyzer analyzer) throws UserException {
+    public void finalizeStats(Analyzer analyzer) throws UserException {
         if (isFinalized) {
             return;
         }
@@ -312,6 +219,7 @@ public class OlapScanNode extends ScanNode {
     @Override
     public void computeStats(Analyzer analyzer) {
         if (cardinality > 0) {
+            long totalBytes = 0;
             avgRowSize = totalBytes / (float) cardinality;
             if (hasLimit()) {
                 cardinality = Math.min(cardinality, limit);
@@ -374,9 +282,7 @@ public class OlapScanNode extends ScanNode {
         int schemaHash = olapTable.getSchemaHashByIndexId(index.getId());
         String schemaHashStr = String.valueOf(schemaHash);
         long visibleVersion = partition.getVisibleVersion();
-        long visibleVersionHash = partition.getVisibleVersionHash();
         String visibleVersionStr = String.valueOf(visibleVersion);
-        String visibleVersionHashStr = String.valueOf(partition.getVisibleVersionHash());
 
         for (Tablet tablet : tablets) {
             long tabletId = tablet.getId();
@@ -387,20 +293,25 @@ public class OlapScanNode extends ScanNode {
             internalRange.setDb_name("");
             internalRange.setSchema_hash(schemaHashStr);
             internalRange.setVersion(visibleVersionStr);
-            internalRange.setVersion_hash(visibleVersionHashStr);
+            internalRange.setVersion_hash("0");
             internalRange.setTablet_id(tabletId);
 
             // random shuffle List && only collect one copy
             List<Replica> allQueryableReplicas = Lists.newArrayList();
             List<Replica> localReplicas = Lists.newArrayList();
             tablet.getQueryableReplicas(allQueryableReplicas, localReplicas,
-                    visibleVersion, visibleVersionHash, localBeId, schemaHash);
+                    visibleVersion, localBeId, schemaHash);
             if (allQueryableReplicas.isEmpty()) {
-                LOG.error("no queryable replica found in tablet {}. visible version {}-{}",
-                        tabletId, visibleVersion, visibleVersionHash);
+                LOG.error("no queryable replica found in tablet {}. visible version {}",
+                        tabletId, visibleVersion);
                 if (LOG.isDebugEnabled()) {
-                    for (Replica replica : tablet.getReplicas()) {
-                        LOG.debug("tablet {}, replica: {}", tabletId, replica.toString());
+                    if (olapTable.isLakeTable()) {
+                        LOG.debug("tablet: {}, shard: {}, backends: {}", tabletId, ((LakeTablet) tablet).getShardId(),
+                                tablet.getBackendIds());
+                    } else {
+                        for (Replica replica : ((LocalTablet) tablet).getReplicas()) {
+                            LOG.debug("tablet {}, replica: {}", tabletId, replica.toString());
+                        }
                     }
                 }
                 throw new UserException("Failed to get scan range, no queryable replica found in tablet: " + tabletId);
@@ -417,7 +328,7 @@ public class OlapScanNode extends ScanNode {
             boolean tabletIsNull = true;
             boolean collectedStat = false;
             for (Replica replica : replicas) {
-                Backend backend = Catalog.getCurrentSystemInfo().getBackend(replica.getBackendId());
+                Backend backend = GlobalStateMgr.getCurrentSystemInfo().getBackend(replica.getBackendId());
                 if (backend == null) {
                     LOG.debug("replica {} not exists", replica.getBackendId());
                     continue;
@@ -432,12 +343,7 @@ public class OlapScanNode extends ScanNode {
 
                 //for CBO
                 if (!collectedStat && replica.getRowCount() != -1) {
-                    if (!ConnectContext.get().getSessionVariable().isEnableNewPlanner()) {
-                        cardinality += replica.getRowCount();
-                        totalBytes += replica.getDataSize();
-                    } else {
-                        actualRows += replica.getRowCount();
-                    }
+                    actualRows += replica.getRowCount();
                     collectedStat = true;
                 }
                 scanBackendIds.add(backend.getId());
@@ -458,7 +364,7 @@ public class OlapScanNode extends ScanNode {
     private void computePartitionInfo() throws AnalysisException {
         long start = System.currentTimeMillis();
         // Step1: compute partition ids
-        PartitionNames partitionNames = ((BaseTableRef) desc.getRef()).getPartitionNames();
+        PartitionNames partitionNames = desc.getRef().getPartitionNames();
         PartitionInfo partitionInfo = olapTable.getPartitionInfo();
         if (partitionInfo.getType() == PartitionType.RANGE) {
             selectedPartitionIds = partitionPrune((RangePartitionInfo) partitionInfo, partitionNames);
@@ -514,7 +420,7 @@ public class OlapScanNode extends ScanNode {
     private void computeTabletInfo() throws UserException {
         long localBeId = -1;
         if (Config.enable_local_replica_selection) {
-            localBeId = Catalog.getCurrentSystemInfo().getBackendIdByHost(FrontendOptions.getLocalHostAddress());
+            localBeId = GlobalStateMgr.getCurrentSystemInfo().getBackendIdByHost(FrontendOptions.getLocalHostAddress());
         }
         /**
          * The tablet info could be computed only once.
@@ -634,10 +540,32 @@ public class OlapScanNode extends ScanNode {
             output.append(prefix).append("Predicates: ").append(getVerboseExplain(conjuncts)).append("\n");
         }
 
+        if (!dictStringIdToIntIds.isEmpty()) {
+            List<String> flatDictList = dictStringIdToIntIds.entrySet().stream().limit(5)
+                    .map((entry) -> "(" + entry.getKey() + "," + entry.getValue() + ")").collect(Collectors.toList());
+            String format_template = "dictStringIdToIntIds=%s";
+            if (dictStringIdToIntIds.size() > 5) {
+                format_template = format_template + "...";
+            }
+            output.append(prefix).append(String.format(format_template, Joiner.on(",").join(flatDictList)));
+            output.append("\n");
+        }
+
+        if (!appliedDictStringColumns.isEmpty()) {
+            int maxSize = Math.min(appliedDictStringColumns.size(), 5);
+            List<String> printList = appliedDictStringColumns.subList(0, maxSize);
+            String format_template = "dict_col=%s";
+            if (dictStringIdToIntIds.size() > 5) {
+                format_template = format_template + "...";
+            }
+            output.append(prefix).append(String.format(format_template, Joiner.on(",").join(printList)));
+            output.append("\n");
+        }
+
         output.append(prefix).append(String.format(
-                "partitionsRatio=%s/%s",
-                selectedPartitionNum,
-                olapTable.getPartitions().size())).append(", ")
+                        "partitionsRatio=%s/%s",
+                        selectedPartitionNum,
+                        olapTable.getPartitions().size())).append(", ")
                 .append(String.format("tabletsRatio=%s/%s", selectedTabletsNum, totalTabletsNum)).append("\n");
 
         if (scanTabletIds.size() > 10) {
@@ -649,9 +577,9 @@ public class OlapScanNode extends ScanNode {
         output.append("\n");
 
         output.append(prefix).append(String.format(
-                "actualRows=%s", actualRows))
+                        "actualRows=%s", actualRows))
                 .append(", ").append(String.format(
-                "avgRowSize=%s", avgRowSize)).append("\n");
+                        "avgRowSize=%s", avgRowSize)).append("\n");
         return output.toString();
     }
 
@@ -673,15 +601,46 @@ public class OlapScanNode extends ScanNode {
                 keyColumnTypes.add(col.getPrimitiveType().toThrift());
             }
         }
-        msg.node_type = TPlanNodeType.OLAP_SCAN_NODE;
-        msg.olap_scan_node =
-                new TOlapScanNode(desc.getId().asInt(), keyColumnNames, keyColumnTypes, isPreAggregation);
-        msg.olap_scan_node.setRollup_name(olapTable.getIndexNameById(selectedIndexId));
-        if (!conjuncts.isEmpty()) {
-            msg.olap_scan_node.setSql_predicates(getExplainString(conjuncts));
-        }
-        if (null != sortColumn) {
-            msg.olap_scan_node.setSort_column(sortColumn);
+        if (olapTable.isLakeTable()) {
+            msg.node_type = TPlanNodeType.LAKE_SCAN_NODE;
+            msg.lake_scan_node =
+                    new TLakeScanNode(desc.getId().asInt(), keyColumnNames, keyColumnTypes, isPreAggregation);
+            msg.lake_scan_node.setRollup_name(olapTable.getIndexNameById(selectedIndexId));
+            if (!conjuncts.isEmpty()) {
+                msg.lake_scan_node.setSql_predicates(getExplainString(conjuncts));
+            }
+            if (null != sortColumn) {
+                msg.lake_scan_node.setSort_column(sortColumn);
+            }
+            if (ConnectContext.get() != null) {
+                msg.lake_scan_node.setEnable_column_expr_predicate(
+                        ConnectContext.get().getSessionVariable().isEnableColumnExprPredicate());
+            }
+            msg.lake_scan_node.setDict_string_id_to_int_ids(dictStringIdToIntIds);
+
+            if (!olapTable.hasDelete()) {
+                msg.lake_scan_node.setUnused_output_column_name(unUsedOutputStringColumns);
+            }
+        } else {
+            msg.node_type = TPlanNodeType.OLAP_SCAN_NODE;
+            msg.olap_scan_node =
+                    new TOlapScanNode(desc.getId().asInt(), keyColumnNames, keyColumnTypes, isPreAggregation);
+            msg.olap_scan_node.setRollup_name(olapTable.getIndexNameById(selectedIndexId));
+            if (!conjuncts.isEmpty()) {
+                msg.olap_scan_node.setSql_predicates(getExplainString(conjuncts));
+            }
+            if (null != sortColumn) {
+                msg.olap_scan_node.setSort_column(sortColumn);
+            }
+            if (ConnectContext.get() != null) {
+                msg.olap_scan_node.setEnable_column_expr_predicate(
+                        ConnectContext.get().getSessionVariable().isEnableColumnExprPredicate());
+            }
+            msg.olap_scan_node.setDict_string_id_to_int_ids(dictStringIdToIntIds);
+
+            if (!olapTable.hasDelete()) {
+                msg.olap_scan_node.setUnused_output_column_name(unUsedOutputStringColumns);
+            }
         }
     }
 
@@ -690,7 +649,6 @@ public class OlapScanNode extends ScanNode {
             PlanNodeId id, TupleDescriptor desc, String planNodeName, List<TScanRangeLocations> locationsList) {
         OlapScanNode olapScanNode = new OlapScanNode(id, desc, planNodeName);
         olapScanNode.numInstances = 1;
-
         olapScanNode.selectedIndexId = olapScanNode.olapTable.getBaseIndexId();
         olapScanNode.selectedPartitionNum = 1;
         olapScanNode.selectedTabletsNum = 1;
@@ -700,137 +658,6 @@ public class OlapScanNode extends ScanNode {
         olapScanNode.result.addAll(locationsList);
 
         return olapScanNode;
-    }
-
-    public void collectColumns(Analyzer analyzer, Set<String> equivalenceColumns, Set<String> unequivalenceColumns) {
-        // 1. Get columns which has predicate on it.
-        for (Expr expr : conjuncts) {
-            if (!isPredicateUsedForPrefixIndex(expr, false)) {
-                continue;
-            }
-            for (SlotDescriptor slot : desc.getMaterializedSlots()) {
-                if (expr.isBound(slot.getId())) {
-                    if (!isEquivalenceExpr(expr)) {
-                        unequivalenceColumns.add(slot.getColumn().getName());
-                    } else {
-                        equivalenceColumns.add(slot.getColumn().getName());
-                    }
-                    break;
-                }
-            }
-        }
-
-        // 2. Equal join predicates when pushing inner child.
-        List<Expr> eqJoinPredicate = analyzer.getEqJoinConjuncts(desc.getId());
-        for (Expr expr : eqJoinPredicate) {
-            if (!isPredicateUsedForPrefixIndex(expr, true)) {
-                continue;
-            }
-            for (SlotDescriptor slot : desc.getMaterializedSlots()) {
-                Preconditions.checkState(expr.getChildren().size() == 2);
-                for (Expr child : expr.getChildren()) {
-                    if (child.isBound(slot.getId())) {
-                        equivalenceColumns.add(slot.getColumn().getName());
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    public TupleId getTupleId() {
-        Preconditions.checkNotNull(desc);
-        return desc.getId();
-    }
-
-    private boolean isEquivalenceExpr(Expr expr) {
-        if (expr instanceof InPredicate) {
-            return true;
-        }
-        if (expr instanceof BinaryPredicate) {
-            final BinaryPredicate predicate = (BinaryPredicate) expr;
-            if (predicate.getOp().isEquivalence()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean isPredicateUsedForPrefixIndex(Expr expr, boolean isJoinConjunct) {
-        if (!(expr instanceof InPredicate)
-                && !(expr instanceof BinaryPredicate)) {
-            return false;
-        }
-        if (expr instanceof InPredicate) {
-            return isInPredicateUsedForPrefixIndex((InPredicate) expr);
-        } else {
-            if (isJoinConjunct) {
-                return isEqualJoinConjunctUsedForPrefixIndex((BinaryPredicate) expr);
-            } else {
-                return isBinaryPredicateUsedForPrefixIndex((BinaryPredicate) expr);
-            }
-        }
-    }
-
-    private boolean isEqualJoinConjunctUsedForPrefixIndex(BinaryPredicate expr) {
-        Preconditions.checkArgument(expr.getOp().isEquivalence());
-        if (expr.isAuxExpr()) {
-            return false;
-        }
-        for (Expr child : expr.getChildren()) {
-            for (SlotDescriptor slot : desc.getMaterializedSlots()) {
-                if (child.isBound(slot.getId()) && isSlotRefNested(child)) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    private boolean isBinaryPredicateUsedForPrefixIndex(BinaryPredicate expr) {
-        if (expr.isAuxExpr() || expr.getOp().isUnequivalence()) {
-            return false;
-        }
-        return (isSlotRefNested(expr.getChild(0)) && expr.getChild(1).isConstant())
-                || (isSlotRefNested(expr.getChild(1)) && expr.getChild(0).isConstant());
-    }
-
-    private boolean isInPredicateUsedForPrefixIndex(InPredicate expr) {
-        if (expr.isNotIn()) {
-            return false;
-        }
-        return isSlotRefNested(expr.getChild(0)) && expr.isLiteralChildren();
-    }
-
-    private boolean isSlotRefNested(Expr expr) {
-        while (expr instanceof CastExpr) {
-            expr = expr.getChild(0);
-        }
-        return expr instanceof SlotRef;
-    }
-
-    @Override
-    public boolean isVectorized() {
-        // Vector query engine only support segment v2
-        if (olapTable.getStorageFormat() == TStorageFormat.V1) {
-            return false;
-        }
-
-        for (Expr expr : conjuncts) {
-            if (!expr.isVectorized()) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    @Override
-    public void setUseVectorized(boolean flag) {
-        this.useVectorized = flag;
-        for (Expr expr : conjuncts) {
-            expr.setUseVectorized(flag);
-        }
     }
 
     @Override
@@ -859,5 +686,15 @@ public class OlapScanNode extends ScanNode {
 
     public void setTotalTabletsNum(long totalTabletsNum) {
         this.totalTabletsNum = totalTabletsNum;
+    }
+
+    @Override
+    public boolean canDoReplicatedJoin() {
+        return Utils.canDoReplicatedJoin(olapTable, selectedIndexId, selectedPartitionIds, scanTabletIds);
+    }
+
+    @VisibleForTesting
+    public long getSelectedIndexId() {
+        return selectedIndexId;
     }
 }

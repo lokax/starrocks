@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.operator.logical;
 
 import com.starrocks.sql.optimizer.ExpressionContext;
@@ -44,24 +44,33 @@ public class LogicalApplyOperator extends LogicalOperator {
     private final boolean needCheckMaxRows;
 
     /**
-     * Mark the subquery isn't appear in AND predicate
+     * Mark the subquery can be cast to Semi/Anti-Join
      */
-    private final boolean fromAndScope;
+    private final boolean useSemiAnti;
+
+    private final boolean needOutputRightChildColumns;
 
     public LogicalApplyOperator(ColumnRefOperator output, ScalarOperator subqueryOperator,
-                                List<ColumnRefOperator> correlationColumnRefs, boolean fromAndScope) {
+                                List<ColumnRefOperator> correlationColumnRefs, boolean useSemiAnti) {
+        this(output, subqueryOperator, correlationColumnRefs, useSemiAnti, false);
+    }
+
+    public LogicalApplyOperator(ColumnRefOperator output, ScalarOperator subqueryOperator,
+                                List<ColumnRefOperator> correlationColumnRefs, boolean useSemiAnti,
+                                boolean needOutputRightChildColumns) {
         super(OperatorType.LOGICAL_APPLY);
         this.output = output;
         this.subqueryOperator = subqueryOperator;
         this.correlationColumnRefs = correlationColumnRefs;
         this.correlationConjuncts = null;
         this.needCheckMaxRows = isScalar();
-        this.fromAndScope = fromAndScope;
+        this.useSemiAnti = useSemiAnti;
+        this.needOutputRightChildColumns = needOutputRightChildColumns;
     }
 
     public LogicalApplyOperator(ColumnRefOperator output, ScalarOperator subqueryOperator,
                                 List<ColumnRefOperator> correlationColumnRefs, ScalarOperator correlationConjuncts,
-                                ScalarOperator predicate, boolean needCheckMaxRows, boolean fromAndScope) {
+                                ScalarOperator predicate, boolean needCheckMaxRows, boolean useSemiAnti) {
         super(OperatorType.LOGICAL_APPLY);
         this.output = output;
         this.subqueryOperator = subqueryOperator;
@@ -69,7 +78,8 @@ public class LogicalApplyOperator extends LogicalOperator {
         this.correlationConjuncts = correlationConjuncts;
         this.predicate = predicate;
         this.needCheckMaxRows = needCheckMaxRows;
-        this.fromAndScope = fromAndScope;
+        this.useSemiAnti = useSemiAnti;
+        this.needOutputRightChildColumns = false;
     }
 
     public ColumnRefOperator getOutput() {
@@ -92,6 +102,7 @@ public class LogicalApplyOperator extends LogicalOperator {
         return subqueryOperator;
     }
 
+
     public List<ColumnRefOperator> getCorrelationColumnRefs() {
         return correlationColumnRefs;
     }
@@ -104,16 +115,17 @@ public class LogicalApplyOperator extends LogicalOperator {
         return needCheckMaxRows;
     }
 
-    public boolean isFromAndScope() {
-        return fromAndScope;
+    public boolean isUseSemiAnti() {
+        return useSemiAnti;
     }
 
     @Override
     public ColumnRefSet getOutputColumns(ExpressionContext expressionContext) {
         ColumnRefSet outputColumns =
                 (ColumnRefSet) expressionContext.getChildLogicalProperty(0).getOutputColumns().clone();
-        outputColumns.union(expressionContext.getChildLogicalProperty(1).getOutputColumns());
-        if (output != null) {
+        if (needOutputRightChildColumns) {
+            outputColumns.union(expressionContext.getChildLogicalProperty(1).getOutputColumns());
+        } else if (output != null) {
             outputColumns.union(output);
         }
         return outputColumns;

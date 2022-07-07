@@ -1,32 +1,18 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.analyzer;
 
 import com.starrocks.utframe.UtFrameUtils;
-import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
-
-import java.io.File;
-import java.util.UUID;
 
 import static com.starrocks.sql.analyzer.AnalyzeTestUtil.analyzeFail;
 import static com.starrocks.sql.analyzer.AnalyzeTestUtil.analyzeSuccess;
 
 public class AnalyzeAggregateTest {
-    // use a unique dir so that it won't be conflict with other unit test which
-    // may also start a Mocked Frontend
-    private static String runningDir = "fe/mocked/AnalyzeAggregateTest/" + UUID.randomUUID().toString() + "/";
-
     @BeforeClass
     public static void beforeClass() throws Exception {
-        UtFrameUtils.createMinStarRocksCluster(runningDir);
+        UtFrameUtils.createMinStarRocksCluster();
         AnalyzeTestUtil.init();
-    }
-
-    @AfterClass
-    public static void tearDown() {
-        File file = new File(runningDir);
-        file.delete();
     }
 
     @Test
@@ -50,6 +36,17 @@ public class AnalyzeAggregateTest {
                 "must be an aggregate expression or appear in GROUP BY clause");
         analyzeSuccess("select abs(count(distinct b1)) from test_object;");
         analyzeSuccess("select date_add(ti, INTERVAL 2 DAY) from tall group by date_add(ti, INTERVAL 2 DAY)");
+
+        analyzeSuccess("select v1,count(*) FROM t0 group by v1 having array_position([1,2,3,4],v1) = 1");
+        analyzeSuccess("select v1,count(*) FROM t0 group by v1 having array_position([1,2,3,v1],4) = 1");
+        analyzeFail("select v1,count(*) FROM t0 group by v1 having array_position([1,2,3,4],v2) = 1");
+        analyzeFail("select v1,count(*) FROM t0 group by v1 having array_position([v1,v2,v3],v1) = 1");
+        analyzeSuccess("select v1,count(*) FROM t0 group by v1 having array_position([1,2,3,4],sum(v2)) = 1");
+        analyzeSuccess("select v1 from t0 group by v1 having parse_json('{\"a\": 1}')->'a'=1");
+        analyzeSuccess("select ta,tc from tall group by ta,tc having ta = @@sql_mode");
+        analyzeSuccess("select ta,tc from tall group by ta,tc having ta = user()");
+
+        analyzeSuccess("select count() from t0");
     }
 
     @Test
@@ -125,5 +122,19 @@ public class AnalyzeAggregateTest {
         analyzeSuccess("select distinct v1 from t0 where v2 = 1");
         analyzeFail("select distinct v1,v2 from t0 order by v3");
         analyzeSuccess("select distinct v1 from t0 order by sum(v2)");
+
+        analyzeFail("select count(distinct v1), count(distinct v3) from tarray",
+                "No matching function with signature: multi_distinct_count(ARRAY)");
+
+        analyzeFail("select abs(distinct v1) from t0");
+        analyzeFail("SELECT VAR_SAMP ( DISTINCT v2 ) FROM v0");
+    }
+
+    @Test
+    public void TestGroupByUseOutput() {
+        analyzeSuccess("select v1 + 1 as v from t0 group by v");
+        analyzeSuccess("select v1 + 1 as v from t0 group by grouping sets((v))");
+        analyzeSuccess("select v1 + 1 as v from t0 group by cube(v)");
+        analyzeSuccess("select v1 + 1 as v from t0 group by rollup(v)");
     }
 }

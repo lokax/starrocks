@@ -26,12 +26,15 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_DIR}/src/util")
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_DIR}/src/util")
 
 set(UTIL_FILES
+  bthreads/executor.cpp
   arrow/row_batch.cpp
-  arrow/row_block.cpp
+  arrow/starrocks_column_to_arrow.cpp
   arrow/utils.cpp
   bfd_parser.cpp
   bitmap.cpp
-  block_compression.cpp
+  compression/block_compression.cpp
+  compression/compression_context_pool_singletons.cpp
+  compression/stream_compression.cpp
   coding.cpp
   cpu_info.cpp
   crc32c.cpp
@@ -39,9 +42,12 @@ set(UTIL_FILES
   dynamic_util.cpp
   debug_util.cpp
   disk_info.cpp
+  download_util.cpp
   errno.cpp
   hash_util.hpp
   json_util.cpp
+  json.cpp
+  json_converter.cpp
   starrocks_metrics.cpp
   mem_info.cpp
   metrics.cpp
@@ -51,7 +57,6 @@ set(UTIL_FILES
   path_builder.cpp
 # TODO: not supported on RHEL 5
 # perf-counters.cpp
-  progress_updater.cpp
   runtime_profile.cpp
   static_asserts.cpp
   string_parser.cpp
@@ -63,17 +68,11 @@ set(UTIL_FILES
   system_metrics.cpp
   url_parser.cpp
   url_coding.cpp
-  file_utils.cpp
   mysql_row_buffer.cpp
-  tuple_row_compare.cpp
   error_util.cc
   spinlock.cc
   filesystem_util.cc
-  load_error_hub.cpp
-  broker_load_error_hub.cpp
-  null_load_error_hub.cpp
   time.cpp
-  os_info.cpp
 # coding_util.cpp
   cidr.cpp
   core_local.cpp
@@ -84,15 +83,12 @@ set(UTIL_FILES
   thrift_rpc_helper.cpp
   faststring.cc
   slice.cpp
+  sm3.cpp
   frame_of_reference_coding.cpp
-  minizip/ioapi.c
-  minizip/unzip.c
-  zip_util.cpp
   utf8_check.cpp
   path_util.cpp
-  file_cache.cpp
   monotime.cpp
-        thread.cpp
+  thread.cpp
   threadpool.cpp
   trace.cpp
   trace_metrics.cpp
@@ -103,12 +99,18 @@ set(UTIL_FILES
   buffered_stream.cpp
   int96.cpp
   hdfs_util.cpp
+  gc_helper.cpp
+  gc_helper_smoothstep.cpp
+  sha.cpp
+  lru_cache.cpp
+  tdigest.cpp
 )
 
-if (WITH_MYSQL)
-    set(UTIL_FILES ${UTIL_FILES}
-        mysql_load_error_hub.cpp
-        )
+# simdjson Runtime Implement Dispatch: https://github.com/simdjson/simdjson/blob/master/doc/implementation-selection.md#runtime-cpu-detection
+# Unset architecture-specific flags to avoid breaking implement runtime dispatch.
+if ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86" OR "${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86_64")
+    set_source_files_properties(json.cpp PROPERTIES COMPILE_FLAGS "-mno-avx -mno-avx2")
+    set_source_files_properties(json_converter.cpp PROPERTIES COMPILE_FLAGS "-mno-avx -mno-avx2")
 endif()
 
 add_library(Util STATIC

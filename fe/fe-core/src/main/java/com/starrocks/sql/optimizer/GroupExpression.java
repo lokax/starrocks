@@ -1,11 +1,14 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer;
 
+import com.clearspring.analytics.util.Lists;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 import com.starrocks.common.Pair;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
+import com.starrocks.sql.optimizer.base.OutputInputProperty;
 import com.starrocks.sql.optimizer.base.PhysicalPropertySet;
 import com.starrocks.sql.optimizer.operator.Operator;
 import com.starrocks.sql.optimizer.rule.Rule;
@@ -15,6 +18,8 @@ import java.util.BitSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * A group-expression is the same as an expression except
@@ -35,11 +40,23 @@ public class GroupExpression {
     private final BitSet ruleMasks = new BitSet(RuleType.NUM_RULES.ordinal() + 1);
     private boolean statsDerived = false;
     private final Map<PhysicalPropertySet, Pair<Double, List<PhysicalPropertySet>>> lowestCostTable;
+    // required property by parent -> output property
+    private final Map<PhysicalPropertySet, PhysicalPropertySet> outputPropertyMap;
+
+    // valid output/input properties, only used in enum plan
+    private final Set<OutputInputProperty> validOutputInputProperties;
+    // property -> plan count, only used in enum plan
+    private final Map<OutputInputProperty, Integer> propertiesPlanCountMap;
+
+    private boolean isUnused = false;
 
     public GroupExpression(Operator op, List<Group> inputs) {
         this.op = op;
         this.inputs = inputs;
         this.lowestCostTable = Maps.newHashMap();
+        this.validOutputInputProperties = Sets.newLinkedHashSet();
+        this.propertiesPlanCountMap = Maps.newLinkedHashMap();
+        this.outputPropertyMap = Maps.newHashMap();
     }
 
     public Group getGroup() {
@@ -71,7 +88,7 @@ public class GroupExpression {
     }
 
     public boolean isUnused() {
-        return hasEmptyRootGroup() || hasEmptyChildGroup();
+        return hasEmptyRootGroup() || hasEmptyChildGroup() || isUnused;
     }
 
     private boolean hasEmptyChildGroup() {
@@ -90,8 +107,61 @@ public class GroupExpression {
         ruleMasks.set(rule.type().ordinal());
     }
 
+    public void setUnused(boolean isUnused) {
+        this.isUnused = isUnused;
+    }
+
     public boolean hasRuleExplored(Rule rule) {
         return ruleMasks.get(rule.type().ordinal());
+    }
+
+    public PhysicalPropertySet getOutputProperty(PhysicalPropertySet requiredPropertySet) {
+        PhysicalPropertySet outputProperty = outputPropertyMap.get(requiredPropertySet);
+        Preconditions.checkState(outputProperty != null);
+        return outputProperty;
+    }
+
+    public void setOutputPropertySatisfyRequiredProperty(PhysicalPropertySet outputPropertySet,
+                                                         PhysicalPropertySet requiredPropertySet) {
+        this.outputPropertyMap.put(requiredPropertySet, outputPropertySet);
+    }
+
+    public void addValidOutputInputProperties(PhysicalPropertySet outputProperty,
+                                              List<PhysicalPropertySet> inputProperties) {
+        validOutputInputProperties.add(OutputInputProperty.of(outputProperty, inputProperties));
+    }
+
+    public List<List<PhysicalPropertySet>> getRequiredInputProperties(PhysicalPropertySet requiredProperty) {
+        List<List<PhysicalPropertySet>> result = Lists.newArrayList();
+        for (OutputInputProperty outputInputProperty : validOutputInputProperties) {
+            if (outputInputProperty.getOutputProperty().equals(requiredProperty)) {
+                result.add(outputInputProperty.getInputProperties());
+            }
+        }
+        return result;
+    }
+
+    public boolean hasValidSubPlan() {
+        return !validOutputInputProperties.isEmpty();
+    }
+
+    public void addPlanCountOfProperties(OutputInputProperty properties, int count) {
+        propertiesPlanCountMap.put(properties, count);
+    }
+
+    public Map<OutputInputProperty, Integer> getPropertiesPlanCountMap(
+            PhysicalPropertySet requiredProperty) {
+        Map<OutputInputProperty, Integer> result = Maps.newLinkedHashMap();
+        propertiesPlanCountMap.entrySet().stream()
+                .filter(entry -> entry.getKey().getOutputProperty().equals(requiredProperty))
+                .forEach(entry -> result.put(entry.getKey(), entry.getValue()));
+        return result;
+    }
+
+    public int getRequiredPropertyPlanCount(PhysicalPropertySet requiredProperty) {
+        return propertiesPlanCountMap.entrySet().stream()
+                .filter(entry -> entry.getKey().getOutputProperty().equals(requiredProperty))
+                .mapToInt(Map.Entry::getValue).sum();
     }
 
     /**
@@ -124,16 +194,38 @@ public class GroupExpression {
      * @param inputProperties  List of children input properties required
      * @param cost             Cost
      */
-    public void setPropertyWithCost(PhysicalPropertySet outputProperties,
-                                    List<PhysicalPropertySet> inputProperties,
-                                    double cost) {
+    public boolean updatePropertyWithCost(PhysicalPropertySet outputProperties,
+                                          List<PhysicalPropertySet> inputProperties,
+                                          double cost) {
         if (lowestCostTable.containsKey(outputProperties)) {
             if (lowestCostTable.get(outputProperties).first > cost) {
                 lowestCostTable.put(outputProperties, new Pair<>(cost, inputProperties));
+                return true;
             }
         } else {
             lowestCostTable.put(outputProperties, new Pair<>(cost, inputProperties));
+            return true;
         }
+        return false;
+    }
+
+    // use other Group Expression to update the lowestCostTable
+    public void updatePropertyWithCost(GroupExpression other) {
+        for (Map.Entry<PhysicalPropertySet, Pair<Double, List<PhysicalPropertySet>>> entry : other.lowestCostTable
+                .entrySet()) {
+            updatePropertyWithCost(entry.getKey(), entry.getValue().second, entry.getValue().first);
+        }
+    }
+
+    // merge other group expression state to this group expression
+    public void mergeGroupExpression(GroupExpression other) {
+        // 1. low Cost Table
+        for (Map.Entry<PhysicalPropertySet, Pair<Double, List<PhysicalPropertySet>>> entry : other.lowestCostTable
+                .entrySet()) {
+            updatePropertyWithCost(entry.getKey(), entry.getValue().second, entry.getValue().first);
+        }
+        // 2. outputPropertyMap
+        outputPropertyMap.putAll(other.outputPropertyMap);
     }
 
     // This function will drive input group logical property first,
@@ -188,19 +280,29 @@ public class GroupExpression {
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder();
-        sb.append("\n {root group ");
+        sb.append("{root group ");
         if (group != null) {
             sb.append(group.getId());
         } else {
             sb.append(-1);
         }
-        sb.append("\t root operator: ")
-                .append(op).append('\n')
-                .append("\t child group id ");
-        for (Group input : inputs) {
-            sb.append("\t").append(input.getId());
-        }
+        sb.append(" root operator: ")
+                .append(op)
+                .append(" child: ");
+        sb.append(inputs.stream().map(s -> String.valueOf(s.getId())).collect(Collectors.joining(", ")));
         sb.append("}");
+        return sb.toString();
+    }
+
+    public String toPrettyString(String headlineIndent, String detailIndent) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(detailIndent)
+                .append(op.accept(new OptimizerTraceUtil.OperatorTracePrinter(), null)).append("\n");
+        String childHeadlineIndent = detailIndent + "->  ";
+        String childDetailIndent = detailIndent + "    ";
+        for (Group input : inputs) {
+            sb.append(input.toPrettyString(childHeadlineIndent, childDetailIndent));
+        }
         return sb.toString();
     }
 }

@@ -21,10 +21,14 @@
 
 package com.starrocks.catalog;
 
+import com.google.common.collect.ImmutableMap;
 import com.starrocks.analysis.AccessTestUtil;
 import com.starrocks.common.FeConstants;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
+import com.starrocks.system.BackendHbResponse;
 import com.starrocks.thrift.TDisk;
+import com.starrocks.thrift.TStorageMedium;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -47,25 +51,27 @@ public class BackendTest {
     private int bePort = 21235;
     private int httpPort = 21237;
     private int beRpcPort = 21238;
+    private int starletPort = 21239;
 
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
 
-    private FakeCatalog fakeCatalog;
+    private FakeGlobalStateMgr fakeGlobalStateMgr;
     private FakeEditLog fakeEditLog;
 
     @Before
     public void setUp() {
-        catalog = AccessTestUtil.fetchAdminCatalog();
+        globalStateMgr = AccessTestUtil.fetchAdminCatalog();
 
-        fakeCatalog = new FakeCatalog();
+        fakeGlobalStateMgr = new FakeGlobalStateMgr();
         fakeEditLog = new FakeEditLog();
 
-        FakeCatalog.setCatalog(catalog);
-        FakeCatalog.setMetaVersion(FeConstants.meta_version);
-        FakeCatalog.setSystemInfo(AccessTestUtil.fetchSystemInfoService());
+        FakeGlobalStateMgr.setGlobalStateMgr(globalStateMgr);
+        FakeGlobalStateMgr.setMetaVersion(FeConstants.meta_version);
+        FakeGlobalStateMgr.setSystemInfo(AccessTestUtil.fetchSystemInfoService());
 
         backend = new Backend(backendId, host, heartbeatPort);
         backend.updateOnce(bePort, httpPort, beRpcPort);
+        backend.setStarletPort(starletPort);
     }
 
     @Test
@@ -74,6 +80,7 @@ public class BackendTest {
         Assert.assertEquals(host, backend.getHost());
         Assert.assertEquals(heartbeatPort, backend.getHeartbeatPort());
         Assert.assertEquals(bePort, backend.getBePort());
+        Assert.assertEquals(starletPort, backend.getStarletPort());
 
         // set new port
         int newBePort = 31235;
@@ -183,6 +190,52 @@ public class BackendTest {
         // 3. delete files
         dis.close();
         file.delete();
+    }
+
+    @Test
+    public void testGetBackendStorageTypeCnt() {
+
+        int backendStorageTypeCnt;
+        Backend backend = new Backend(100L, "192.168.1.1", 9050);
+        backendStorageTypeCnt = backend.getAvailableBackendStorageTypeCnt();
+        Assert.assertEquals(0, backendStorageTypeCnt);
+
+        backend.setAlive(true);
+        DiskInfo diskInfo1 = new DiskInfo("/tmp/abc");
+        diskInfo1.setStorageMedium(TStorageMedium.HDD);
+        ImmutableMap<String, DiskInfo> disks = ImmutableMap.of("/tmp/abc", diskInfo1);
+        backend.setDisks(disks);
+        backendStorageTypeCnt = backend.getAvailableBackendStorageTypeCnt();
+        Assert.assertEquals(1, backendStorageTypeCnt);
+
+        DiskInfo diskInfo2 = new DiskInfo("/tmp/abc");
+        diskInfo2.setStorageMedium(TStorageMedium.SSD);
+        disks = ImmutableMap.of("/tmp/abc", diskInfo1, "/tmp/abcd", diskInfo2);
+        backend.setDisks(disks);
+        backendStorageTypeCnt = backend.getAvailableBackendStorageTypeCnt();
+        Assert.assertEquals(2, backendStorageTypeCnt);
+
+        diskInfo2.setStorageMedium(TStorageMedium.HDD);
+        disks = ImmutableMap.of("/tmp/abc", diskInfo1, "/tmp/abcd", diskInfo2);
+        backend.setDisks(disks);
+        backendStorageTypeCnt = backend.getAvailableBackendStorageTypeCnt();
+        Assert.assertEquals(1, backendStorageTypeCnt);
+
+        diskInfo1.setState(DiskInfo.DiskState.OFFLINE);
+        disks = ImmutableMap.of("/tmp/abc", diskInfo1);
+        backend.setDisks(disks);
+        backendStorageTypeCnt = backend.getAvailableBackendStorageTypeCnt();
+        Assert.assertEquals(0, backendStorageTypeCnt);
+
+    }
+
+    @Test
+    public void testHeartbeatOk() throws Exception {
+        Backend be = new Backend();
+        BackendHbResponse hbResponse = new BackendHbResponse(1, 9060, 8040, 8060, 8090,
+                System.currentTimeMillis(), "1.0", 64);
+        boolean isChanged = be.handleHbResponse(hbResponse);
+        Assert.assertTrue(isChanged);
     }
 
 }

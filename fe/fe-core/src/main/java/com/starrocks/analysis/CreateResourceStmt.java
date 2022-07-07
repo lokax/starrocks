@@ -21,7 +21,6 @@
 
 package com.starrocks.analysis;
 
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Resource.ResourceType;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.ErrorCode;
@@ -31,7 +30,9 @@ import com.starrocks.common.UserException;
 import com.starrocks.common.util.PrintableMap;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
 
+import java.util.Arrays;
 import java.util.Map;
 
 // CREATE [EXTERNAL] RESOURCE resource_name
@@ -68,7 +69,7 @@ public class CreateResourceStmt extends DdlStmt {
         super.analyze(analyzer);
 
         // check auth
-        if (!Catalog.getCurrentCatalog().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
+        if (!GlobalStateMgr.getCurrentState().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "ADMIN");
         }
 
@@ -85,13 +86,12 @@ public class CreateResourceStmt extends DdlStmt {
         }
         resourceType = ResourceType.fromString(type);
         if (resourceType == ResourceType.UNKNOWN) {
-            throw new AnalysisException("Unsupported resource type: " + type);
+            throw new AnalysisException("Unrecognized resource type: " + type + ". " + "Only " +
+                    Arrays.toString(Arrays.stream(ResourceType.values())
+                            .filter(t -> t != ResourceType.UNKNOWN).toArray()) + " are supported.");
         }
-        if (resourceType == ResourceType.SPARK && !isExternal) {
-            throw new AnalysisException("Spark is external resource");
-        }
-        if (resourceType == ResourceType.HIVE && !isExternal) {
-            throw new AnalysisException("Hive is external resource");
+        if (!isExternal) {
+            throw new AnalysisException(resourceType + " resource type must be external.");
         }
     }
 

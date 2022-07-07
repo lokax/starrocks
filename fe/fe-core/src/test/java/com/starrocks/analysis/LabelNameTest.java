@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/analysis/LabelNameTest.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -38,7 +34,7 @@ public class LabelNameTest {
             {
                 analyzer.getClusterName();
                 minTimes = 0;
-                result = "testCluster";
+                result = "default_cluster";
             }
         };
     }
@@ -55,12 +51,12 @@ public class LabelNameTest {
 
         LabelName label = new LabelName("testDb", "testLabel");
         label.analyze(analyzer);
-        Assert.assertEquals("`testCluster:testDb`.`testLabel`", label.toString());
+        Assert.assertEquals("`default_cluster:testDb`.`testLabel`", label.toString());
 
         label = new LabelName("", "testLabel");
         label.analyze(analyzer);
-        Assert.assertEquals("`testCluster:testDb`.`testLabel`", label.toString());
-        Assert.assertEquals("testCluster:testDb", label.getDbName());
+        Assert.assertEquals("`default_cluster:testDb`.`testLabel`", label.toString());
+        Assert.assertEquals("default_cluster:testDb", label.getDbName());
         Assert.assertEquals("testLabel", label.getLabelName());
     }
 

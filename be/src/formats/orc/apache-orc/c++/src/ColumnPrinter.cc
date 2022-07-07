@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/orc/tree/main/c++/src/ColumnPrinter.cc
-
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
@@ -22,8 +18,7 @@
 
 #include "orc/ColumnPrinter.hh"
 
-#include <time.h>
-
+#include <ctime>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -41,7 +36,7 @@ namespace orc {
 class VoidColumnPrinter : public ColumnPrinter {
 public:
     VoidColumnPrinter(std::string&);
-    ~VoidColumnPrinter() override {}
+    ~VoidColumnPrinter() override = default;
     void printRow(uint64_t rowId) override;
     void reset(const ColumnVectorBatch& batch) override;
 };
@@ -52,7 +47,7 @@ private:
 
 public:
     BooleanColumnPrinter(std::string&);
-    ~BooleanColumnPrinter() override {}
+    ~BooleanColumnPrinter() override = default;
     void printRow(uint64_t rowId) override;
     void reset(const ColumnVectorBatch& batch) override;
 };
@@ -63,7 +58,7 @@ private:
 
 public:
     LongColumnPrinter(std::string&);
-    ~LongColumnPrinter() override {}
+    ~LongColumnPrinter() override = default;
     void printRow(uint64_t rowId) override;
     void reset(const ColumnVectorBatch& batch) override;
 };
@@ -75,7 +70,7 @@ private:
 
 public:
     DoubleColumnPrinter(std::string&, const Type& type);
-    virtual ~DoubleColumnPrinter() override {}
+    ~DoubleColumnPrinter() override = default;
     void printRow(uint64_t rowId) override;
     void reset(const ColumnVectorBatch& batch) override;
 };
@@ -87,7 +82,7 @@ private:
 
 public:
     TimestampColumnPrinter(std::string&);
-    ~TimestampColumnPrinter() override {}
+    ~TimestampColumnPrinter() override = default;
     void printRow(uint64_t rowId) override;
     void reset(const ColumnVectorBatch& batch) override;
 };
@@ -98,7 +93,7 @@ private:
 
 public:
     DateColumnPrinter(std::string&);
-    ~DateColumnPrinter() override {}
+    ~DateColumnPrinter() override = default;
     void printRow(uint64_t rowId) override;
     void reset(const ColumnVectorBatch& batch) override;
 };
@@ -110,7 +105,7 @@ private:
 
 public:
     Decimal64ColumnPrinter(std::string&);
-    ~Decimal64ColumnPrinter() override {}
+    ~Decimal64ColumnPrinter() override = default;
     void printRow(uint64_t rowId) override;
     void reset(const ColumnVectorBatch& batch) override;
 };
@@ -122,7 +117,7 @@ private:
 
 public:
     Decimal128ColumnPrinter(std::string&);
-    ~Decimal128ColumnPrinter() override {}
+    ~Decimal128ColumnPrinter() override = default;
     void printRow(uint64_t rowId) override;
     void reset(const ColumnVectorBatch& batch) override;
 };
@@ -134,7 +129,7 @@ private:
 
 public:
     StringColumnPrinter(std::string&);
-    virtual ~StringColumnPrinter() override {}
+    ~StringColumnPrinter() override = default;
     void printRow(uint64_t rowId) override;
     void reset(const ColumnVectorBatch& batch) override;
 };
@@ -146,7 +141,7 @@ private:
 
 public:
     BinaryColumnPrinter(std::string&);
-    virtual ~BinaryColumnPrinter() override {}
+    ~BinaryColumnPrinter() override = default;
     void printRow(uint64_t rowId) override;
     void reset(const ColumnVectorBatch& batch) override;
 };
@@ -158,7 +153,7 @@ private:
 
 public:
     ListColumnPrinter(std::string&, const Type& type);
-    virtual ~ListColumnPrinter() override {}
+    ~ListColumnPrinter() override = default;
     void printRow(uint64_t rowId) override;
     void reset(const ColumnVectorBatch& batch) override;
 };
@@ -171,7 +166,7 @@ private:
 
 public:
     MapColumnPrinter(std::string&, const Type& type);
-    virtual ~MapColumnPrinter() override {}
+    ~MapColumnPrinter() override = default;
     void printRow(uint64_t rowId) override;
     void reset(const ColumnVectorBatch& batch) override;
 };
@@ -365,7 +360,7 @@ std::string toDecimalString(int64_t value, int32_t scale) {
         buffer << value;
         return buffer.str();
     }
-    std::string sign = "";
+    std::string sign;
     if (value < 0) {
         sign = "-";
         value = -value;

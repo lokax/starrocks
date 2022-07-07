@@ -1,9 +1,10 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.dump;
 
 import com.google.common.base.Preconditions;
 import com.starrocks.catalog.Table;
+import com.starrocks.catalog.View;
 import com.starrocks.common.Pair;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.qe.VariableMgr;
@@ -11,21 +12,26 @@ import com.starrocks.sql.optimizer.statistics.ColumnStatistic;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 public class QueryDumpInfo implements DumpInfo {
     private String originStmt = "";
     // tableId-><dbName, table>
-    private Map<Long, Pair<String, Table>> tableMap = new HashMap<>();
+    private final Map<Long, Pair<String, Table>> tableMap = new HashMap<>();
+    // viewId->view
+    private final Map<Long, View> viewMap = new LinkedHashMap<>();
     // tableName->partitionName->partitionRowCount
-    private Map<String, Map<String, Long>> partitionRowCountMap = new HashMap<>();
+    private final Map<String, Map<String, Long>> partitionRowCountMap = new HashMap<>();
     // tableName->columnName->column statistics
-    private Map<String, Map<String, ColumnStatistic>> tableStatisticsMap = new HashMap<>();
+    private final Map<String, Map<String, ColumnStatistic>> tableStatisticsMap = new HashMap<>();
     private SessionVariable sessionVariable;
     // tableName->createTableStmt
-    private Map<String, String> createTableStmtMap = new HashMap<>();
-    private List<String> exceptionList = new ArrayList<>();
+    private final Map<String, String> createTableStmtMap = new HashMap<>();
+    // viewName->createViewStmt
+    private final Map<String, String> createViewStmtMap = new LinkedHashMap<>();
+    private final List<String> exceptionList = new ArrayList<>();
     private int beNum;
 
     public QueryDumpInfo(SessionVariable sessionVariable) {
@@ -64,6 +70,10 @@ public class QueryDumpInfo implements DumpInfo {
         addPartitionRowCount(tableName, partition, rowCount);
     }
 
+    public void addView(View view) {
+        viewMap.put(view.getId(), view);
+    }
+
     @Override
     public void reset() {
         this.originStmt = "";
@@ -85,16 +95,9 @@ public class QueryDumpInfo implements DumpInfo {
         return partitionRowCountMap;
     }
 
-    public Long getRowCount(long tableId, String partition) {
-        return partitionRowCountMap.get(tableId).get(partition);
-    }
-
     @Override
     public void addTableStatistics(Table table, String column, ColumnStatistic columnStatistic) {
-        if (!tableStatisticsMap.containsKey(getTableName(table.getId()))) {
-            tableStatisticsMap.put(getTableName(table.getId()), new HashMap<>());
-        }
-        tableStatisticsMap.get(getTableName(table.getId())).put(column, columnStatistic);
+        addTableStatistics(getTableName(table.getId()), column, columnStatistic);
     }
 
     public void addTableStatistics(String tableName, String column, ColumnStatistic columnStatistic) {
@@ -112,8 +115,16 @@ public class QueryDumpInfo implements DumpInfo {
         return tableMap;
     }
 
+    public Map<Long, View> getViewMap() {
+        return viewMap;
+    }
+
     public Map<String, String> getCreateTableStmtMap() {
         return createTableStmtMap;
+    }
+
+    public Map<String, String> getCreateViewStmtMap() {
+        return createViewStmtMap;
     }
 
     // return table full name
@@ -125,6 +136,10 @@ public class QueryDumpInfo implements DumpInfo {
 
     public void addTableCreateStmt(String tableName, String createTableStmt) {
         createTableStmtMap.put(tableName, createTableStmt);
+    }
+
+    public void addViewCreateStmt(String viewName, String createViewStmt) {
+        createViewStmtMap.put(viewName, createViewStmt);
     }
 
     @Override

@@ -1,10 +1,10 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "storage/protobuf_file.h"
 
 #include <google/protobuf/message.h>
 
-#include "env/env.h"
+#include "fs/fs.h"
 #include "gutil/strings/substitute.h"
 #include "storage/olap_define.h"
 #include "storage/utils.h"
@@ -25,7 +25,8 @@ typedef struct _FixedFileHeader {
     uint32_t protobuf_checksum;
 } __attribute__((packed)) FixedFileHeader;
 
-ProtobufFile::ProtobufFile(std::string path, Env* env) : _path(std::move(path)), _env(env ? env : Env::Default()) {}
+ProtobufFile::ProtobufFile(std::string path, FileSystem* fs)
+        : _path(std::move(path)), _fs(fs ? fs : FileSystem::Default()) {}
 
 Status ProtobufFile::save(const ::google::protobuf::Message& message, bool sync) {
     uint32_t unused_flag = 0;
@@ -38,8 +39,8 @@ Status ProtobufFile::save(const ::google::protobuf::Message& message, bool sync)
     header.version = OLAP_DATA_VERSION_APPLIED;
     header.magic_number = OLAP_FIX_HEADER_MAGIC_NUMBER;
 
-    std::unique_ptr<WritableFile> output_file;
-    RETURN_IF_ERROR(_env->new_writable_file(_path, &output_file));
+    WritableFileOptions opts{.sync_on_close = false, .mode = FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE};
+    ASSIGN_OR_RETURN(auto output_file, _fs->new_writable_file(opts, _path));
     RETURN_IF_ERROR(output_file->append(Slice((const char*)(&header), sizeof(header))));
     RETURN_IF_ERROR(output_file->append(Slice((const char*)(&unused_flag), sizeof(unused_flag))));
     RETURN_IF_ERROR(output_file->append(serialized_message));
@@ -47,29 +48,31 @@ Status ProtobufFile::save(const ::google::protobuf::Message& message, bool sync)
 }
 
 Status ProtobufFile::load(::google::protobuf::Message* message) {
-    std::unique_ptr<SequentialFile> input_file;
-    RETURN_IF_ERROR(_env->new_sequential_file(_path, &input_file));
+    ASSIGN_OR_RETURN(auto input_file, _fs->new_sequential_file(_path));
 
     FixedFileHeader header;
-    Slice buff((char*)&header, sizeof(header));
-    RETURN_IF_ERROR(input_file->read(&buff));
+    ASSIGN_OR_RETURN(auto nread, input_file->read(&header, sizeof(header)));
+    if (nread != sizeof(header)) {
+        return Status::Corruption("fail to read header");
+    }
     if (header.magic_number != OLAP_FIX_HEADER_MAGIC_NUMBER) {
         return Status::Corruption(strings::Substitute("invalid magic number $0", header.magic_number));
     }
 
     uint32_t unused_flag;
-    buff = Slice((char*)&unused_flag, sizeof(unused_flag));
-    RETURN_IF_ERROR(input_file->read(&buff));
+    ASSIGN_OR_RETURN(nread, input_file->read(&unused_flag, sizeof(unused_flag)));
+    if (UNLIKELY(nread != sizeof(unused_flag))) {
+        return Status::Corruption("fail to read flag");
+    }
 
     std::string str;
     raw::stl_string_resize_uninitialized(&str, header.protobuf_length + 1);
-    buff = Slice(str);
-    RETURN_IF_ERROR(input_file->read(&buff));
-    str.resize(buff.size);
-    if (buff.size != header.protobuf_length) {
+    ASSIGN_OR_RETURN(nread, input_file->read(str.data(), str.size()));
+    str.resize(nread);
+    if (str.size() != header.protobuf_length) {
         return Status::Corruption("mismatched serialized size");
     }
-    if (olap_adler32(ADLER32_INIT, buff.data, buff.size) != header.protobuf_checksum) {
+    if (olap_adler32(ADLER32_INIT, str.data(), str.size()) != header.protobuf_checksum) {
         return Status::Corruption("mismatched checksum");
     }
     if (!message->ParseFromString(str)) {

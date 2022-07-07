@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/backup/BackupJobInfoTest.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -62,8 +58,7 @@ public class BackupJobInfoTest {
                 + "                        }\n"
                 + "                    },\n"
                 + "                    \"id\": 10011,\n"
-                + "                    \"version\": 11,\n"
-                + "                    \"version_hash\": 123456789\n"
+                + "                    \"version\": 11\n"
                 + "                }\n"
                 + "            },\n"
                 + "            \"id\": 10010\n"
@@ -90,8 +85,7 @@ public class BackupJobInfoTest {
                 + "                        }\n"
                 + "                    },\n"
                 + "                    \"id\": 10007,\n"
-                + "                    \"version\": 20,\n"
-                + "                    \"version_hash\": 123534645745\n"
+                + "                    \"version\": 20\n"
                 + "                },\n"
                 + "                \"partition1\": {\n"
                 + "                    \"indexes\": {\n"
@@ -113,8 +107,7 @@ public class BackupJobInfoTest {
                 + "                        }\n"
                 + "                    },\n"
                 + "                    \"id\": 10002,\n"
-                + "                    \"version\": 21,\n"
-                + "                    \"version_hash\": 345346234234\n"
+                + "                    \"version\": 21\n"
                 + "                }\n"
                 + "            },\n"
                 + "            \"id\": 10001\n"

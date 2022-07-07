@@ -29,9 +29,10 @@ import com.google.common.collect.Sets;
 import com.starrocks.alter.SchemaChangeHandler;
 import com.starrocks.catalog.AggregateType;
 import com.starrocks.catalog.BrokerTable;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.ExternalOlapTable;
+import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.MysqlTable;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
@@ -51,8 +52,10 @@ import com.starrocks.planner.DataSink;
 import com.starrocks.planner.ExportSink;
 import com.starrocks.planner.OlapTableSink;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.rewrite.ExprRewriter;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.FrontendOptions;
+import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.thrift.TUniqueId;
 import com.starrocks.transaction.TransactionState;
 import com.starrocks.transaction.TransactionState.LoadJobSourceType;
@@ -82,7 +85,7 @@ import java.util.Set;
  * The only difference is that non-streaming will record the load info in LoadManager and return label.
  * User can check the load info by show load stmt.
  */
-public class InsertStmt extends DdlStmt {
+public class InsertStmt extends DmlStmt {
     private static final Logger LOG = LogManager.getLogger(InsertStmt.class);
 
     public static final String SHUFFLE_HINT = "SHUFFLE";
@@ -90,12 +93,13 @@ public class InsertStmt extends DdlStmt {
     public static final String STREAMING = "STREAMING";
 
     private final TableName tblName;
-    private final PartitionNames targetPartitionNames;
+    private PartitionNames targetPartitionNames;
     // parsed from targetPartitionNames.
     // if targetPartitionNames is not set, add all formal partitions' id of the table into it
     private List<Long> targetPartitionIds = Lists.newArrayList();
-    private final List<String> targetColumnNames;
+    private List<String> targetColumnNames;
     private QueryStmt queryStmt;
+    private QueryStatement queryStatement;
     private final List<String> planHints;
     private Boolean isRepartition;
     private boolean isStreaming = false;
@@ -122,12 +126,19 @@ public class InsertStmt extends DdlStmt {
     private DataPartition dataPartition;
 
     private List<Column> targetColumns = Lists.newArrayList();
+    private boolean isOverwrite;
+    private long overwriteJobId = -1;
 
     /*
      * InsertStmt may be analyzed twice, but transaction must be only begun once.
      * So use a boolean to check if transaction already begun.
      */
     private boolean isTransactionBegin = false;
+
+    // The default value of this variable is false, which means that the insert operation created by the user
+    // it is not allowed to write data to the materialized view.
+    // If this is set to true it means a system refresh operation, which is allowed to write to materialized view.
+    private boolean isSystem = false;
 
     public InsertStmt(InsertTarget target, String label, List<String> cols, InsertSource source, List<String> hints) {
         this.tblName = target.getTblName();
@@ -142,12 +153,27 @@ public class InsertStmt extends DdlStmt {
         }
     }
 
+    public InsertStmt(InsertTarget target, String label, List<String> cols, QueryStatement queryStatement,
+                      List<String> hints, boolean isOverwrite) {
+        this.tblName = target.getTblName();
+        this.targetPartitionNames = target.getPartitionNames();
+        this.label = label;
+        this.queryStatement = queryStatement;
+        this.planHints = hints;
+        this.targetColumnNames = cols;
+        this.isOverwrite = isOverwrite;
+
+        if (!Strings.isNullOrEmpty(label)) {
+            isUserSpecifiedLabel = true;
+        }
+    }
+
     // Ctor for CreateTableAsSelectStmt
-    public InsertStmt(TableName name, QueryStmt queryStmt) {
+    public InsertStmt(TableName name, QueryStatement queryStatement) {
         this.tblName = name;
         this.targetPartitionNames = null;
         this.targetColumnNames = null;
-        this.queryStmt = queryStmt;
+        this.queryStatement = queryStatement;
         this.planHints = null;
     }
 
@@ -179,6 +205,22 @@ public class InsertStmt extends DdlStmt {
         return tblName.getDb();
     }
 
+    public boolean isOverwrite() {
+        return isOverwrite;
+    }
+
+    public void setOverwrite(boolean overwrite) {
+        isOverwrite = overwrite;
+    }
+
+    public void setOverwriteJobId(long overwriteJobId) {
+        this.overwriteJobId = overwriteJobId;
+    }
+
+    public boolean hasOverwriteJob() {
+        return overwriteJobId > 0;
+    }
+
     // TODO(zc): used to get all dbs for lock
     public void getDbs(ConnectContext context, Map<String, Database> dbs) throws AnalysisException {
         // get dbs of statement
@@ -188,14 +230,15 @@ public class InsertStmt extends DdlStmt {
         String dbName = tblName.getDb();
 
         // check exist
-        Database db = context.getCatalog().getDb(dbName);
+        Database db = context.getGlobalStateMgr().getDb(dbName);
         if (db == null) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
         }
 
         // check access
-        if (!Catalog.getCurrentCatalog().getAuth().checkTblPriv(ConnectContext.get(), tblName.getDb(), tblName.getTbl(),
-                PrivPredicate.LOAD)) {
+        if (!GlobalStateMgr.getCurrentState().getAuth()
+                .checkTblPriv(ConnectContext.get(), tblName.getDb(), tblName.getTbl(),
+                        PrivPredicate.LOAD)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "LOAD",
                     ConnectContext.get().getQualifiedUser(),
                     ConnectContext.get().getRemoteIP(), tblName.getTbl());
@@ -212,15 +255,22 @@ public class InsertStmt extends DdlStmt {
         this.queryStmt = queryStmt;
     }
 
-    @Override
-    public void rewriteExprs(ExprRewriter rewriter) throws AnalysisException {
-        Preconditions.checkState(isAnalyzed());
-        queryStmt.rewriteExprs(rewriter);
+    public QueryStatement getQueryStatement() {
+        return queryStatement;
+    }
+
+    public void setQueryStatement(QueryStatement queryStatement) {
+        this.queryStatement = queryStatement;
     }
 
     @Override
     public boolean isExplain() {
-        return queryStmt.isExplain();
+        return queryStatement.isExplain();
+    }
+
+    @Override
+    public ExplainLevel getExplainLevel() {
+        return queryStatement.getExplainLevel();
     }
 
     public boolean isStreaming() {
@@ -247,6 +297,14 @@ public class InsertStmt extends DdlStmt {
         return isTransactionBegin;
     }
 
+    public boolean isSystem() {
+        return isSystem;
+    }
+
+    public void setSystem(boolean system) {
+        isSystem = system;
+    }
+
     @Override
     public void analyze(Analyzer analyzer) throws UserException {
         super.analyze(analyzer);
@@ -256,7 +314,7 @@ public class InsertStmt extends DdlStmt {
         }
 
         // Check privilege
-        if (!Catalog.getCurrentCatalog().getAuth().checkTblPriv(ConnectContext.get(), tblName.getDb(),
+        if (!GlobalStateMgr.getCurrentState().getAuth().checkTblPriv(ConnectContext.get(), tblName.getDb(),
                 tblName.getTbl(), PrivPredicate.LOAD)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "LOAD",
                     ConnectContext.get().getQualifiedUser(),
@@ -287,10 +345,20 @@ public class InsertStmt extends DdlStmt {
                 label = "insert_" + DebugUtil.printId(analyzer.getContext().getExecutionId());
             }
 
-            if (targetTable instanceof OlapTable) {
+            if (targetTable instanceof ExternalOlapTable) {
+                LoadJobSourceType sourceType = LoadJobSourceType.INSERT_STREAMING;
+                ExternalOlapTable externalTable = (ExternalOlapTable) targetTable;
+                transactionId = GlobalStateMgr.getCurrentGlobalTransactionMgr()
+                        .beginRemoteTransaction(externalTable.getSourceTableDbId(),
+                                Lists.newArrayList(externalTable.getSourceTableId()), label,
+                                externalTable.getSourceTableHost(),
+                                externalTable.getSourceTablePort(),
+                                new TxnCoordinator(TxnSourceType.FE, FrontendOptions.getLocalHostAddress()),
+                                sourceType, timeoutSecond);
+            } else if (targetTable instanceof OlapTable) {
                 LoadJobSourceType sourceType = LoadJobSourceType.INSERT_STREAMING;
                 MetricRepo.COUNTER_LOAD_ADD.increase(1L);
-                transactionId = Catalog.getCurrentGlobalTransactionMgr().beginTransaction(db.getId(),
+                transactionId = GlobalStateMgr.getCurrentGlobalTransactionMgr().beginTransaction(db.getId(),
                         Lists.newArrayList(targetTable.getId()), label,
                         new TxnCoordinator(TxnSourceType.FE, FrontendOptions.getLocalHostAddress()),
                         sourceType, timeoutSecond);
@@ -299,7 +367,7 @@ public class InsertStmt extends DdlStmt {
         }
 
         // init data sink
-        if (!isExplain() && targetTable instanceof OlapTable) {
+        if (!isExplain() && (targetTable instanceof OlapTable || targetTable instanceof ExternalOlapTable)) {
             OlapTableSink sink = (OlapTableSink) dataSink;
             TUniqueId loadId = analyzer.getContext().getExecutionId();
             sink.init(loadId, transactionId, db.getId(), timeoutSecond);
@@ -315,7 +383,7 @@ public class InsertStmt extends DdlStmt {
             }
         }
 
-        if (targetTable instanceof OlapTable) {
+        if ((targetTable instanceof OlapTable) || (targetTable instanceof ExternalOlapTable)) {
             OlapTable olapTable = (OlapTable) targetTable;
 
             // partition
@@ -385,7 +453,8 @@ public class InsertStmt extends DdlStmt {
             if (mentionedCols.contains(col.getName())) {
                 continue;
             }
-            if (col.getDefaultValue() == null && !col.isAllowNull()) {
+            Column.DefaultValueType defaultValueType = col.getDefaultValueType();
+            if (defaultValueType == Column.DefaultValueType.NULL && !col.isAllowNull()) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_COL_NOT_MENTIONED, col.getName());
             }
         }
@@ -445,7 +514,8 @@ public class InsertStmt extends DdlStmt {
          */
         List<Pair<Integer, Column>> origColIdxsForExtendCols = Lists.newArrayList();
         for (Column column : targetTable.getFullSchema()) {
-            if (column.isNameWithPrefix(SchemaChangeHandler.SHADOW_NAME_PRFIX)) {
+            if (column.isNameWithPrefix(SchemaChangeHandler.SHADOW_NAME_PRFIX) ||
+                    column.isNameWithPrefix(SchemaChangeHandler.SHADOW_NAME_PRFIX_V1)) {
                 String origName = Column.removeNamePrefix(column.getName());
                 for (int i = 0; i < targetColumns.size(); i++) {
                     if (targetColumns.get(i).nameEquals(origName, false)) {
@@ -628,17 +698,23 @@ public class InsertStmt extends DdlStmt {
             Expr expr = row.get(i);
             Column col = targetColumns.get(i);
 
-            // TargeTable's hll column must be hll_hash's result
+            // TargetTable's hll column must be hll_hash's result
             if (col.getType().isHllType()) {
                 checkHllCompatibility(col, expr);
             }
 
             if (expr instanceof DefaultValueExpr) {
-                if (targetColumns.get(i).getDefaultValue() == null) {
+                Column column = targetColumns.get(i);
+                Column.DefaultValueType defaultValueType = column.getDefaultValueType();
+                if (defaultValueType == Column.DefaultValueType.NULL) {
                     throw new AnalysisException(
-                            "Column has no default value, column=" + targetColumns.get(i).getName());
+                            "Column has no default value, column=" + column.getName());
+                } else if (defaultValueType == Column.DefaultValueType.CONST) {
+                    expr = new StringLiteral(column.calculatedDefaultValue());
+                } else if (defaultValueType == Column.DefaultValueType.VARY) {
+                    throw new AnalysisException("unsupported default value=" +
+                            column.getDefaultExpr().getExpr() + ", column=" + column.getName());
                 }
-                expr = new StringLiteral(targetColumns.get(i).getDefaultValue());
             }
 
             expr.analyze(analyzer);
@@ -690,7 +766,7 @@ public class InsertStmt extends DdlStmt {
             }
         } else if (expr instanceof FunctionCallExpr) {
             final FunctionCallExpr functionExpr = (FunctionCallExpr) expr;
-            if (!functionExpr.getFnName().getFunction().equalsIgnoreCase("hll_hash") &&
+            if (!functionExpr.getFnName().getFunction().equalsIgnoreCase(FunctionSet.HLL_HASH) &&
                     !functionExpr.getFnName().getFunction().equalsIgnoreCase("hll_empty")) {
                 throw new AnalysisException(hllMismatchLog);
             }
@@ -729,7 +805,8 @@ public class InsertStmt extends DdlStmt {
             if (exprByName.containsKey(col.getName())) {
                 resultExprs.add(exprByName.get(col.getName()));
             } else {
-                if (col.getDefaultValue() == null) {
+                Column.DefaultValueType defaultValueType = col.getDefaultValueType();
+                if (defaultValueType == Column.DefaultValueType.NULL) {
                     /*
                     The import stmt has been filtered in function checkColumnCoverage when
                         the default value of column is null and column is not nullable.
@@ -737,8 +814,12 @@ public class InsertStmt extends DdlStmt {
                      */
                     Preconditions.checkState(col.isAllowNull());
                     resultExprs.add(NullLiteral.create(col.getType()));
-                } else {
-                    resultExprs.add(checkTypeCompatibility(col, new StringLiteral(col.getDefaultValue())));
+                } else if (defaultValueType == Column.DefaultValueType.CONST) {
+                    resultExprs.add(checkTypeCompatibility(col,
+                            new StringLiteral(col.calculatedDefaultValue())));
+                } else if (defaultValueType == Column.DefaultValueType.VARY) {
+                    throw new AnalysisException("Column " + col.getName() + " has unsupported default value:" +
+                            col.getDefaultExpr().getExpr());
                 }
             }
         }
@@ -748,7 +829,7 @@ public class InsertStmt extends DdlStmt {
         if (dataSink != null) {
             return dataSink;
         }
-        if (targetTable instanceof OlapTable) {
+        if ((targetTable instanceof OlapTable) || (targetTable instanceof ExternalOlapTable)) {
             dataSink = new OlapTableSink((OlapTable) targetTable, olapTuple, targetPartitionIds);
             dataPartition = dataSink.getOutputPartition();
         } else if (targetTable instanceof BrokerTable) {
@@ -773,13 +854,15 @@ public class InsertStmt extends DdlStmt {
     public void complete() throws UserException {
         if (!isExplain() && targetTable instanceof OlapTable) {
             ((OlapTableSink) dataSink).complete();
-            // add table indexes to transaction state
-            TransactionState txnState =
-                    Catalog.getCurrentGlobalTransactionMgr().getTransactionState(db.getId(), transactionId);
-            if (txnState == null) {
-                throw new DdlException("txn does not exist: " + transactionId);
+            if (!(targetTable instanceof ExternalOlapTable)) {
+                // add table indexes to transaction state
+                TransactionState txnState =
+                        GlobalStateMgr.getCurrentGlobalTransactionMgr().getTransactionState(db.getId(), transactionId);
+                if (txnState == null) {
+                    throw new DdlException("txn does not exist: " + transactionId);
+                }
+                txnState.addTableIndexes((OlapTable) targetTable);
             }
-            txnState.addTableIndexes((OlapTable) targetTable);
         }
     }
 
@@ -816,6 +899,7 @@ public class InsertStmt extends DdlStmt {
     /**
      * Below function is added by new analyzer
      */
+    @Override
     public TableName getTableName() {
         return tblName;
     }
@@ -826,5 +910,25 @@ public class InsertStmt extends DdlStmt {
 
     public List<String> getTargetColumnNames() {
         return targetColumnNames;
+    }
+
+    public void setTargetPartitionNames(PartitionNames targetPartitionNames) {
+        this.targetPartitionNames = targetPartitionNames;
+    }
+
+    public void setTargetPartitionIds(List<Long> targetPartitionIds) {
+        this.targetPartitionIds = targetPartitionIds;
+    }
+
+    public List<Long> getTargetPartitionIds() {
+        return targetPartitionIds;
+    }
+
+    public void setTargetColumns(List<Column> targetColumns) {
+        this.targetColumns = targetColumns;
+    }
+
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
+        return visitor.visitInsertStatement(this, context);
     }
 }

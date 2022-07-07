@@ -1,16 +1,19 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rewrite.scalar;
 
-import com.clearspring.analytics.util.Lists;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.operator.scalar.BetweenPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CompoundPredicateOperator;
+import com.starrocks.sql.optimizer.operator.scalar.InPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.rewrite.ScalarOperatorRewriteContext;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
@@ -40,7 +43,10 @@ public class NormalizePredicateRule extends BottomUpScalarOperatorRewriteRule {
             return predicate;
         }
 
-        return predicate.negative();
+        ScalarOperator result = predicate.commutative();
+        Preconditions.checkState(!(result.getChild(0).isConstant() && result.getChild(1).isVariable()),
+                "Normalized predicate error: " + result);
+        return result;
     }
 
     //
@@ -120,4 +126,38 @@ public class NormalizePredicateRule extends BottomUpScalarOperatorRewriteRule {
 
         return predicate;
     }
+
+    /**
+     * Rewrite column ref into comparison predicate *
+     * Before
+     * example:
+     * IN
+     * / |  \
+     * left 1  a  b
+     * After rule:
+     * left = 1 OR left = a OR left = b
+     */
+    @Override
+    public ScalarOperator visitInPredicate(InPredicateOperator predicate, ScalarOperatorRewriteContext context) {
+        List<ScalarOperator> rhs = predicate.getChildren().subList(1, predicate.getChildren().size());
+        if (rhs.stream().allMatch(ScalarOperator::isConstant)) {
+            return predicate;
+        }
+
+        List<ScalarOperator> result = new ArrayList<>();
+        ScalarOperator lhs = predicate.getChild(0);
+        boolean isIn = !predicate.isNotIn();
+
+        for (ScalarOperator child : predicate.getChildren().subList(1, predicate.getChildren().size())) {
+            BinaryPredicateOperator newOp;
+            if (isIn) {
+                newOp = new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.EQ, lhs, child);
+            } else {
+                newOp = new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.NE, lhs, child);
+            }
+            result.add(newOp);
+        }
+        return isIn ? Utils.compoundOr(result) : Utils.compoundAnd(result);
+    }
+
 }

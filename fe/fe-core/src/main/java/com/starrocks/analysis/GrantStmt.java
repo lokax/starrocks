@@ -24,7 +24,6 @@ package com.starrocks.analysis;
 import com.google.common.base.Joiner;
 import com.google.common.base.Strings;
 import com.starrocks.catalog.AccessPrivilege;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.cluster.ClusterNamespace;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.ErrorCode;
@@ -36,6 +35,7 @@ import com.starrocks.mysql.privilege.PrivBitSet;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.mysql.privilege.Privilege;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
 
 import java.util.List;
 
@@ -74,6 +74,28 @@ public class GrantStmt extends DdlStmt {
         this.privileges = privs.toPrivilegeList();
     }
 
+    /**
+     * call by TablePrivEntry, DbPrivEntry, GlobalPrivEntry to transfer to SQL
+     */
+    public GrantStmt(UserIdentity userIdentity, TablePattern tblPattern, PrivBitSet bitSet) {
+        this.userIdent = userIdentity;
+        this.role = null;
+        this.tblPattern = tblPattern;
+        this.resourcePattern = null;
+        this.privileges = bitSet.toPrivilegeList();
+    }
+
+    /**
+     * call by ResourcePrivEntry to transfer to SQL
+     */
+    public GrantStmt(UserIdentity userIdentity, ResourcePattern resourcePattern, PrivBitSet bitSet) {
+        this.userIdent = userIdentity;
+        this.role = null;
+        this.tblPattern = null;
+        this.resourcePattern = resourcePattern;
+        this.privileges = bitSet.toPrivilegeList();
+    }
+
     public UserIdentity getUserIdent() {
         return userIdent;
     }
@@ -105,7 +127,7 @@ public class GrantStmt extends DdlStmt {
             userIdent.analyze(analyzer.getClusterName());
         } else {
             FeNameFormat.checkRoleName(role, false /* can not be admin */, "Can not grant to role");
-            role = ClusterNamespace.getFullName(analyzer.getClusterName(), role);
+            role = ClusterNamespace.getFullName(role);
         }
 
         if (tblPattern != null) {
@@ -127,7 +149,7 @@ public class GrantStmt extends DdlStmt {
 
     /*
      * Rules:
-     * 1. Can not grant/revoke NODE_PRIV to/from any other user.
+     * 1. NODE_PRIV can only be granted/revoked on GLOBAL level
      * 2. ADMIN_PRIV can only be granted/revoked on GLOBAL level
      * 3. Privileges can not be granted/revoked to/from ADMIN and OPERATOR role
      * 4. Only user with GLOBAL level's GRANT_PRIV can grant/revoke privileges to/from roles.
@@ -138,8 +160,8 @@ public class GrantStmt extends DdlStmt {
     public static void checkPrivileges(Analyzer analyzer, List<Privilege> privileges,
                                        String role, TablePattern tblPattern) throws AnalysisException {
         // Rule 1
-        if (privileges.contains(Privilege.NODE_PRIV)) {
-            throw new AnalysisException("Can not grant NODE_PRIV to any other users or roles");
+        if (tblPattern.getPrivLevel() != PrivLevel.GLOBAL && privileges.contains(Privilege.NODE_PRIV)) {
+            throw new AnalysisException("NODE_PRIV privilege can only be granted on *.*");
         }
 
         // Rule 2
@@ -149,23 +171,25 @@ public class GrantStmt extends DdlStmt {
 
         if (role != null) {
             // Rule 3 and 4
-            if (!Catalog.getCurrentCatalog().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
+            if (!GlobalStateMgr.getCurrentState().getAuth()
+                    .checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "GRANT");
             }
         } else {
             // Rule 5.1 and 5.2
             if (tblPattern.getPrivLevel() == PrivLevel.GLOBAL) {
-                if (!Catalog.getCurrentCatalog().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
+                if (!GlobalStateMgr.getCurrentState().getAuth()
+                        .checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
                     ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "GRANT");
                 }
             } else if (tblPattern.getPrivLevel() == PrivLevel.DATABASE) {
-                if (!Catalog.getCurrentCatalog().getAuth()
+                if (!GlobalStateMgr.getCurrentState().getAuth()
                         .checkDbPriv(ConnectContext.get(), tblPattern.getQuolifiedDb(), PrivPredicate.GRANT)) {
                     ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "GRANT");
                 }
             } else {
                 // table level
-                if (!Catalog.getCurrentCatalog().getAuth()
+                if (!GlobalStateMgr.getCurrentState().getAuth()
                         .checkTblPriv(ConnectContext.get(), tblPattern.getQuolifiedDb(), tblPattern.getTbl(),
                                 PrivPredicate.GRANT)) {
                     ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "GRANT");
@@ -177,8 +201,8 @@ public class GrantStmt extends DdlStmt {
     public static void checkPrivileges(Analyzer analyzer, List<Privilege> privileges,
                                        String role, ResourcePattern resourcePattern) throws AnalysisException {
         // Rule 1
-        if (privileges.contains(Privilege.NODE_PRIV)) {
-            throw new AnalysisException("Can not grant NODE_PRIV to any other users or roles");
+        if (resourcePattern.getPrivLevel() != PrivLevel.GLOBAL && privileges.contains(Privilege.NODE_PRIV)) {
+            throw new AnalysisException("NODE_PRIV privilege can only be granted on resource *");
         }
 
         // Rule 2
@@ -188,17 +212,19 @@ public class GrantStmt extends DdlStmt {
 
         if (role != null) {
             // Rule 3 and 4
-            if (!Catalog.getCurrentCatalog().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
+            if (!GlobalStateMgr.getCurrentState().getAuth()
+                    .checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "GRANT");
             }
         } else {
             // Rule 5.1 and 5.3
             if (resourcePattern.getPrivLevel() == PrivLevel.GLOBAL) {
-                if (!Catalog.getCurrentCatalog().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
+                if (!GlobalStateMgr.getCurrentState().getAuth()
+                        .checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
                     ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "GRANT");
                 }
             } else {
-                if (!Catalog.getCurrentCatalog().getAuth()
+                if (!GlobalStateMgr.getCurrentState().getAuth()
                         .checkResourcePriv(ConnectContext.get(), resourcePattern.getResourceName(),
                                 PrivPredicate.GRANT)) {
                     ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "GRANT");

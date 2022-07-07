@@ -26,20 +26,16 @@ import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.FeConstants;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
-import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
 
-import java.util.UUID;
-
 public class DynamicPartitionTableTest {
-    private static String runningDir = "fe/mocked/DynamicPartitionTableTest/" + UUID.randomUUID().toString() + "/";
-
     private static ConnectContext connectContext;
     private static StarRocksAssert starRocksAssert;
 
@@ -51,7 +47,7 @@ public class DynamicPartitionTableTest {
         FeConstants.default_scheduler_interval_millisecond = 1000;
         FeConstants.runningUnitTest = true;
 
-        UtFrameUtils.createMinStarRocksCluster(runningDir);
+        UtFrameUtils.createMinStarRocksCluster();
 
         // create connect context
         connectContext = UtFrameUtils.createDefaultCtx();
@@ -60,14 +56,9 @@ public class DynamicPartitionTableTest {
         starRocksAssert.withDatabase("test").useDatabase("test");
     }
 
-    @AfterClass
-    public static void TearDown() {
-        UtFrameUtils.cleanStarRocksFeDir(runningDir);
-    }
-
     private static void createTable(String sql) throws Exception {
-        CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseAndAnalyzeStmt(sql, connectContext);
-        Catalog.getCurrentCatalog().createTable(createTableStmt);
+        CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(sql, connectContext);
+        GlobalStateMgr.getCurrentState().createTable(createTableStmt);
     }
 
     @Test
@@ -97,7 +88,7 @@ public class DynamicPartitionTableTest {
                 "\"dynamic_partition.prefix\" = \"p\",\n" +
                 "\"dynamic_partition.buckets\" = \"1\"\n" +
                 ");");
-        Database db = Catalog.getCurrentCatalog().getDb("default_cluster:test");
+        Database db = GlobalStateMgr.getCurrentState().getDb("default_cluster:test");
         OlapTable table = (OlapTable) db.getTable("dynamic_partition_normal");
         Assert.assertEquals(table.getTableProperty().getDynamicPartitionProperty().getReplicationNum(),
                 DynamicPartitionProperty.NOT_SET_REPLICATION_NUM);
@@ -223,8 +214,6 @@ public class DynamicPartitionTableTest {
 
     @Test
     public void testMissBuckets() throws Exception {
-        expectedException.expect(DdlException.class);
-        expectedException.expectMessage("Must assign dynamic_partition.buckets properties");
         starRocksAssert.withTable("CREATE TABLE test.`dynamic_partition_buckets` (\n" +
                 "  `k1` date NULL COMMENT \"\",\n" +
                 "  `k2` int NULL COMMENT \"\",\n" +
@@ -249,13 +238,16 @@ public class DynamicPartitionTableTest {
                 "\"dynamic_partition.time_unit\" = \"day\",\n" +
                 "\"dynamic_partition.prefix\" = \"p\"\n" +
                 ");");
+        Database db = GlobalStateMgr.getCurrentState().getDb("default_cluster:test");
+        OlapTable table = (OlapTable) db.getTable("dynamic_partition_buckets");
+        Assert.assertEquals(table.getTableProperty().getDynamicPartitionProperty().getBuckets(), 32);
     }
 
     @Test
     public void testNotAllowed() throws Exception {
         expectedException.expect(DdlException.class);
         expectedException.expectMessage("Only support dynamic partition properties on range partition table");
-        starRocksAssert.withTable("CREATE TABLE test.`dynamic_partition_buckets` (\n" +
+        starRocksAssert.withTable("CREATE TABLE test.`dynamic_partition_non_range` (\n" +
                 "  `k1` date NULL COMMENT \"\",\n" +
                 "  `k2` int NULL COMMENT \"\",\n" +
                 "  `k3` smallint NULL COMMENT \"\",\n" +
@@ -427,7 +419,7 @@ public class DynamicPartitionTableTest {
                 "\"dynamic_partition.buckets\" = \"1\",\n" +
                 "\"dynamic_partition.replication_num\" = \"2\"\n" +
                 ");");
-        Database db = Catalog.getCurrentCatalog().getDb("default_cluster:test");
+        Database db = GlobalStateMgr.getCurrentState().getDb("default_cluster:test");
         OlapTable table = (OlapTable) db.getTable(tableName);
         Assert.assertEquals(table.getTableProperty().getDynamicPartitionProperty().getReplicationNum(), 2);
     }
@@ -459,8 +451,8 @@ public class DynamicPartitionTableTest {
                 "insert into test.`empty_dynamic_partition` values ('2020-09-10', 1000, 100, 'test', '2020-09-10 23:59:59');";
         createTable(createOlapTblStmt);
         expectedException.expect(AnalysisException.class);
-        expectedException.expectMessage("data cannot be inserted into table with empty partition. " +
+        expectedException.expectMessage("data cannot be inserted into table with empty partition." +
                 "Use `SHOW PARTITIONS FROM empty_dynamic_partition` to see the currently partitions of this table. ");
-        UtFrameUtils.parseAndAnalyzeStmt("explain " + insertStmt, connectContext);
+        UtFrameUtils.parseStmtWithNewParser("explain " + insertStmt, connectContext);
     }
 }

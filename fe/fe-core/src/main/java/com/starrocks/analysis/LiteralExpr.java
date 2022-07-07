@@ -25,7 +25,7 @@ import com.google.common.base.Preconditions;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.NotImplementedException;
-import com.starrocks.sql.analyzer.ExprVisitor;
+import com.starrocks.sql.ast.AstVisitor;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -33,9 +33,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr> {
     public LiteralExpr() {
         numDistinctValues = 1;
@@ -159,6 +156,11 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
         return buffer;
     }
 
+    @Override
+    public String toDigestImpl() {
+        return " ? ";
+    }
+
     // Swaps the sign of numeric literals.
     // Throws for non-numeric literals.
     public void swapSign() throws NotImplementedException {
@@ -185,7 +187,7 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
         if (!(obj instanceof LiteralExpr)) {
             return false;
         }
-        //TODO chenhao16, call super.equals()
+
         if ((obj instanceof StringLiteral && !(this instanceof StringLiteral))
                 || (this instanceof StringLiteral && !(obj instanceof StringLiteral))
                 || (obj instanceof DecimalLiteral && !(this instanceof DecimalLiteral))
@@ -201,11 +203,6 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
     }
 
     @Override
-    public boolean isVectorized() {
-        return true;
-    }
-
-    @Override
     public int compareTo(LiteralExpr o) {
         return compareLiteral(o);
     }
@@ -214,7 +211,12 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
      * Below function is added by new analyzer
      */
     @Override
-    public <R, C> R accept(ExprVisitor<R, C> visitor, C context) {
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
         return visitor.visitLiteral(this, context);
+    }
+
+    @Override
+    public boolean isSelfMonotonic() {
+        return true;
     }
 }

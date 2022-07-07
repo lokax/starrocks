@@ -26,12 +26,13 @@ include "AgentService.thrift"
 include "InternalService.thrift"
 include "Types.thrift"
 include "Status.thrift"
+include "WorkGroup.thrift"
 
 struct TTabletInfo {
     1: required Types.TTabletId tablet_id
     2: required Types.TSchemaHash schema_hash
     3: required Types.TVersion version
-    4: required Types.TVersionHash version_hash
+    4: required Types.TVersionHash version_hash // Deprecated
     5: required Types.TCount row_count
     6: required Types.TSize data_size
     7: optional Types.TStorageMedium storage_medium
@@ -42,6 +43,12 @@ struct TTabletInfo {
     12: optional bool used
     13: optional Types.TPartitionId partition_id
     14: optional bool is_in_memory
+    15: optional bool enable_persistent_index
+}
+
+struct TTabletVersionPair {
+    1: optional Types.TTabletId tablet_id
+    2: optional Types.TVersion version
 }
 
 struct TFinishTaskRequest {
@@ -53,7 +60,7 @@ struct TFinishTaskRequest {
     6: optional list<TTabletInfo> finish_tablet_infos
     7: optional i64 tablet_checksum
     8: optional i64 request_version
-    9: optional i64 request_version_hash
+    9: optional i64 request_version_hash // Deprecated
     10: optional string snapshot_path
     11: optional list<Types.TTabletId> error_tablet_ids
     12: optional list<string> snapshot_files
@@ -61,6 +68,7 @@ struct TFinishTaskRequest {
     14: optional list<Types.TTabletId> downloaded_tablet_ids
     15: optional i64 copy_size
     16: optional i64 copy_time_ms
+    17: optional list<TTabletVersionPair> tablet_versions;
 }
 
 struct TTablet {
@@ -93,13 +101,17 @@ struct TReportRequest {
     // the max compaction score of all tablets on a backend,
     // this field should be set along with tablet report
     8: optional i64 tablet_max_compaction_score
+    // active workgroup on this backend
+    9: optional list<WorkGroup.TWorkGroup> active_workgroups
 }
 
 struct TMasterResult {
     // required in V1
     1: required Status.TStatus status
+    2: optional list<WorkGroup.TWorkGroupOp> workgroup_ops
 }
 
+// Deprecated
 // Now we only support CPU share.
 enum TResourceType {
     TRESOURCE_CPU_SHARE
@@ -114,10 +126,12 @@ enum TResourceType {
     TRESOURCE_HDD_WRITE_MBPS
 }
 
+// Deprecated
 struct TResourceGroup {
     1: required map<TResourceType, i32> resourceByType
 }
 
+// Deprecated
 // Resource per user
 struct TUserResource {
     1: required TResourceGroup resource
@@ -126,6 +140,7 @@ struct TUserResource {
     2: required map<string, i32> shareByGroup
 }
 
+// Deprecated
 struct TFetchResourceResult {
     // Master service not find protocol version, so using agent service version
     1: required AgentService.TAgentServiceVersion protocolVersion

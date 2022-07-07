@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -12,9 +12,9 @@ class VectorizedInfoFunc final : public Expr {
 public:
     VectorizedInfoFunc(const TExprNode& node);
 
-    virtual ~VectorizedInfoFunc();
+    ~VectorizedInfoFunc() override;
 
-    virtual Expr* clone(ObjectPool* pool) const override { return pool->add(new VectorizedInfoFunc(*this)); }
+    Expr* clone(ObjectPool* pool) const override { return pool->add(new VectorizedInfoFunc(*this)); }
 
     ColumnPtr evaluate(ExprContext* context, vectorized::Chunk* ptr) override;
 

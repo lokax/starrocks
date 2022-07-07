@@ -28,10 +28,7 @@ import com.starrocks.catalog.Column;
 import com.starrocks.catalog.InlineView;
 import com.starrocks.catalog.View;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.common.ErrorCode;
-import com.starrocks.common.ErrorReport;
 import com.starrocks.common.UserException;
-import com.starrocks.rewrite.ExprRewriter;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -41,15 +38,12 @@ import java.util.Set;
 
 /**
  * An inline view is a query statement with an alias. Inline views can be parsed directly
- * from a query string or represent a reference to a local or catalog view.
+ * from a query string or represent a reference to a local or globalStateMgr view.
  */
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public class InlineViewRef extends TableRef {
     private static final Logger LOG = LogManager.getLogger(InlineViewRef.class);
 
-    // Catalog or local view that is referenced.
+    // GlobalStateMgr or local view that is referenced.
     // Null for inline views parsed directly from a query string.
     private final View view;
 
@@ -97,7 +91,7 @@ public class InlineViewRef extends TableRef {
     }
 
     /**
-     * C'tor for creating inline views that replace a local or catalog view ref.
+     * C'tor for creating inline views that replace a local or globalStateMgr view ref.
      */
     public InlineViewRef(View view, TableRef origTblRef) {
         super(origTblRef.getName(), origTblRef.getExplicitAlias());
@@ -136,10 +130,6 @@ public class InlineViewRef extends TableRef {
         baseTblSmap = other.baseTblSmap.clone();
     }
 
-    public List<String> getExplicitColLabels() {
-        return explicitColLabels;
-    }
-
     public List<String> getColLabels() {
         if (explicitColLabels != null) {
             return explicitColLabels;
@@ -173,82 +163,7 @@ public class InlineViewRef extends TableRef {
      * then performs join clause analysis.
      */
     @Override
-    public void analyze(Analyzer analyzer) throws AnalysisException, UserException {
-        if (isAnalyzed) {
-            return;
-        }
-
-        if (view == null && !hasExplicitAlias()) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_DERIVED_MUST_HAVE_ALIAS);
-        }
-
-        // Analyze the inline view query statement with its own analyzer
-        inlineViewAnalyzer = new Analyzer(analyzer);
-
-        queryStmt.analyze(inlineViewAnalyzer);
-        correlatedTupleIds_.addAll(queryStmt.getCorrelatedTupleIds(inlineViewAnalyzer));
-
-        queryStmt.getMaterializedTupleIds(materializedTupleIds);
-        if (view != null && !hasExplicitAlias() && !view.isLocalView()) {
-            name = analyzer.getFqTableName(name);
-            aliases_ = new String[] {name.toString(), view.getName()};
-        }
-        //TODO(chenhao16): fix TableName in Db.Table style
-        // name.analyze(analyzer);
-        desc = analyzer.registerTableRef(this);
-        isAnalyzed = true;  // true now that we have assigned desc
-
-        // For constant selects we materialize its exprs into a tuple.
-        if (materializedTupleIds.isEmpty()) {
-            Preconditions.checkState(queryStmt instanceof SelectStmt);
-            Preconditions.checkState(((SelectStmt) queryStmt).getTableRefs().isEmpty());
-            desc.setIsMaterialized(true);
-            materializedTupleIds.add(desc.getId());
-        }
-
-        // create smap_ and baseTblSmap_ and register auxiliary eq predicates between our
-        // tuple descriptor's slots and our *unresolved* select list exprs;
-        // we create these auxiliary predicates so that the analyzer can compute the value
-        // transfer graph through this inline view correctly (ie, predicates can get
-        // propagated through the view);
-        // if the view stmt contains analytic functions, we cannot propagate predicates
-        // into the view, unless the predicates are compatible with the analytic
-        // function's partition by clause, because those extra filters
-        // would alter the results of the analytic functions (see IMPALA-1243)
-        // TODO: relax this a bit by allowing propagation out of the inline view (but
-        // not into it)
-        for (int i = 0; i < getColLabels().size(); ++i) {
-            String colName = getColLabels().get(i);
-            SlotDescriptor slotDesc = analyzer.registerColumnRef(getAliasAsName(), colName);
-            Expr colExpr = queryStmt.getResultExprs().get(i);
-            SlotRef slotRef = new SlotRef(slotDesc);
-            sMap.put(slotRef, colExpr);
-            baseTblSmap.put(slotRef, queryStmt.getBaseTblResultExprs().get(i));
-            if (createAuxPredicate(colExpr)) {
-                analyzer.createAuxEquivPredicate(new SlotRef(slotDesc), colExpr.clone());
-            }
-        }
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("inline view " + getUniqueAlias() + " smap: " + sMap.debugString());
-            LOG.debug("inline view " + getUniqueAlias() + " baseTblSmap: " + baseTblSmap.debugString());
-        }
-
-        // Now do the remaining join analysis
-        analyzeJoin(analyzer);
-    }
-
-    /**
-     * Checks if an auxiliary predicate should be created for an expr. Returns False if the
-     * inline view has a SELECT stmt with analytic functions and the expr is not in the
-     * common partition exprs of all the analytic functions computed by this inline view.
-     */
-    public boolean createAuxPredicate(Expr e) {
-        if (!(queryStmt instanceof SelectStmt)
-                || !((SelectStmt) queryStmt).hasAnalyticInfo()) {
-            return true;
-        }
-        AnalyticInfo analyticInfo = ((SelectStmt) queryStmt).getAnalyticInfo();
-        return analyticInfo.getCommonPartitionExprs().contains(e);
+    public void analyze(Analyzer analyzer) throws UserException {
     }
 
     /**
@@ -257,7 +172,7 @@ public class InlineViewRef extends TableRef {
      */
     @Override
     public TupleDescriptor createTupleDescriptor(Analyzer analyzer) throws AnalysisException {
-        // Create a fake catalog table for the inline view
+        // Create a fake globalStateMgr table for the inline view
         int numColLabels = getColLabels().size();
         Preconditions.checkState(numColLabels > 0);
         Set<String> columnSet = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
@@ -288,67 +203,8 @@ public class InlineViewRef extends TableRef {
         return result;
     }
 
-    protected void makeOutputNullableHelper(Analyzer analyzer, ExprSubstitutionMap smap)
-            throws Exception {
-        // Gather all unique rhs SlotRefs into rhsSlotRefs
-        List<SlotRef> rhsSlotRefs = Lists.newArrayList();
-        Expr.collectList(smap.getRhs(), SlotRef.class, rhsSlotRefs);
-        // Map for substituting SlotRefs with NullLiterals.
-        ExprSubstitutionMap nullSMap = new ExprSubstitutionMap();
-        for (SlotRef rhsSlotRef : rhsSlotRefs) {
-            nullSMap.put(rhsSlotRef.clone(), NullLiteral.create(rhsSlotRef.getType()));
-        }
-
-        // Make rhs exprs nullable if necessary.
-        for (int i = 0; i < smap.getRhs().size(); ++i) {
-            List<Expr> params = Lists.newArrayList();
-            if (!requiresNullWrapping(analyzer, smap.getRhs().get(i), nullSMap)) {
-                continue;
-            }
-            params.add(new TupleIsNullPredicate(materializedTupleIds));
-            params.add(NullLiteral.create(smap.getRhs().get(i).getType()));
-            params.add(smap.getRhs().get(i));
-            Expr ifExpr = new FunctionCallExpr("if", params);
-            ifExpr.analyze(analyzer);
-            smap.getRhs().set(i, ifExpr);
-        }
-    }
-
-    /**
-     * Replaces all SloRefs in expr with a NullLiteral using nullSMap, and evaluates the
-     * resulting constant expr. Returns true if the constant expr yields a non-NULL value,
-     * false otherwise.
-     */
-    private boolean requiresNullWrapping(Analyzer analyzer, Expr expr, ExprSubstitutionMap nullSMap)
-            throws UserException {
-        // If the expr is already wrapped in an IF(TupleIsNull(), NULL, expr)
-        // then do not try to execute it.
-        if (expr.contains(TupleIsNullPredicate.class)) {
-            return true;
-        }
-        return true;
-    }
-
-    @Override
-    public void rewriteExprs(ExprRewriter rewriter, Analyzer analyzer)
-            throws AnalysisException {
-        super.rewriteExprs(rewriter, analyzer);
-        queryStmt.rewriteExprs(rewriter);
-    }
-
-    @Override
-    public List<TupleId> getMaterializedTupleIds() {
-        Preconditions.checkState(isAnalyzed);
-        Preconditions.checkState(materializedTupleIds.size() > 0);
-        return materializedTupleIds;
-    }
-
     public QueryStmt getViewStmt() {
         return queryStmt;
-    }
-
-    public void setViewStmt(QueryStmt queryStmt) {
-        this.queryStmt = queryStmt;
     }
 
     public Analyzer getAnalyzer() {
@@ -359,11 +215,6 @@ public class InlineViewRef extends TableRef {
     public ExprSubstitutionMap getSmap() {
         Preconditions.checkState(isAnalyzed);
         return sMap;
-    }
-
-    public ExprSubstitutionMap getBaseTblSmap() {
-        Preconditions.checkState(isAnalyzed);
-        return baseTblSmap;
     }
 
     @Override

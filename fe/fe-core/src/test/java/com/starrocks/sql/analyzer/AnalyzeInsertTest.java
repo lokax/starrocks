@@ -1,32 +1,19 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.analyzer;
 
 import com.starrocks.utframe.UtFrameUtils;
-import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import java.io.File;
-import java.util.UUID;
-
 import static com.starrocks.sql.analyzer.AnalyzeTestUtil.analyzeFail;
-import static com.starrocks.sql.analyzer.AnalyzeTestUtil.analyzeSuccessUseInsert;
+import static com.starrocks.sql.analyzer.AnalyzeTestUtil.analyzeSuccess;
 
 public class AnalyzeInsertTest {
-    // use a unique dir so that it won't be conflict with other unit test which
-    // may also start a Mocked Frontend
-    private static String runningDir = "fe/mocked/AnalyzeInsertTest/" + UUID.randomUUID().toString() + "/";
 
     @BeforeClass
     public static void beforeClass() throws Exception {
-        UtFrameUtils.createMinStarRocksCluster(runningDir);
+        UtFrameUtils.createMinStarRocksCluster();
         AnalyzeTestUtil.init();
-    }
-
-    @AfterClass
-    public static void tearDown() {
-        File file = new File(runningDir);
-        file.delete();
     }
 
     @Test
@@ -41,6 +28,18 @@ public class AnalyzeInsertTest {
         analyzeFail("insert into tnotnull(v1,v3) values(1,3)",
                 "must be explicitly mentioned in column permutation");
 
-        analyzeSuccessUseInsert("insert into tarray(v1,v4) values (1,[NULL,9223372036854775808])");
+        analyzeSuccess("insert into tarray(v1,v4) values (1,[NULL,9223372036854775808])");
+
+        analyzeFail("insert into t0 values (170141183460469231731687303715884105728)", "Number Overflow. literal");
+
+        analyzeFail("insert into tall(ta) values(min('x'))", "Values clause cannot contain aggregations");
+        analyzeFail("insert into tall(ta) values(case min('x') when 'x' then 'x' end)",
+                "Values clause cannot contain aggregations");
+        analyzeFail("insert into tall(ta) values(min('x') over())", "Values clause cannot contain window function");
+
+        analyzeSuccess("INSERT INTO tp  PARTITION(p1) VALUES(1,2,3)");
+
+        analyzeSuccess("insert into t0 with label l1 select * from t0");
+        analyzeSuccess("insert into t0 with label `l1` select * from t0");
     }
 }

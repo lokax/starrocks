@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/analysis/SysVariableDescTest.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -23,18 +19,20 @@ package com.starrocks.analysis;
 
 import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.ScalarType;
-import com.starrocks.common.AnalysisException;
+import com.starrocks.sql.analyzer.ExpressionAnalyzer;
+import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.thrift.TExprNode;
 import com.starrocks.thrift.TExprNodeType;
+import com.starrocks.utframe.UtFrameUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
 public class SysVariableDescTest {
 
     @Test
-    public void testNormal() throws AnalysisException {
+    public void testNormal() throws Exception {
         SysVariableDesc desc = new SysVariableDesc("version_comment");
-        desc.analyze(AccessTestUtil.fetchAdminAnalyzer(false));
+        ExpressionAnalyzer.analyzeExpressionIgnoreSlot(desc, UtFrameUtils.createDefaultCtx());
         Assert.assertEquals("@@version_comment", desc.toSql());
         Assert.assertEquals("version_comment", desc.getName());
         Assert.assertEquals(ScalarType.createType(PrimitiveType.VARCHAR), desc.getType());
@@ -46,10 +44,10 @@ public class SysVariableDescTest {
         Assert.assertNotNull(tNode.string_literal);
     }
 
-    @Test(expected = AnalysisException.class)
-    public void testNoVar() throws AnalysisException {
+    @Test(expected = SemanticException.class)
+    public void testNoVar() throws Exception {
         SysVariableDesc desc = new SysVariableDesc("zcPrivate");
-        desc.analyze(AccessTestUtil.fetchAdminAnalyzer(false));
+        ExpressionAnalyzer.analyzeExpressionIgnoreSlot(desc, UtFrameUtils.createDefaultCtx());
         Assert.fail("No exception throws.");
     }
 

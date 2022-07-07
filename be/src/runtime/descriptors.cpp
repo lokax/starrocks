@@ -105,22 +105,66 @@ std::string TableDescriptor::debug_string() const {
     return out.str();
 }
 
+// ============== HDFS Table Descriptor ============
+
+HdfsPartitionDescriptor::HdfsPartitionDescriptor(const THdfsTable& thrift_table, const THdfsPartition& thrift_partition)
+        : _file_format(thrift_partition.file_format),
+          _location(thrift_partition.location.suffix),
+          _thrift_partition_key_exprs(thrift_partition.partition_key_exprs) {}
+
+HdfsPartitionDescriptor::HdfsPartitionDescriptor(const THudiTable& thrift_table, const THdfsPartition& thrift_partition)
+        : _file_format(thrift_partition.file_format),
+          _location(thrift_partition.location.suffix),
+          _thrift_partition_key_exprs(thrift_partition.partition_key_exprs) {}
+
+Status HdfsPartitionDescriptor::create_part_key_exprs(ObjectPool* pool, int32_t chunk_size) {
+    RETURN_IF_ERROR(Expr::create_expr_trees(pool, _thrift_partition_key_exprs, &_partition_key_value_evals));
+    return Status::OK();
+}
+
 HdfsTableDescriptor::HdfsTableDescriptor(const TTableDescriptor& tdesc, ObjectPool* pool)
-        : TableDescriptor(tdesc),
-          _columns(tdesc.hdfsTable.columns),
-          _partition_columns(tdesc.hdfsTable.partition_columns) {
+        : LakeTableDescriptor(tdesc, pool) {
+    _hdfs_base_path = tdesc.hdfsTable.hdfs_base_dir;
+    _columns = tdesc.hdfsTable.columns;
+    _partition_columns = tdesc.hdfsTable.partition_columns;
     for (const auto& entry : tdesc.hdfsTable.partitions) {
         auto* partition = pool->add(new HdfsPartitionDescriptor(tdesc.hdfsTable, entry.second));
         _partition_id_to_desc_map[entry.first] = partition;
     }
-    _hdfs_base_dir = tdesc.hdfsTable.hdfs_base_dir;
 }
 
-bool HdfsTableDescriptor::is_partition_col(const SlotDescriptor* slot) const {
+IcebergTableDescriptor::IcebergTableDescriptor(const TTableDescriptor& tdesc, ObjectPool* pool)
+        : LakeTableDescriptor(tdesc, pool) {
+    _table_location = tdesc.icebergTable.location;
+    _columns = tdesc.icebergTable.columns;
+}
+
+HudiTableDescriptor::HudiTableDescriptor(const TTableDescriptor& tdesc, ObjectPool* pool)
+        : LakeTableDescriptor(tdesc, pool) {
+    _table_location = tdesc.hudiTable.location;
+    _columns = tdesc.hudiTable.columns;
+    _partition_columns = tdesc.hudiTable.partition_columns;
+    for (const auto& entry : tdesc.hudiTable.partitions) {
+        auto* partition = pool->add(new HdfsPartitionDescriptor(tdesc.hudiTable, entry.second));
+        _partition_id_to_desc_map[entry.first] = partition;
+    }
+}
+
+LakeTableDescriptor::LakeTableDescriptor(const TTableDescriptor& tdesc, ObjectPool* pool) : TableDescriptor(tdesc) {}
+
+bool LakeTableDescriptor::is_partition_col(const SlotDescriptor* slot) const {
     return get_partition_col_index(slot) >= 0;
 }
 
-int HdfsTableDescriptor::get_partition_col_index(const SlotDescriptor* slot) const {
+HdfsPartitionDescriptor* LakeTableDescriptor::get_partition(int64_t partition_id) const {
+    auto it = _partition_id_to_desc_map.find(partition_id);
+    if (it == _partition_id_to_desc_map.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
+int LakeTableDescriptor::get_partition_col_index(const SlotDescriptor* slot) const {
     int idx = 0;
     for (const auto& partition_column : _partition_columns) {
         if (partition_column.column_name == slot->col_name()) {
@@ -131,23 +175,7 @@ int HdfsTableDescriptor::get_partition_col_index(const SlotDescriptor* slot) con
     return -1;
 }
 
-HdfsPartitionDescriptor* HdfsTableDescriptor::get_partition(int64_t partition_id) const {
-    auto it = _partition_id_to_desc_map.find(partition_id);
-    if (it == _partition_id_to_desc_map.end()) {
-        return nullptr;
-    }
-    return it->second;
-}
-
-HdfsPartitionDescriptor::HdfsPartitionDescriptor(const THdfsTable& thrift_table, const THdfsPartition& thrift_partition)
-        : _file_format(thrift_partition.file_format),
-          _location(thrift_partition.location.suffix),
-          _thrift_partition_key_exprs(thrift_partition.partition_key_exprs) {}
-
-Status HdfsPartitionDescriptor::create_part_key_exprs(ObjectPool* pool) {
-    RETURN_IF_ERROR(Expr::create_expr_trees(pool, _thrift_partition_key_exprs, &_partition_key_value_evals));
-    return Status::OK();
-}
+// =============================================
 
 OlapTableDescriptor::OlapTableDescriptor(const TTableDescriptor& tdesc) : TableDescriptor(tdesc) {}
 
@@ -159,7 +187,7 @@ std::string OlapTableDescriptor::debug_string() const {
 
 SchemaTableDescriptor::SchemaTableDescriptor(const TTableDescriptor& tdesc)
         : TableDescriptor(tdesc), _schema_table_type(tdesc.schemaTable.tableType) {}
-SchemaTableDescriptor::~SchemaTableDescriptor() {}
+SchemaTableDescriptor::~SchemaTableDescriptor() = default;
 
 std::string SchemaTableDescriptor::debug_string() const {
     std::stringstream out;
@@ -169,7 +197,7 @@ std::string SchemaTableDescriptor::debug_string() const {
 
 BrokerTableDescriptor::BrokerTableDescriptor(const TTableDescriptor& tdesc) : TableDescriptor(tdesc) {}
 
-BrokerTableDescriptor::~BrokerTableDescriptor() {}
+BrokerTableDescriptor::~BrokerTableDescriptor() = default;
 
 std::string BrokerTableDescriptor::debug_string() const {
     std::stringstream out;
@@ -179,7 +207,7 @@ std::string BrokerTableDescriptor::debug_string() const {
 
 EsTableDescriptor::EsTableDescriptor(const TTableDescriptor& tdesc) : TableDescriptor(tdesc) {}
 
-EsTableDescriptor::~EsTableDescriptor() {}
+EsTableDescriptor::~EsTableDescriptor() = default;
 
 std::string EsTableDescriptor::debug_string() const {
     std::stringstream out;
@@ -203,13 +231,31 @@ std::string MySQLTableDescriptor::debug_string() const {
     return out.str();
 }
 
+JDBCTableDescriptor::JDBCTableDescriptor(const TTableDescriptor& tdesc)
+        : TableDescriptor(tdesc),
+          _jdbc_driver_name(tdesc.jdbcTable.jdbc_driver_name),
+          _jdbc_driver_url(tdesc.jdbcTable.jdbc_driver_url),
+          _jdbc_driver_checksum(tdesc.jdbcTable.jdbc_driver_checksum),
+          _jdbc_driver_class(tdesc.jdbcTable.jdbc_driver_class),
+          _jdbc_url(tdesc.jdbcTable.jdbc_url),
+          _jdbc_table(tdesc.jdbcTable.jdbc_table),
+          _jdbc_user(tdesc.jdbcTable.jdbc_user),
+          _jdbc_passwd(tdesc.jdbcTable.jdbc_passwd) {}
+
+std::string JDBCTableDescriptor::debug_string() const {
+    std::stringstream out;
+    out << "JDBCTable(" << TableDescriptor::debug_string() << " jdbc_driver_name=" << _jdbc_driver_name
+        << " jdbc_driver_url=" << _jdbc_driver_url << " jdbc_driver_checksum=" << _jdbc_driver_checksum
+        << " jdbc_driver_class=" << _jdbc_driver_class << " jdbc_url=" << _jdbc_url << " jdbc_table=" << _jdbc_table
+        << " jdbc_user=" << _jdbc_user << " jdbc_passwd=" << _jdbc_passwd << "}";
+    return out.str();
+}
+
 TupleDescriptor::TupleDescriptor(const TTupleDescriptor& tdesc)
         : _id(tdesc.id),
-          _table_desc(NULL),
+          _table_desc(nullptr),
           _byte_size(tdesc.byteSize),
           _num_null_bytes(tdesc.numNullBytes),
-          _num_materialized_slots(0),
-          _slots(),
           _has_varlen_slots(false) {
     if (false == tdesc.__isset.numNullSlots) {
         //be compatible for existing tables with no NULL value
@@ -221,11 +267,10 @@ TupleDescriptor::TupleDescriptor(const TTupleDescriptor& tdesc)
 
 TupleDescriptor::TupleDescriptor(const PTupleDescriptor& pdesc)
         : _id(pdesc.id()),
-          _table_desc(NULL),
+          _table_desc(nullptr),
           _byte_size(pdesc.byte_size()),
           _num_null_bytes(pdesc.num_null_bytes()),
-          _num_materialized_slots(0),
-          _slots(),
+
           _has_varlen_slots(false) {
     if (!pdesc.has_num_null_slots()) {
         //be compatible for existing tables with no NULL value
@@ -237,17 +282,7 @@ TupleDescriptor::TupleDescriptor(const PTupleDescriptor& pdesc)
 
 void TupleDescriptor::add_slot(SlotDescriptor* slot) {
     _slots.push_back(slot);
-
-    if (slot->is_materialized()) {
-        ++_num_materialized_slots;
-
-        if (slot->type().is_string_type()) {
-            _string_slots.push_back(slot);
-            _has_varlen_slots = true;
-        } else {
-            _no_string_slots.push_back(slot);
-        }
-    }
+    _decoded_slots.push_back(slot);
 }
 
 std::vector<SlotDescriptor*> TupleDescriptor::slots_ordered_by_idx() const {
@@ -282,7 +317,7 @@ void TupleDescriptor::to_protobuf(PTupleDescriptor* ptuple) const {
 std::string TupleDescriptor::debug_string() const {
     std::stringstream out;
     out << "Tuple(id=" << _id << " size=" << _byte_size;
-    if (_table_desc != NULL) {
+    if (_table_desc != nullptr) {
         //out << " " << _table_desc->debug_string();
     }
 
@@ -307,11 +342,11 @@ RowDescriptor::RowDescriptor(const DescriptorTbl& desc_tbl, const std::vector<TT
     DCHECK_GT(row_tuples.size(), 0);
     _num_null_slots = 0;
 
-    for (int i = 0; i < row_tuples.size(); ++i) {
-        TupleDescriptor* tupleDesc = desc_tbl.get_tuple_descriptor(row_tuples[i]);
+    for (int row_tuple : row_tuples) {
+        TupleDescriptor* tupleDesc = desc_tbl.get_tuple_descriptor(row_tuple);
         _num_null_slots += tupleDesc->num_null_slots();
         _tuple_desc_map.push_back(tupleDesc);
-        DCHECK(_tuple_desc_map.back() != NULL);
+        DCHECK(_tuple_desc_map.back() != nullptr);
     }
     _num_null_bytes = (_num_null_slots + 7) / 8;
 
@@ -328,8 +363,8 @@ RowDescriptor::RowDescriptor(TupleDescriptor* tuple_desc, bool is_nullable)
 void RowDescriptor::init_tuple_idx_map() {
     // find max id
     TupleId max_id = 0;
-    for (int i = 0; i < _tuple_desc_map.size(); ++i) {
-        max_id = std::max(_tuple_desc_map[i]->id(), max_id);
+    for (auto& i : _tuple_desc_map) {
+        max_id = std::max(i->id(), max_id);
     }
 
     _tuple_idx_map.resize(max_id + 1, INVALID_IDX);
@@ -340,8 +375,8 @@ void RowDescriptor::init_tuple_idx_map() {
 
 void RowDescriptor::init_has_varlen_slots() {
     _has_varlen_slots = false;
-    for (int i = 0; i < _tuple_desc_map.size(); ++i) {
-        if (_tuple_desc_map[i]->has_varlen_slots()) {
+    for (auto& i : _tuple_desc_map) {
+        if (i->has_varlen_slots()) {
             _has_varlen_slots = true;
             break;
         }
@@ -351,8 +386,8 @@ void RowDescriptor::init_has_varlen_slots() {
 int RowDescriptor::get_row_size() const {
     int size = 0;
 
-    for (int i = 0; i < _tuple_desc_map.size(); ++i) {
-        size += _tuple_desc_map[i]->byte_size();
+    for (auto i : _tuple_desc_map) {
+        size += i->byte_size();
     }
 
     return size;
@@ -369,8 +404,8 @@ bool RowDescriptor::tuple_is_nullable(int tuple_idx) const {
 }
 
 bool RowDescriptor::is_any_tuple_nullable() const {
-    for (int i = 0; i < _tuple_idx_nullable_map.size(); ++i) {
-        if (_tuple_idx_nullable_map[i]) {
+    for (bool i : _tuple_idx_nullable_map) {
+        if (i) {
             return true;
         }
     }
@@ -380,8 +415,8 @@ bool RowDescriptor::is_any_tuple_nullable() const {
 void RowDescriptor::to_thrift(std::vector<TTupleId>* row_tuple_ids) {
     row_tuple_ids->clear();
 
-    for (int i = 0; i < _tuple_desc_map.size(); ++i) {
-        row_tuple_ids->push_back(_tuple_desc_map[i]->id());
+    for (auto& i : _tuple_desc_map) {
+        row_tuple_ids->push_back(i->id());
     }
 }
 
@@ -468,13 +503,13 @@ std::string RowDescriptor::debug_string() const {
     return ss.str();
 }
 
-Status DescriptorTbl::create(ObjectPool* pool, const TDescriptorTable& thrift_tbl, DescriptorTbl** tbl) {
+Status DescriptorTbl::create(ObjectPool* pool, const TDescriptorTable& thrift_tbl, DescriptorTbl** tbl,
+                             int32_t chunk_size) {
     *tbl = pool->add(new DescriptorTbl());
 
     // deserialize table descriptors first, they are being referenced by tuple descriptors
-    for (size_t i = 0; i < thrift_tbl.tableDescriptors.size(); ++i) {
-        const TTableDescriptor& tdesc = thrift_tbl.tableDescriptors[i];
-        TableDescriptor* desc = NULL;
+    for (const auto& tdesc : thrift_tbl.tableDescriptors) {
+        TableDescriptor* desc = nullptr;
 
         switch (tdesc.tableType) {
         case TTableType::MYSQL_TABLE:
@@ -482,6 +517,7 @@ Status DescriptorTbl::create(ObjectPool* pool, const TDescriptorTable& thrift_tb
             break;
 
         case TTableType::OLAP_TABLE:
+        case TTableType::MATERIALIZED_VIEW:
             desc = pool->add(new OlapTableDescriptor(tdesc));
             break;
 
@@ -496,8 +532,22 @@ Status DescriptorTbl::create(ObjectPool* pool, const TDescriptorTable& thrift_tb
             break;
         case TTableType::HDFS_TABLE: {
             auto* hdfs_desc = pool->add(new HdfsTableDescriptor(tdesc, pool));
-            RETURN_IF_ERROR(hdfs_desc->create_key_exprs(pool));
+            RETURN_IF_ERROR(hdfs_desc->create_key_exprs(pool, chunk_size));
             desc = hdfs_desc;
+            break;
+        }
+        case TTableType::ICEBERG_TABLE: {
+            desc = pool->add(new IcebergTableDescriptor(tdesc, pool));
+            break;
+        }
+        case TTableType::HUDI_TABLE: {
+            auto* hudi_desc = pool->add(new HudiTableDescriptor(tdesc, pool));
+            RETURN_IF_ERROR(hudi_desc->create_key_exprs(pool, chunk_size));
+            desc = hudi_desc;
+            break;
+        }
+        case TTableType::JDBC_TABLE: {
+            desc = pool->add(new JDBCTableDescriptor(tdesc));
             break;
         }
         default:
@@ -507,21 +557,19 @@ Status DescriptorTbl::create(ObjectPool* pool, const TDescriptorTable& thrift_tb
         (*tbl)->_tbl_desc_map[tdesc.id] = desc;
     }
 
-    for (size_t i = 0; i < thrift_tbl.tupleDescriptors.size(); ++i) {
-        const TTupleDescriptor& tdesc = thrift_tbl.tupleDescriptors[i];
+    for (const auto& tdesc : thrift_tbl.tupleDescriptors) {
         TupleDescriptor* desc = pool->add(new TupleDescriptor(tdesc));
 
         // fix up table pointer
         if (tdesc.__isset.tableId) {
             desc->_table_desc = (*tbl)->get_table_descriptor(tdesc.tableId);
-            DCHECK(desc->_table_desc != NULL);
+            DCHECK(desc->_table_desc != nullptr);
         }
 
         (*tbl)->_tuple_desc_map[tdesc.id] = desc;
     }
 
-    for (size_t i = 0; i < thrift_tbl.slotDescriptors.size(); ++i) {
-        const TSlotDescriptor& tdesc = thrift_tbl.slotDescriptors[i];
+    for (const auto& tdesc : thrift_tbl.slotDescriptors) {
         SlotDescriptor* slot_d = pool->add(new SlotDescriptor(tdesc));
         (*tbl)->_slot_desc_map[tdesc.id] = slot_d;
 
@@ -541,7 +589,7 @@ Status DescriptorTbl::create(ObjectPool* pool, const TDescriptorTable& thrift_tb
 TableDescriptor* DescriptorTbl::get_table_descriptor(TableId id) const {
     TableDescriptorMap::const_iterator i = _tbl_desc_map.find(id);
     if (i == _tbl_desc_map.end()) {
-        return NULL;
+        return nullptr;
     } else {
         return i->second;
     }
@@ -550,7 +598,7 @@ TableDescriptor* DescriptorTbl::get_table_descriptor(TableId id) const {
 TupleDescriptor* DescriptorTbl::get_tuple_descriptor(TupleId id) const {
     TupleDescriptorMap::const_iterator i = _tuple_desc_map.find(id);
     if (i == _tuple_desc_map.end()) {
-        return NULL;
+        return nullptr;
     } else {
         return i->second;
     }
@@ -561,7 +609,7 @@ SlotDescriptor* DescriptorTbl::get_slot_descriptor(SlotId id) const {
     SlotDescriptorMap::const_iterator i = _slot_desc_map.find(id);
 
     if (i == _slot_desc_map.end()) {
-        return NULL;
+        return nullptr;
     } else {
         return i->second;
     }
@@ -571,8 +619,8 @@ SlotDescriptor* DescriptorTbl::get_slot_descriptor(SlotId id) const {
 void DescriptorTbl::get_tuple_descs(std::vector<TupleDescriptor*>* descs) const {
     descs->clear();
 
-    for (TupleDescriptorMap::const_iterator i = _tuple_desc_map.begin(); i != _tuple_desc_map.end(); ++i) {
-        descs->push_back(i->second);
+    for (auto i : _tuple_desc_map) {
+        descs->push_back(i.second);
     }
 }
 
@@ -589,8 +637,8 @@ std::string DescriptorTbl::debug_string() const {
     std::stringstream out;
     out << "tuples:\n";
 
-    for (TupleDescriptorMap::const_iterator i = _tuple_desc_map.begin(); i != _tuple_desc_map.end(); ++i) {
-        out << i->second->debug_string() << '\n';
+    for (auto i : _tuple_desc_map) {
+        out << i.second->debug_string() << '\n';
     }
 
     return out.str();

@@ -24,8 +24,6 @@ package com.starrocks.analysis;
 import com.google.common.collect.Lists;
 import com.starrocks.catalog.AggregateType;
 import com.starrocks.catalog.FunctionSet;
-import mockit.Expectations;
-import mockit.Injectable;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -46,19 +44,13 @@ public class MVColumnOneChildPatternTest {
     }
 
     @Test
-    public void testCorrectMin(@Injectable CastExpr castExpr) {
+    public void testCorrectMin() {
         TableName tableName = new TableName("db", "table");
         SlotRef slotRef = new SlotRef(tableName, "c1");
         List<Expr> child0Params = Lists.newArrayList();
         child0Params.add(slotRef);
-        new Expectations() {
-            {
-                castExpr.unwrapSlotRef();
-                result = slotRef;
-            }
-        };
         List<Expr> params = Lists.newArrayList();
-        params.add(castExpr);
+        params.add(slotRef);
         FunctionCallExpr functionCallExpr = new FunctionCallExpr(AggregateType.MIN.name(), params);
         MVColumnOneChildPattern mvColumnOneChildPattern = new MVColumnOneChildPattern(
                 AggregateType.MIN.name().toLowerCase());

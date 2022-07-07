@@ -23,7 +23,6 @@ package com.starrocks;
 
 import com.google.common.base.Charsets;
 import com.google.common.base.Strings;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.common.CommandLineOptions;
 import com.starrocks.common.Config;
 import com.starrocks.common.Log4jConfig;
@@ -37,6 +36,7 @@ import com.starrocks.journal.bdbje.BDBJEJournal;
 import com.starrocks.journal.bdbje.BDBTool;
 import com.starrocks.journal.bdbje.BDBToolOptions;
 import com.starrocks.qe.QeService;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.ExecuteEnv;
 import com.starrocks.service.FeServer;
 import com.starrocks.service.FrontendOptions;
@@ -53,7 +53,6 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.lang.management.ManagementFactory;
 import java.nio.channels.FileLock;
-import java.nio.channels.OverlappingFileLockException;
 
 public class StarRocksFE {
     private static final Logger LOG = LogManager.getLogger(StarRocksFE.class);
@@ -101,14 +100,19 @@ public class StarRocksFE {
             // check command line options
             checkCommandLineOptions(cmdLineOpts);
 
+            // check meta dir
+            checkMetaDir();
+
             LOG.info("StarRocks FE starting...");
 
-            FrontendOptions.init();
+            FrontendOptions.init(args);
             ExecuteEnv.setup();
 
-            // init catalog and wait it be ready
-            Catalog.getCurrentCatalog().initialize(args);
-            Catalog.getCurrentCatalog().waitForReady();
+            // init globalStateMgr and wait it be ready
+            GlobalStateMgr.getCurrentState().initialize(args);
+            GlobalStateMgr.getCurrentState().waitForReady();
+
+            FrontendOptions.saveStartType();
 
             // init and start:
             // 1. QeService for MySQL Server
@@ -132,47 +136,50 @@ public class StarRocksFE {
                 Thread.sleep(2000);
             }
         } catch (Throwable e) {
+            LOG.error("StarRocksFE start failed", e);
             e.printStackTrace();
         }
     }
 
-    // NOTE: To avoid dead lock
-    //      1. never call System.exit in shutdownHook
-    //      2. shutdownHook cannot have lock conflict with the function calling System.exit
-    private static void addShutdownHook() {
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            LOG.info("start to execute shutdown hook");
-            try {
-                Thread t = new Thread(() -> {
-                    try {
-                        // NOTE: do not call EditLog.close() or BDBJEJournal.close(), because we only want to close BDBEnvironment.
-                        // In addition, calling EditLog.close() may cause deadlock:
-                        //      If there is a synchronized function funA of EditLog calls System.exit(), the System.exit() will wait shutdown hook complete,
-                        //      because EditLog.close is a synchronized function too, and it cannot be executed unless funA returns.
-                        //      In this case, system will fall into deadlock.
-                        Journal journal = Catalog.getCurrentCatalog().getEditLog().getJournal();
-                        if (journal instanceof BDBJEJournal) {
-                            BDBEnvironment bdbEnvironment = ((BDBJEJournal) journal).getBdbEnvironment();
-                            if (bdbEnvironment != null) {
-                                bdbEnvironment.close();
-                            }
-                        }
-                    } catch (Throwable e) {
-                        LOG.warn("close edit log failed", e);
-                    }
-                });
+    private static void checkMetaDir() {
 
-                t.start();
-
-                // it is necessary to set shutdown timeout,
-                // because in addition to kill by user, System.exit(-1) will trigger the shutdown hook too,
-                // if no timeout and shutdown hook blocked indefinitely, Fe will fall into a catastrophic state.
-                t.join(Config.shutdown_hook_timeout_sec * 1000);
-            } catch (Throwable e) {
-                LOG.warn("shut down hook failed", e);
+        // check meta dir
+        //   if metaDir is the default config: StarRocksFE.STARROCKS_HOME_DIR + "/meta",
+        //   we should check whether both the new default dir (STARROCKS_HOME_DIR + "/meta")
+        //   and the old default dir (DORIS_HOME_DIR + "/doris-meta") are present. If both are present,
+        //   we need to let users keep only one to avoid starting from outdated metadata.
+        String oldDefaultMetaDir = System.getenv("DORIS_HOME") + "/doris-meta";
+        String newDefaultMetaDir = StarRocksFE.STARROCKS_HOME_DIR + "/meta";
+        String metaDir = Config.meta_dir;
+        if (metaDir.equals(newDefaultMetaDir)) {
+            File oldMeta = new File(oldDefaultMetaDir);
+            File newMeta = new File(newDefaultMetaDir);
+            if (oldMeta.exists() && newMeta.exists()) {
+                LOG.error("New default meta dir: {} and Old default meta dir: {} are both present. " +
+                                "Please make sure {} has the latest data, and remove the another one.",
+                        newDefaultMetaDir, oldDefaultMetaDir, newDefaultMetaDir);
+                System.exit(-1);
             }
-            LOG.info("shutdown hook end");
-        }));
+        }
+
+        File meta = new File(metaDir);
+        if (!meta.exists()) {
+            // If metaDir is not the default config, it means the user has specified the other directory
+            // We should not use the oldDefaultMetaDir.
+            // Just exit in this case
+            if (!metaDir.equals(newDefaultMetaDir)) {
+                LOG.error("meta dir {} dose not exist, will exit", metaDir);
+                System.exit(-1);
+            }
+            File oldMeta = new File(oldDefaultMetaDir);
+            if (oldMeta.exists()) {
+                // For backward compatible
+                Config.meta_dir = oldDefaultMetaDir;
+            } else {
+                LOG.error("meta dir {} does not exist, will exit", meta.getAbsolutePath());
+                System.exit(-1);
+            }
+        }
     }
 
     /*
@@ -202,10 +209,11 @@ public class StarRocksFE {
     private static CommandLineOptions parseArgs(String[] args) {
         CommandLineParser commandLineParser = new BasicParser();
         Options options = new Options();
+        options.addOption("ht", "host_type", false, "Specify fe start use ip or fqdn");
         options.addOption("v", "version", false, "Print the version of StarRocks Frontend");
         options.addOption("h", "helper", true, "Specify the helper node when joining a bdb je replication group");
         options.addOption("b", "bdb", false, "Run bdbje debug tools");
-        options.addOption("l", "listdb", false, "Run bdbje debug tools");
+        options.addOption("l", "listdb", false, "Print the list of databases in bdbje");
         options.addOption("d", "db", true, "Specify a database in bdbje");
         options.addOption("s", "stat", false, "Print statistic of a database, including count, first key, last key");
         options.addOption("f", "from", true, "Specify the start scan key");
@@ -278,7 +286,8 @@ public class StarRocksFE {
                     }
 
                     BDBToolOptions bdbOpts =
-                            new BDBToolOptions(false, dbName, false, fromKey, endKey, metaVersion, starrocksMetaVersion);
+                            new BDBToolOptions(false, dbName, false, fromKey, endKey, metaVersion,
+                                    starrocksMetaVersion);
                     return new CommandLineOptions(false, "", bdbOpts);
                 }
             } else {
@@ -308,7 +317,8 @@ public class StarRocksFE {
             System.out.println("Java compile version: " + Version.STARROCKS_JAVA_COMPILE_VERSION);
             System.exit(0);
         } else if (cmdLineOpts.runBdbTools()) {
-            BDBTool bdbTool = new BDBTool(Catalog.getCurrentCatalog().getBdbDir(), cmdLineOpts.getBdbToolOpts());
+            
+            BDBTool bdbTool = new BDBTool(BDBEnvironment.getBdbDir(), cmdLineOpts.getBdbToolOpts());
             if (bdbTool.run()) {
                 System.exit(0);
             } else {
@@ -319,29 +329,64 @@ public class StarRocksFE {
         // go on
     }
 
-    private static boolean createAndLockPidFile(String pidFilePath) throws IOException {
+    private static boolean createAndLockPidFile(String pidFilePath) {
         File pid = new File(pidFilePath);
-        RandomAccessFile file = new RandomAccessFile(pid, "rws");
-        try {
-            FileLock lock = file.getChannel().tryLock();
-            if (lock == null) {
-                return false;
+        for (int i = 0; i < 3; i++) {
+            try (RandomAccessFile file = new RandomAccessFile(pid, "rws")) {
+                if (i > 0) {
+                    Thread.sleep(10000);
+                }
+                FileLock lock = file.getChannel().tryLock();
+                if (lock == null) {
+                    throw new Exception("get pid file lock failed, lock is null");
+                }
+
+                pid.deleteOnExit();
+
+                String name = ManagementFactory.getRuntimeMXBean().getName();
+                file.setLength(0);
+                file.write(name.split("@")[0].getBytes(Charsets.UTF_8));
+
+                return true;
+            } catch (Throwable t) {
+                LOG.warn("get pid file lock failed, retried: {}", i, t);
             }
-
-            pid.deleteOnExit();
-
-            String name = ManagementFactory.getRuntimeMXBean().getName();
-            file.setLength(0);
-            file.write(name.split("@")[0].getBytes(Charsets.UTF_8));
-
-            return true;
-        } catch (OverlappingFileLockException e) {
-            file.close();
-            return false;
-        } catch (IOException e) {
-            file.close();
-            throw e;
         }
+
+        return false;
+    }
+
+    // NOTE: To avoid dead lock
+    //      1. never call System.exit in shutdownHook
+    //      2. shutdownHook cannot have lock conflict with the function calling System.exit
+    private static void addShutdownHook() {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            LOG.info("start to execute shutdown hook");
+            try {
+                Thread t = new Thread(() -> {
+                    try {
+                        Journal journal = GlobalStateMgr.getCurrentState().getJournal();
+                        if (journal instanceof BDBJEJournal) {
+                            BDBEnvironment bdbEnvironment = ((BDBJEJournal) journal).getBdbEnvironment();
+                            if (bdbEnvironment != null) {
+                                bdbEnvironment.flushVLSNMapping();
+                            }
+                        }
+                    } catch (Throwable e) {
+                        LOG.warn("flush vlsn mapping failed", e);
+                    }
+                });
+
+                t.start();
+
+                // it is necessary to set shutdown timeout,
+                // because in addition to kill by user, System.exit(-1) will trigger the shutdown hook too,
+                // if no timeout and shutdown hook blocked indefinitely, Fe will fall into a catastrophic state.
+                t.join(30000);
+            } catch (Throwable e) {
+                LOG.warn("shut down hook failed", e);
+            }
+            LOG.info("shutdown hook end");
+        }));
     }
 }
-

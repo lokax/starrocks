@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.operator.scalar;
 
 import com.google.common.base.Preconditions;
@@ -9,10 +9,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-import static com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator.BinaryType.EQ_FOR_NULL;
-
 public class BinaryPredicateOperator extends PredicateOperator {
-    private static final Map<BinaryType, BinaryType> BINARY_CONVERSE_MAP =
+    private static final Map<BinaryType, BinaryType> BINARY_COMMUTATIVE_MAP =
             ImmutableMap.<BinaryType, BinaryType>builder()
                     .put(BinaryType.EQ, BinaryType.EQ)
                     .put(BinaryType.NE, BinaryType.NE)
@@ -21,6 +19,17 @@ public class BinaryPredicateOperator extends PredicateOperator {
                     .put(BinaryType.GE, BinaryType.LE)
                     .put(BinaryType.GT, BinaryType.LT)
                     .put(BinaryType.EQ_FOR_NULL, BinaryType.EQ_FOR_NULL)
+                    .build();
+
+    private static final Map<BinaryType, BinaryType> BINARY_NEGATIVE_MAP =
+            ImmutableMap.<BinaryType, BinaryType>builder()
+                    .put(BinaryType.EQ, BinaryType.NE)
+                    .put(BinaryType.NE, BinaryType.EQ)
+                    .put(BinaryType.LE, BinaryType.GT)
+                    .put(BinaryType.LT, BinaryType.GE)
+                    .put(BinaryType.GE, BinaryType.LT)
+                    .put(BinaryType.GT, BinaryType.LE)
+                    .put(BinaryType.EQ_FOR_NULL, BinaryType.NE)
                     .build();
 
     private final BinaryType type;
@@ -85,7 +94,13 @@ public class BinaryPredicateOperator extends PredicateOperator {
             return this == EQ || this == EQ_FOR_NULL;
         }
 
-        ;
+        public boolean isUnequivalence() {
+            return this == NE;
+        }
+
+        public boolean isNotRangeComparison() {
+            return isEquivalence() || isUnequivalence();
+        }
 
         public boolean isRange() {
             return type.equals(LT.type)
@@ -95,10 +110,14 @@ public class BinaryPredicateOperator extends PredicateOperator {
         }
     }
 
-    public BinaryPredicateOperator negative() {
-        return new BinaryPredicateOperator(BINARY_CONVERSE_MAP.get(this.getBinaryType()),
+    public BinaryPredicateOperator commutative() {
+        return new BinaryPredicateOperator(BINARY_COMMUTATIVE_MAP.get(this.getBinaryType()),
                 this.getChild(1),
                 this.getChild(0));
+    }
+
+    public BinaryPredicateOperator negative() {
+        return new BinaryPredicateOperator(BINARY_NEGATIVE_MAP.get(this.getBinaryType()), this.getChildren());
     }
 
     @Override
@@ -132,12 +151,31 @@ public class BinaryPredicateOperator extends PredicateOperator {
     }
 
     @Override
-    public boolean isStrictPredicate() {
-        if (type == EQ_FOR_NULL) {
-            return false;
-        }
-        // To exclude 1 = 1;
-        // TODO(kks): Currently, we only allow column ref and cast, we should allow some functions
-        return getChild(0).isColumnRefOrCast() || getChild(1).isColumnRefOrCast();
+    public boolean isNullable() {
+        return !this.type.equals(BinaryType.EQ_FOR_NULL) && super.isNullable();
+    }
+
+    public static BinaryPredicateOperator eq(ScalarOperator lhs, ScalarOperator rhs) {
+        return new BinaryPredicateOperator(BinaryType.EQ, lhs, rhs);
+    }
+
+    public static BinaryPredicateOperator ge(ScalarOperator lhs, ScalarOperator rhs) {
+        return new BinaryPredicateOperator(BinaryType.GE, lhs, rhs);
+    }
+
+    public static BinaryPredicateOperator gt(ScalarOperator lhs, ScalarOperator rhs) {
+        return new BinaryPredicateOperator(BinaryType.GT, lhs, rhs);
+    }
+
+    public static BinaryPredicateOperator ne(ScalarOperator lhs, ScalarOperator rhs) {
+        return new BinaryPredicateOperator(BinaryType.NE, lhs, rhs);
+    }
+
+    public static BinaryPredicateOperator le(ScalarOperator lhs, ScalarOperator rhs) {
+        return new BinaryPredicateOperator(BinaryType.LE, lhs, rhs);
+    }
+
+    public static BinaryPredicateOperator lt(ScalarOperator lhs, ScalarOperator rhs) {
+        return new BinaryPredicateOperator(BinaryType.LT, lhs, rhs);
     }
 }

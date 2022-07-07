@@ -32,7 +32,6 @@ import com.starrocks.analysis.RestoreStmt;
 import com.starrocks.analysis.TableName;
 import com.starrocks.analysis.TableRef;
 import com.starrocks.catalog.BrokerMgr;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
@@ -46,6 +45,7 @@ import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.FeConstants;
 import com.starrocks.persist.EditLog;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.task.DirMoveTask;
 import com.starrocks.task.DownloadTask;
 import com.starrocks.task.SnapshotTask;
@@ -82,7 +82,7 @@ public class BackupHandlerTest {
     private BackupHandler handler;
 
     @Mocked
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
     @Mocked
     private BrokerMgr brokerMgr;
     @Mocked
@@ -106,27 +106,27 @@ public class BackupHandlerTest {
 
         new Expectations() {
             {
-                catalog.getBrokerMgr();
+                globalStateMgr.getBrokerMgr();
                 minTimes = 0;
                 result = brokerMgr;
 
-                catalog.getNextId();
+                globalStateMgr.getNextId();
                 minTimes = 0;
                 result = idGen++;
 
-                catalog.getEditLog();
+                globalStateMgr.getEditLog();
                 minTimes = 0;
                 result = editLog;
 
-                Catalog.getCurrentCatalog();
+                GlobalStateMgr.getCurrentState();
                 minTimes = 0;
-                result = catalog;
+                result = globalStateMgr;
 
-                Catalog.getCurrentCatalogJournalVersion();
+                GlobalStateMgr.getCurrentStateJournalVersion();
                 minTimes = 0;
                 result = FeConstants.meta_version;
 
-                Catalog.getCurrentInvertedIndex();
+                GlobalStateMgr.getCurrentInvertedIndex();
                 minTimes = 0;
                 result = invertedIndex;
             }
@@ -141,7 +141,7 @@ public class BackupHandlerTest {
 
         new Expectations() {
             {
-                catalog.getDb(anyString);
+                globalStateMgr.getDb(anyString);
                 minTimes = 0;
                 result = db;
             }
@@ -153,7 +153,7 @@ public class BackupHandlerTest {
         if (rootDir != null) {
             try {
                 Files.walk(Paths.get(Config.tmp_dir),
-                        FileVisitOption.FOLLOW_LINKS).sorted(Comparator.reverseOrder()).map(Path::toFile)
+                                FileVisitOption.FOLLOW_LINKS).sorted(Comparator.reverseOrder()).map(Path::toFile)
                         .forEach(File::delete);
             } catch (IOException e) {
                 // TODO Auto-generated catch block
@@ -164,7 +164,7 @@ public class BackupHandlerTest {
 
     @Test
     public void testInit() {
-        handler = new BackupHandler(catalog);
+        handler = new BackupHandler(globalStateMgr);
         handler.runAfterCatalogReady();
 
         File backupDir = new File(BackupHandler.BACKUP_ROOT_DIR.toString());
@@ -239,7 +239,7 @@ public class BackupHandlerTest {
         };
 
         // add repo
-        handler = new BackupHandler(catalog);
+        handler = new BackupHandler(globalStateMgr);
         CreateRepositoryStmt stmt = new CreateRepositoryStmt(false, "repo", "broker", "bos://location",
                 Maps.newHashMap());
         try {
@@ -264,7 +264,7 @@ public class BackupHandlerTest {
         // handleFinishedSnapshotTask
         BackupJob backupJob = (BackupJob) handler.getJob(CatalogMocker.TEST_DB_ID);
         SnapshotTask snapshotTask = new SnapshotTask(null, 0, 0, backupJob.getJobId(), CatalogMocker.TEST_DB_ID,
-                0, 0, 0, 0, 0, 0, 0, 1, false);
+                0, 0, 0, 0, 0, 0, 1, false);
         TFinishTaskRequest request = new TFinishTaskRequest();
         List<String> snapshotFiles = Lists.newArrayList();
         request.setSnapshot_files(snapshotFiles);
@@ -307,6 +307,21 @@ public class BackupHandlerTest {
             Assert.fail();
         }
 
+        {
+            // process backup for primary key, will be forbidden
+            List<TableRef> tblRefs1 = Lists.newArrayList();
+            tblRefs1.add(new TableRef(new TableName(CatalogMocker.TEST_DB_NAME, CatalogMocker.TEST_TBL3_NAME), null));
+            BackupStmt backupStmt1 =
+                    new BackupStmt(new LabelName(CatalogMocker.TEST_DB_NAME, "label2"), "repo", tblRefs1,
+                            null);
+            try {
+                handler.process(backupStmt1);
+            } catch (DdlException e1) {
+                Assert.assertEquals(e1.toString(),
+                        "com.starrocks.common.DdlException: backup do not support primary key table: test_tbl3");
+            }
+        }
+
         // process restore
         List<TableRef> tblRefs2 = Lists.newArrayList();
         tblRefs2.add(new TableRef(new TableName(CatalogMocker.TEST_DB_NAME, CatalogMocker.TEST_TBL_NAME), null));
@@ -331,7 +346,7 @@ public class BackupHandlerTest {
         // handleFinishedSnapshotTask
         RestoreJob restoreJob = (RestoreJob) handler.getJob(CatalogMocker.TEST_DB_ID);
         snapshotTask = new SnapshotTask(null, 0, 0, restoreJob.getJobId(), CatalogMocker.TEST_DB_ID,
-                0, 0, 0, 0, 0, 0, 0, 1, true);
+                0, 0, 0, 0, 0, 0, 1, true);
         request = new TFinishTaskRequest();
         request.setSnapshot_path("./snapshot/path");
         request.setTask_status(new TStatus(TStatusCode.OK));

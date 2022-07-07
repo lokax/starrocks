@@ -24,6 +24,12 @@
 #include <ostream>
 
 #include "gutil/strings/substitute.h"
+#include "runtime/datetime_value.h"
+#include "runtime/decimal_value.h"
+#include "runtime/primitive_type.h"
+#include "runtime/string_value.h"
+#include "storage/array_type_info.h"
+#include "storage/types.h"
 
 namespace starrocks {
 
@@ -51,8 +57,8 @@ TypeDescriptor::TypeDescriptor(const std::vector<TTypeNode>& types, int* idx) : 
     case TTypeNodeType::STRUCT:
         type = TYPE_STRUCT;
         ++(*idx);
-        for (int i = 0; i < node.struct_fields.size(); ++i) {
-            field_names.push_back(node.struct_fields[i].name);
+        for (const auto& struct_field : node.struct_fields) {
+            field_names.push_back(struct_field.name);
             children.push_back(TypeDescriptor(types, idx));
         }
         break;
@@ -234,6 +240,102 @@ std::string TypeDescriptor::debug_string() const {
     default:
         return type_to_string(type);
     }
+}
+
+bool TypeDescriptor::support_join() const {
+    return type != TYPE_JSON && type != TYPE_OBJECT && type != TYPE_PERCENTILE && type != TYPE_HLL &&
+           type != TYPE_MAP && type != TYPE_STRUCT && type != TYPE_ARRAY;
+}
+
+bool TypeDescriptor::support_orderby() const {
+    return type != TYPE_JSON && type != TYPE_OBJECT && type != TYPE_PERCENTILE && type != TYPE_HLL &&
+           type != TYPE_MAP && type != TYPE_STRUCT && type != TYPE_ARRAY;
+}
+
+bool TypeDescriptor::support_groupby() const {
+    return type != TYPE_JSON && type != TYPE_OBJECT && type != TYPE_PERCENTILE && type != TYPE_HLL &&
+           type != TYPE_MAP && type != TYPE_STRUCT;
+}
+
+TypeDescriptor TypeDescriptor::from_storage_type_info(TypeInfo* type_info) {
+    FieldType ftype = type_info->type();
+
+    bool is_array = false;
+    if (ftype == OLAP_FIELD_TYPE_ARRAY) {
+        is_array = true;
+        type_info = get_item_type_info(type_info).get();
+        ftype = type_info->type();
+    }
+
+    PrimitiveType ptype = scalar_field_type_to_primitive_type(ftype);
+    DCHECK(ptype != INVALID_TYPE);
+    int len = TypeDescriptor::MAX_VARCHAR_LENGTH;
+    int precision = type_info->precision();
+    int scale = type_info->scale();
+    TypeDescriptor ret = TypeDescriptor::from_primtive_type(ptype, len, precision, scale);
+
+    if (is_array) {
+        TypeDescriptor arr;
+        arr.type = TYPE_ARRAY;
+        arr.children.emplace_back(ret);
+        return arr;
+    }
+    return ret;
+}
+
+/// Returns the size of a slot for this type.
+int TypeDescriptor::get_slot_size() const {
+    switch (type) {
+    case TYPE_CHAR:
+    case TYPE_VARCHAR:
+    case TYPE_HLL:
+    case TYPE_OBJECT:
+    case TYPE_PERCENTILE:
+    case TYPE_JSON:
+        return sizeof(StringValue);
+
+    case TYPE_NULL:
+    case TYPE_BOOLEAN:
+    case TYPE_TINYINT:
+        return 1;
+
+    case TYPE_SMALLINT:
+        return 2;
+
+    case TYPE_INT:
+    case TYPE_FLOAT:
+    case TYPE_DECIMAL32:
+        return 4;
+
+    case TYPE_BIGINT:
+    case TYPE_DOUBLE:
+    case TYPE_TIME:
+    case TYPE_DECIMAL64:
+        return 8;
+
+    case TYPE_DATE:
+    case TYPE_DATETIME:
+        // This is the size of the slot, the actual size of the data is 12.
+        return sizeof(DateTimeValue);
+
+    case TYPE_DECIMAL:
+        return sizeof(DecimalValue);
+
+    case TYPE_LARGEINT:
+    case TYPE_DECIMALV2:
+    case TYPE_DECIMAL128:
+        return 16;
+    case TYPE_ARRAY:
+        return sizeof(void*); // sizeof(Collection*)
+    case INVALID_TYPE:
+    case TYPE_BINARY:
+    case TYPE_STRUCT:
+    case TYPE_MAP:
+        DCHECK(false);
+        break;
+    }
+    // For llvm complain
+    return -1;
 }
 
 } // namespace starrocks

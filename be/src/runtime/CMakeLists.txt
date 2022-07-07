@@ -31,65 +31,44 @@ set(RUNTIME_FILES
     broker_mgr.cpp
     buffer_control_block.cpp
     client_cache.cpp
+    local_pass_through_buffer.cpp
     data_stream_mgr.cpp
     data_stream_sender.cpp
+    multi_cast_data_stream_sink.cpp
     datetime_value.cpp
     descriptors.cpp
     exec_env.cpp
     user_function_cache.cpp
+    jdbc_driver_manager.cpp
     mem_pool.cpp
     plan_fragment_executor.cpp
     primitive_type.cpp
     raw_value.cpp
-    raw_value_ir.cpp
     result_sink.cpp
     result_buffer_mgr.cpp
-    result_writer.cpp
-    row_batch.cpp
     runtime_state.cpp
     string_value.cpp
     thread_resource_mgr.cpp
-    #  timestamp_value.cpp
     decimal_value.cpp
     decimalv2_value.cpp
     large_int_value.cpp
-    tuple.cpp
-    tuple_row.cpp
-    vectorized_row_batch.cpp
     fragment_mgr.cpp
     dpp_sink_internal.cpp
     load_path_mgr.cpp
     types.cpp
-    tmp_file_mgr.cc
-    disk_io_mgr.cc
-    disk_io_mgr_reader_context.cc
-    disk_io_mgr_scan_range.cc 
-    buffered_block_mgr2.cc
-    test_env.cc
     mem_tracker.cpp
-    spill_sorter.cc
-    sorted_run_merger.cc
     data_stream_recvr.cc
-    buffered_tuple_stream2.cc
-    buffered_tuple_stream2_ir.cc
-    buffered_tuple_stream3.cc
-    #  export_task_mgr.cpp
     export_sink.cpp
     load_channel_mgr.cpp
     load_channel.cpp
-    tablets_channel.cpp
-    bufferpool/buffer_allocator.cc
-    bufferpool/buffer_pool.cc
-    bufferpool/reservation_tracker.cc
-    bufferpool/reservation_util.cc
-    bufferpool/suballocator.cc
-    bufferpool/system_allocator.cc
-    initial_reservations.cc
+    local_tablets_channel.cpp
     snapshot_loader.cpp
     query_statistics.cpp 
     message_body_sink.cpp
+    stream_load/transaction_mgr.cpp
     stream_load/stream_load_context.cpp
     stream_load/stream_load_executor.cpp
+    stream_load/stream_load_pipe.cpp
     routine_load/data_consumer.cpp
     routine_load/data_consumer_group.cpp
     routine_load/data_consumer_pool.cpp
@@ -103,22 +82,25 @@ set(RUNTIME_FILES
     mysql_result_writer.cpp
     memory/system_allocator.cpp
     memory/chunk_allocator.cpp
-    date_value.cpp
-    timestamp_value.cpp
-    vectorized/chunk_cursor.cpp
-    vectorized/sorted_chunks_merger.cpp
-    vectorized/time_types.cpp
-    vectorized/statistic_result_writer.cpp
+    chunk_cursor.cpp
+    sorted_chunks_merger.cpp
+    time_types.cpp
+    statistic_result_writer.cpp
     hdfs/hdfs_fs_cache.cpp
     runtime_filter_worker.cpp
+    global_dict/decoder.cpp
+    global_dict/parser.cpp
+    global_dict/miscs.cpp
+    global_dict/types.cpp
+    current_thread.cpp
+    runtime_filter_cache.cpp
+    lake_tablets_channel.cpp
 )
 
-if (WITH_MYSQL)
-    set(RUNTIME_FILES ${RUNTIME_FILES}
-        mysql_table_writer.cpp
-        mysql_table_sink.cpp
-        )
-endif()
+set(RUNTIME_FILES ${RUNTIME_FILES}
+    mysql_table_writer.cpp
+    mysql_table_sink.cpp
+)
 
 add_library(Runtime STATIC
     ${RUNTIME_FILES}

@@ -42,16 +42,15 @@ public:
             return _stream_map.size();
         });
     }
-    ~LoadStreamMgr() {}
+    ~LoadStreamMgr() = default;
 
-    Status put(const UniqueId& id, std::shared_ptr<StreamLoadPipe> stream) {
+    Status put(const UniqueId& id, const std::shared_ptr<StreamLoadPipe>& stream) {
         std::lock_guard<std::mutex> l(_lock);
         auto it = _stream_map.find(id);
         if (it != std::end(_stream_map)) {
             return Status::InternalError("id already exist");
         }
         _stream_map.emplace(id, stream);
-        VLOG(3) << "put stream load pipe: " << id;
         return Status::OK();
     }
 
@@ -62,7 +61,6 @@ public:
             return nullptr;
         }
         auto stream = it->second;
-        _stream_map.erase(it);
         return stream;
     }
 
@@ -71,9 +69,7 @@ public:
         auto it = _stream_map.find(id);
         if (it != std::end(_stream_map)) {
             _stream_map.erase(it);
-            VLOG(3) << "remove stream load pipe: " << id;
         }
-        return;
     }
 
 private:

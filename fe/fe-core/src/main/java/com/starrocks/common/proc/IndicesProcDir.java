@@ -122,7 +122,7 @@ public class IndicesProcDir implements ProcDirInterface {
             if (materializedIndex == null) {
                 throw new AnalysisException("Index[" + indexId + "] does not exist.");
             }
-            return new TabletsProcDir(db, materializedIndex);
+            return new TabletsProcDir(db, partition, materializedIndex);
         } finally {
             db.readUnlock();
         }

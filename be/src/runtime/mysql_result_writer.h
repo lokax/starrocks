@@ -27,13 +27,12 @@
 
 namespace starrocks {
 
-class TupleRow;
-class RowBatch;
 class ExprContext;
 class MysqlRowBuffer;
 class BufferControlBlock;
 class RuntimeProfile;
 using TFetchDataResultPtr = std::unique_ptr<TFetchDataResult>;
+using TFetchDataResultPtrs = std::vector<TFetchDataResultPtr>;
 // convert the row batch to mysql protocol row
 class MysqlResultWriter final : public ResultWriter {
 public:
@@ -44,10 +43,6 @@ public:
 
     Status init(RuntimeState* state) override;
 
-    // convert one row batch to mysql result and
-    // append this batch to the result sink
-    Status append_row_batch(const RowBatch* batch) override;
-
     Status append_chunk(vectorized::Chunk* chunk) override;
 
     Status close() override;
@@ -56,30 +51,34 @@ public:
     // the former transform input chunk into TFetchDataResult, the latter add TFetchDataResult
     // to queue whose consumers are rpc threads that invoke fetch_data rpc.
     StatusOr<TFetchDataResultPtr> process_chunk(vectorized::Chunk* chunk);
+    // because the mem buffer used by thrift serialization is limited, we should control the size of single TFetchDataResult,
+    // we may split a chunk into multiple TFetchDataResults
+    // In order not to affect the current implementation of the non-pipeline engine,
+    // we only implement it for the pipeline engine
+    StatusOr<TFetchDataResultPtrs> process_chunk_for_pipeline(vectorized::Chunk* chunk);
 
     // try to add result into _sinker if ResultQueue is not full and this operation is
     // non-blocking. return true on success, false in case of that ResultQueue is full.
-    StatusOr<bool> try_add_batch(TFetchDataResultPtr& result);
+    StatusOr<bool> try_add_batch(TFetchDataResultPtrs& results);
 
 private:
     void _init_profile();
-    // convert one tuple row
-    Status _add_one_row(TupleRow* row);
 
-private:
     BufferControlBlock* _sinker;
     const std::vector<ExprContext*>& _output_expr_ctxs;
     MysqlRowBuffer* _row_buffer;
 
     RuntimeProfile* _parent_profile; // parent profile from result sink. not owned
-    // total time cost on append batch opertion
-    RuntimeProfile::Counter* _append_row_batch_timer = nullptr;
-    // tuple convert timer, child timer of _append_row_batch_timer
+    // total time cost on append chunk operation
+    RuntimeProfile::Counter* _append_chunk_timer = nullptr;
+    // tuple convert timer, child timer of _append_chunk_timer
     RuntimeProfile::Counter* _convert_tuple_timer = nullptr;
-    // file write timer, child timer of _append_row_batch_timer
+    // file write timer, child timer of _append_chunk_timer
     RuntimeProfile::Counter* _result_send_timer = nullptr;
     // number of sent rows
     RuntimeProfile::Counter* _sent_rows_counter = nullptr;
+
+    const size_t _max_row_buffer_size = 1024 * 1024 * 1024;
 };
 
 } // namespace starrocks

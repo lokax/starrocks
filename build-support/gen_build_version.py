@@ -1,5 +1,5 @@
 #! /usr/bin/python3
-# This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+# This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 import argparse
 import os
@@ -37,9 +37,14 @@ def get_current_time():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def get_user():
-    return os.getenv("USER")
+    user = os.getenv("USER")
+    if not user:
+        user = "StarRocks"
+    return user
 
 def get_hostname():
+    if os.path.exists('/.dockerenv'):
+        return "docker"
     res = subprocess.Popen(["hostname", "-f"], stdout=subprocess.PIPE)
     out, err = res.communicate()
     return out.decode('utf-8').strip()
@@ -71,7 +76,7 @@ def generate_java_file(java_path, version, commit_hash, build_type, build_time, 
 
 package com.starrocks.common;
 
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 // This is a generated file, DO NOT EDIT IT.
 // COMMIT_HASH: {COMMIT_HASH}
 
@@ -97,22 +102,18 @@ public class Version {{
 
 def generate_cpp_file(cpp_path, version, commit_hash, build_type, build_time, user, host):
     file_format = '''
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 // NOTE: This is a generated file, DO NOT EDIT IT
 // COMMIT_HASH: {COMMIT_HASH}
 
-#pragma once
-
-#include <string>
-
 namespace starrocks {{
 
-#define STARROCKS_VERSION         "{VERSION}"
-#define STARROCKS_COMMIT_HASH     "{COMMIT_HASH}"
-#define STARROCKS_BUILD_TYPE      "{BUILD_TYPE}"
-#define STARROCKS_BUILD_TIME      "{BUILD_TIME}"
-#define STARROCKS_BUILD_USER      "{BUILD_USER}"
-#define STARROCKS_BUILD_HOST      "{BUILD_HOST}"
+const char* STARROCKS_VERSION = "{VERSION}";
+const char* STARROCKS_COMMIT_HASH = "{COMMIT_HASH}";
+const char* STARROCKS_BUILD_TYPE = "{BUILD_TYPE}";
+const char* STARROCKS_BUILD_TIME = "{BUILD_TIME}";
+const char* STARROCKS_BUILD_USER = "{BUILD_USER}";
+const char* STARROCKS_BUILD_HOST = "{BUILD_HOST}";
 }}
 
 '''
@@ -120,7 +121,7 @@ namespace starrocks {{
             BUILD_TYPE = build_type, BUILD_TIME = build_time,
             BUILD_USER = user, BUILD_HOST = host)
 
-    file_name = cpp_path + "/version.h"
+    file_name = cpp_path + "/version.cpp"
     d = os.path.dirname(file_name)
     if not os.path.exists(d):
         os.makedirs(d)
@@ -128,7 +129,7 @@ namespace starrocks {{
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cpp", dest='cpp_path', default="./version.h", help="Path of generated cpp file", type=str)
+    parser.add_argument("--cpp", dest='cpp_path', default="./version.cpp", help="Path of generated cpp file", type=str)
     parser.add_argument("--java", dest='java_path', default="./Version.java", help="Path of generated java file", type=str)
     args = parser.parse_args()
 

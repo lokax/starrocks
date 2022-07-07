@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
@@ -18,9 +18,10 @@ import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptimizerContext;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.operator.AggType;
+import com.starrocks.sql.optimizer.operator.Operator;
 import com.starrocks.sql.optimizer.operator.OperatorType;
+import com.starrocks.sql.optimizer.operator.Projection;
 import com.starrocks.sql.optimizer.operator.logical.LogicalAggregationOperator;
-import com.starrocks.sql.optimizer.operator.logical.LogicalOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalRepeatOperator;
 import com.starrocks.sql.optimizer.operator.pattern.Pattern;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
@@ -28,9 +29,15 @@ import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
 import com.starrocks.sql.optimizer.operator.scalar.IsNullPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
+import com.starrocks.sql.optimizer.rewrite.ReplaceColumnRefRewriter;
 import com.starrocks.sql.optimizer.rule.RuleType;
+import com.starrocks.sql.optimizer.statistics.ColumnStatistic;
+import com.starrocks.sql.optimizer.statistics.Statistics;
+import com.starrocks.sql.optimizer.statistics.StatisticsEstimateCoefficient;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -55,8 +62,17 @@ public class SplitAggregateRule extends TransformationRule {
         return agg.getType().isGlobal() && !agg.isSplit();
     }
 
-    // Note: This method logic must consistent with CostEstimator::canGenerateOneStageAggNode
-    private boolean needGenerateTwoStageAggregate(OptExpression input, long distinctCount) {
+    private boolean canGenerateMultiStageAggregate(OptExpression input) {
+        // Must do one stage aggregate If the child contains limit,
+        // the aggregation must be a single node to ensure correctness.
+        // eg. select count(*) from (select * table limit 2) t
+        if (input.inputAt(0).getOp().hasLimit()) {
+            return false;
+        }
+        return true;
+    }
+
+    private boolean mustGenerateMultiStageAggregate(OptExpression input, List<CallOperator> distinctAggCallOperator) {
         LogicalAggregationOperator aggregationOperator = (LogicalAggregationOperator) input.getOp();
         // 1 Must do two stage aggregate if child operator is LogicalRepeatOperator
         //   If the repeat node is used as the input node of the Exchange node.
@@ -67,33 +83,38 @@ public class SplitAggregateRule extends TransformationRule {
         if (input.inputAt(0).getOp() instanceof LogicalRepeatOperator) {
             return true;
         }
-
-        // 2 Must do two stage aggregate is aggregate function has array type
+        // 2 Must do multi stage aggregate when aggregate distinct function has array type
         if (aggregationOperator.getAggregations().values().stream().anyMatch(callOperator
-                -> callOperator.getChildren().stream().anyMatch(c -> c.getType().isArrayType()))) {
+                -> callOperator.getChildren().stream().anyMatch(c -> c.getType().isArrayType()) &&
+                callOperator.isDistinct())) {
             return true;
         }
+        // 3. Must generate three, four phase aggregate for distinct aggregate with multi columns
+        boolean hasMultiColumns =
+                distinctAggCallOperator.stream().anyMatch(callOperator -> callOperator.getChildren().size() > 1);
+        if (distinctAggCallOperator.size() > 0 && hasMultiColumns) {
+            return true;
+        }
+        return false;
+    }
 
-        // 3 Must do one stage aggregate If the child contains limit,
-        // the aggregation must be a single node to ensure correctness.
-        // eg. select count(*) from (select * table limit 2) t
-        if (((LogicalOperator) input.inputAt(0).getOp()).getLimit() != -1) {
+    // Note: This method logic must consistent with CostEstimator::needGenerateOneStageAggNode
+    private boolean needGenerateMultiStageAggregate(OptExpression input, List<CallOperator> distinctAggCallOperator) {
+        // 1. check if can generate multi stage aggregate.
+        if (!canGenerateMultiStageAggregate(input)) {
             return false;
         }
-
-        // 4 Respect user hint
+        // 2. check if must generate multi stage aggregate.
+        if (mustGenerateMultiStageAggregate(input, distinctAggCallOperator)) {
+            return true;
+        }
+        // 3. Respect user hint
         int aggStage = ConnectContext.get().getSessionVariable().getNewPlannerAggStage();
         if (aggStage == 1) {
             return false;
         }
-
-        // 5 generate two, three, four phase aggregate for distinct aggregate
-        if (distinctCount > 0) {
-            return true;
-        }
-
-        // 6 If scan tablet sum leas than 1, do one phase aggregate is enough
-        if (aggStage == 0 && input.getLogicalProperty().isExecuteInOneInstance()) {
+        // 4. If scan tablet sum leas than 1, do one phase aggregate is enough
+        if (aggStage == 0 && input.getLogicalProperty().isExecuteInOneTablet()) {
             return false;
         }
         // Default, we could generate two stage aggregate
@@ -124,6 +145,23 @@ public class SplitAggregateRule extends TransformationRule {
         return hasSameMultiColumn;
     }
 
+    private boolean hasAggregateEffect(OptExpression input, List<ColumnRefOperator> distinctColumns) {
+        Statistics statistics = input.getGroupExpression().getGroup().getStatistics();
+        Statistics inputStatistics = input.getGroupExpression().getInputs().get(0).getStatistics();
+        Collection<ColumnStatistic> inputsColumnStatistics = inputStatistics.getColumnStatistics().values();
+
+        if (inputsColumnStatistics.stream().anyMatch(ColumnStatistic::isUnknown)) {
+            return false;
+        }
+
+        double inputRowCount = Math.max(1, inputStatistics.getOutputRowCount());
+        double rowCount = Math.max(1, statistics.getOutputRowCount());
+        if (rowCount / inputRowCount < StatisticsEstimateCoefficient.DEFAULT_AGGREGATE_EFFECT_COEFFICIENT) {
+            return true;
+        }
+        return false;
+    }
+
     @Override
     public List<OptExpression> transform(OptExpression input, OptimizerContext context) {
         List<OptExpression> newExpressions = new ArrayList<>();
@@ -136,7 +174,7 @@ public class SplitAggregateRule extends TransformationRule {
                 .collect(Collectors.toList());
         long distinctCount = distinctAggCallOperator.size();
 
-        if (!needGenerateTwoStageAggregate(input, distinctCount)) {
+        if (!needGenerateMultiStageAggregate(input, distinctAggCallOperator)) {
             return Lists.newArrayList();
         }
 
@@ -161,41 +199,38 @@ public class SplitAggregateRule extends TransformationRule {
 
             if (!operator.getGroupingKeys().isEmpty()) {
                 if (ConnectContext.get().getSessionVariable().getNewPlannerAggStage() == 0) {
-                    newExpressions.addAll(implementOneDistinctWithGroupByAgg(
-                            context.getColumnRefFactory(), input, operator,
-                            singleDistinctFunctionPos));
-                    // Array type not support two stage distinct
-                    // Count Distinct with multi columns not support two stage aggregate
-                    if (distinctColumns.stream().anyMatch(column -> column.getType().isArrayType()) ||
-                            operator.getAggregations().values().stream().
-                                    anyMatch(callOperator -> callOperator.isDistinct() &&
-                                            callOperator.getChildren().size() > 1)) {
-                        return newExpressions;
+                    if (isGroupByAllConstant(input, operator)) {
+                        return implementOneDistinctWithConstantGroupByAgg(context.getColumnRefFactory(),
+                                input, operator, distinctColumns, singleDistinctFunctionPos,
+                                operator.getGroupingKeys());
+                        // If agg node has limit or has a very good aggregation effect which could reduce the shuffle data,
+                        // we prefer to choose 2 phase aggregate
+                    } else if (canGenerateTwoStageAggregate(operator, distinctColumns) &&
+                            (operator.hasLimit() || hasAggregateEffect(input, distinctColumns))) {
+                        return implementTwoStageAgg(input, operator);
+                    } else {
+                        return implementOneDistinctWithGroupByAgg(context.getColumnRefFactory(), input, operator,
+                                singleDistinctFunctionPos);
                     }
-                    newExpressions.addAll(implementTwoStageAgg(input, operator));
-                    return newExpressions;
-                } else if (ConnectContext.get().getSessionVariable().getNewPlannerAggStage() == 2) {
+                } else if (ConnectContext.get().getSessionVariable().getNewPlannerAggStage() == 2 &&
+                        canGenerateTwoStageAggregate(operator, distinctColumns)) {
                     return implementTwoStageAgg(input, operator);
                 } else {
-                    return implementOneDistinctWithGroupByAgg(
-                            context.getColumnRefFactory(), input, operator,
-                            singleDistinctFunctionPos);
+                    if (isGroupByAllConstant(input, operator)) {
+                        return implementOneDistinctWithConstantGroupByAgg(context.getColumnRefFactory(),
+                                input, operator, distinctColumns, singleDistinctFunctionPos,
+                                operator.getGroupingKeys());
+                    } else {
+                        return implementOneDistinctWithGroupByAgg(context.getColumnRefFactory(), input, operator,
+                                singleDistinctFunctionPos);
+                    }
                 }
             } else {
                 if (ConnectContext.get().getSessionVariable().getNewPlannerAggStage() == 0) {
-                    newExpressions.addAll(implementOneDistinctWithOutGroupByAgg(context.getColumnRefFactory(),
-                            input, operator, distinctColumns, singleDistinctFunctionPos));
-                    // Array type not support two stage distinct
-                    // Count Distinct with multi columns not support two stage aggregate
-                    if (distinctColumns.stream().anyMatch(column -> column.getType().isArrayType()) ||
-                            operator.getAggregations().values().stream().
-                                    anyMatch(callOperator -> callOperator.isDistinct() &&
-                                            callOperator.getChildren().size() > 1)) {
-                        return newExpressions;
-                    }
-                    newExpressions.addAll(implementTwoStageAgg(input, operator));
-                    return newExpressions;
-                } else if (ConnectContext.get().getSessionVariable().getNewPlannerAggStage() == 2) {
+                    return implementOneDistinctWithOutGroupByAgg(context.getColumnRefFactory(),
+                            input, operator, distinctColumns, singleDistinctFunctionPos);
+                } else if (ConnectContext.get().getSessionVariable().getNewPlannerAggStage() == 2 &&
+                        canGenerateTwoStageAggregate(operator, distinctColumns)) {
                     return implementTwoStageAgg(input, operator);
                 } else {
                     return implementOneDistinctWithOutGroupByAgg(context.getColumnRefFactory(),
@@ -207,15 +242,41 @@ public class SplitAggregateRule extends TransformationRule {
         return implementTwoStageAgg(input, operator);
     }
 
+    private boolean isGroupByAllConstant(OptExpression input, LogicalAggregationOperator operator) {
+        Map<ColumnRefOperator, ScalarOperator> rewriteProjectMap = Maps.newHashMap();
+        Projection childProjection = input.getInputs().get(0).getOp().getProjection();
+        if (childProjection != null) {
+            rewriteProjectMap.putAll(childProjection.getColumnRefMap());
+        }
+
+        ReplaceColumnRefRewriter rewriter = new ReplaceColumnRefRewriter(rewriteProjectMap);
+        List<ScalarOperator> groupingKeys = operator.getGroupingKeys().stream().map(rewriter::rewrite).
+                collect(Collectors.toList());
+        return groupingKeys.stream().allMatch(ScalarOperator::isConstant);
+    }
+
+    private boolean canGenerateTwoStageAggregate(LogicalAggregationOperator operator,
+                                                 List<ColumnRefOperator> distinctColumns) {
+        // Array type not support two stage distinct
+        // Count Distinct with multi columns not support two stage aggregate
+        if (distinctColumns.stream().anyMatch(column -> column.getType().isArrayType()) ||
+                operator.getAggregations().values().stream().
+                        anyMatch(callOperator -> callOperator.isDistinct() &&
+                                callOperator.getChildren().size() > 1)) {
+            return false;
+        }
+        return true;
+    }
+
     private CallOperator rewriteDistinctAggFn(CallOperator fnCall) {
         final String functionName = fnCall.getFnName();
         if (functionName.equalsIgnoreCase(FunctionSet.COUNT)) {
-            return new CallOperator("MULTI_DISTINCT_COUNT", fnCall.getType(), fnCall.getChildren(),
-                    Expr.getBuiltinFunction("MULTI_DISTINCT_COUNT", new Type[] {fnCall.getChild(0).getType()},
+            return new CallOperator(FunctionSet.MULTI_DISTINCT_COUNT, fnCall.getType(), fnCall.getChildren(),
+                    Expr.getBuiltinFunction(FunctionSet.MULTI_DISTINCT_COUNT, new Type[] {fnCall.getChild(0).getType()},
                             IS_NONSTRICT_SUPERTYPE_OF), false);
-        } else if (functionName.equalsIgnoreCase("SUM")) {
-            return new CallOperator("MULTI_DISTINCT_SUM", fnCall.getType(), fnCall.getChildren(),
-                    Expr.getBuiltinFunction("MULTI_DISTINCT_SUM", new Type[] {fnCall.getChild(0).getType()},
+        } else if (functionName.equalsIgnoreCase(FunctionSet.SUM)) {
+            return new CallOperator(FunctionSet.MULTI_DISTINCT_SUM, fnCall.getType(), fnCall.getChildren(),
+                    Expr.getBuiltinFunction(FunctionSet.MULTI_DISTINCT_SUM, new Type[] {fnCall.getChild(0).getType()},
                             IS_NONSTRICT_SUPERTYPE_OF), false);
         }
         return null;
@@ -226,27 +287,32 @@ public class SplitAggregateRule extends TransformationRule {
         Preconditions.checkState(oldAgg.getAggregations().values().stream()
                         .map(call -> call.isDistinct() ? 1 : 0).reduce(Integer::sum).orElse(0) <= 1,
                 "There are multi count(distinct) function call, multi distinct rewrite error");
+        Map<ColumnRefOperator, CallOperator> newAggMap = new HashMap<>(oldAgg.getAggregations());
         for (Map.Entry<ColumnRefOperator, CallOperator> entry : oldAgg.getAggregations().entrySet()) {
             CallOperator aggregation = entry.getValue();
             // rewrite single distinct agg function
             if (aggregation.isDistinct()) {
-                aggregation = rewriteDistinctAggFn(aggregation);
-                Preconditions.checkState(aggregation.getFunction() != null);
-                entry.setValue(aggregation);
+                CallOperator call = rewriteDistinctAggFn(aggregation);
+                Preconditions.checkState(call != null);
+                newAggMap.put(entry.getKey(), call);
                 break;
             }
         }
 
-        LogicalAggregationOperator local = createNormalAgg(
-                AggType.LOCAL, oldAgg.getGroupingKeys(), oldAgg.getAggregations());
-        local.setPartitionByColumns(oldAgg.getGroupingKeys());
+        LogicalAggregationOperator local = new LogicalAggregationOperator.Builder().withOperator(oldAgg)
+                .setType(AggType.LOCAL)
+                .setAggregations(createNormalAgg(AggType.LOCAL, newAggMap))
+                .setPredicate(null)
+                .setLimit(Operator.DEFAULT_LIMIT)
+                .setProjection(null)
+                .build();
         OptExpression localOptExpression = OptExpression.create(local, input.getInputs());
 
-        LogicalAggregationOperator global = createNormalAgg(AggType.GLOBAL,
-                oldAgg.getGroupingKeys(), oldAgg.getAggregations());
-        global.setSplit();
-        global.setPredicate(oldAgg.getPredicate());
-        global.setLimit(oldAgg.getLimit());
+        LogicalAggregationOperator global = new LogicalAggregationOperator.Builder().withOperator(oldAgg)
+                .setType(AggType.GLOBAL)
+                .setAggregations(createNormalAgg(AggType.GLOBAL, newAggMap))
+                .setSplit()
+                .build();
         OptExpression globalOptExpression = OptExpression.create(global, localOptExpression);
 
         return Lists.newArrayList(globalOptExpression);
@@ -272,14 +338,90 @@ public class SplitAggregateRule extends TransformationRule {
         distinctGlobal.setPartitionByColumns(oldAgg.getGroupingKeys());
         OptExpression distinctGlobalOptExpression = OptExpression.create(distinctGlobal, localOptExpression);
 
-        LogicalAggregationOperator global = createDistinctAggForSecondPhase(
-                oldAgg.getGroupingKeys(), oldAgg.getAggregations(), AggType.GLOBAL);
-        global.setSplit();
-        global.setSingleDistinctFunctionPos(singleDistinctFunctionPos);
-        global.setPredicate(oldAgg.getPredicate());
-        global.setLimit(oldAgg.getLimit());
+        LogicalAggregationOperator global = new LogicalAggregationOperator.Builder().withOperator(oldAgg)
+                .setType(AggType.GLOBAL)
+                .setAggregations(createDistinctAggForSecondPhase(AggType.GLOBAL, oldAgg.getAggregations()))
+                .setSplit()
+                .setSingleDistinctFunctionPos(singleDistinctFunctionPos)
+                .build();
         OptExpression globalOptExpression = OptExpression.create(global, distinctGlobalOptExpression);
 
+        return Lists.newArrayList(globalOptExpression);
+    }
+
+    private List<OptExpression> implementOneDistinctWithConstantGroupByAgg(
+            ColumnRefFactory columnRefFactory,
+            OptExpression input,
+            LogicalAggregationOperator oldAgg,
+            List<ColumnRefOperator> distinctAggColumns,
+            int singleDistinctFunctionPos,
+            List<ColumnRefOperator> groupByColumns) {
+        List<ColumnRefOperator> partitionColumns = distinctAggColumns;
+
+        LogicalAggregationOperator local = createDistinctAggForFirstPhase(
+                columnRefFactory,
+                Lists.newArrayList(), oldAgg.getAggregations(), AggType.LOCAL);
+        local.setPartitionByColumns(partitionColumns);
+        OptExpression localOptExpression = OptExpression.create(local, input.getInputs());
+
+        LogicalAggregationOperator distinctGlobal = createDistinctAggForFirstPhase(
+                columnRefFactory, Lists.newArrayList(), oldAgg.getAggregations(), AggType.DISTINCT_GLOBAL);
+        distinctGlobal.setPartitionByColumns(partitionColumns);
+
+        // build projection for DISTINCT_GLOBAL aggregate node
+        Map<ColumnRefOperator, ScalarOperator> columnRefMap = Maps.newHashMap();
+        distinctGlobal.getGroupingKeys().forEach(k -> columnRefMap.put(k, k));
+        distinctGlobal.getAggregations().keySet().forEach(key -> columnRefMap.put(key, key));
+
+        Projection childProjection = input.getInputs().get(0).getOp().getProjection();
+        if (childProjection != null) {
+            childProjection.getColumnRefMap().entrySet().stream()
+                    .filter(entry -> groupByColumns.contains(entry.getKey())).forEach(entry -> columnRefMap.put(
+                            entry.getKey(), entry.getValue()));
+        }
+
+        LogicalAggregationOperator distinctGlobalWithProjection = new LogicalAggregationOperator.Builder()
+                .withOperator(distinctGlobal)
+                .setProjection(new Projection(columnRefMap))
+                .build();
+
+        OptExpression distinctGlobalExpression = OptExpression.create(distinctGlobalWithProjection, localOptExpression);
+
+        LogicalAggregationOperator distinctLocal = new LogicalAggregationOperator.Builder()
+                .withOperator(oldAgg)
+                .setType(AggType.DISTINCT_LOCAL)
+                .setAggregations(createDistinctAggForSecondPhase(AggType.DISTINCT_LOCAL, oldAgg.getAggregations()))
+                .setGroupingKeys(groupByColumns)
+                .setPartitionByColumns(partitionColumns)
+                .setSingleDistinctFunctionPos(singleDistinctFunctionPos)
+                .setPredicate(null)
+                .setLimit(Operator.DEFAULT_LIMIT)
+                .setProjection(null)
+                .build();
+        OptExpression distinctLocalExpression = OptExpression.create(distinctLocal, distinctGlobalExpression);
+
+        // in DISTINCT_LOCAL phase, may rewrite the aggregate function, we use the rewrite function in GLOBAL phase
+        Map<ColumnRefOperator, CallOperator> reRewriteAggregate = Maps.newHashMap(oldAgg.getAggregations());
+        Map<ColumnRefOperator, CallOperator> countDistinctMap = oldAgg.getAggregations().entrySet().stream().
+                filter(entry -> entry.getValue().isDistinct() &&
+                        entry.getValue().getFnName().equalsIgnoreCase(FunctionSet.COUNT)).
+                collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+        if (!countDistinctMap.isEmpty()) {
+            for (Map.Entry<ColumnRefOperator, CallOperator> entry : countDistinctMap.entrySet()) {
+                reRewriteAggregate.put(entry.getKey(), distinctLocal.getAggregations().get(entry.getKey()));
+            }
+        }
+
+        LogicalAggregationOperator.Builder builder = new LogicalAggregationOperator.Builder();
+        LogicalAggregationOperator global = builder.withOperator(oldAgg)
+                .setType(AggType.GLOBAL)
+                .setGroupingKeys(groupByColumns)
+                .setPartitionByColumns(Lists.newArrayList())
+                .setAggregations(createNormalAgg(AggType.GLOBAL, reRewriteAggregate))
+                .setSplit()
+                .build();
+
+        OptExpression globalOptExpression = OptExpression.create(global, distinctLocalExpression);
         return Lists.newArrayList(globalOptExpression);
     }
 
@@ -304,10 +446,17 @@ public class SplitAggregateRule extends TransformationRule {
                 Lists.newArrayList(), oldAgg.getAggregations(), AggType.DISTINCT_GLOBAL);
         OptExpression distinctGlobalExpression = OptExpression.create(distinctGlobal, localOptExpression);
 
-        LogicalAggregationOperator distinctLocal =
-                createDistinctAggForSecondPhase(Lists.newArrayList(), oldAgg.getAggregations(), AggType.DISTINCT_LOCAL);
-        distinctLocal.setPartitionByColumns(partitionColumns);
-        distinctLocal.setSingleDistinctFunctionPos(singleDistinctFunctionPos);
+        LogicalAggregationOperator distinctLocal = new LogicalAggregationOperator.Builder()
+                .withOperator(oldAgg)
+                .setType(AggType.DISTINCT_LOCAL)
+                .setAggregations(createDistinctAggForSecondPhase(AggType.DISTINCT_LOCAL, oldAgg.getAggregations()))
+                .setGroupingKeys(Lists.newArrayList())
+                .setPartitionByColumns(partitionColumns)
+                .setSingleDistinctFunctionPos(singleDistinctFunctionPos)
+                .setPredicate(null)
+                .setLimit(Operator.DEFAULT_LIMIT)
+                .setProjection(null)
+                .build();
         OptExpression distinctLocalExpression = OptExpression.create(distinctLocal, distinctGlobalExpression);
 
         // in DISTINCT_LOCAL phase, may rewrite the aggregate function, we use the rewrite function in GLOBAL phase
@@ -322,23 +471,22 @@ public class SplitAggregateRule extends TransformationRule {
             }
         }
 
-        LogicalAggregationOperator global = createNormalAgg(AggType.GLOBAL, Lists.newArrayList(), reRewriteAggregate);
-        global.setSplit();
-        global.setPredicate(oldAgg.getPredicate());
-        global.setLimit(oldAgg.getLimit());
-        OptExpression globalOptExpression = OptExpression.create(global, distinctLocalExpression);
+        LogicalAggregationOperator.Builder builder = new LogicalAggregationOperator.Builder();
+        LogicalAggregationOperator global = builder.withOperator(oldAgg)
+                .setType(AggType.GLOBAL)
+                .setGroupingKeys(Lists.newArrayList())
+                .setAggregations(createNormalAgg(AggType.GLOBAL, reRewriteAggregate))
+                .setSplit()
+                .build();
 
+        OptExpression globalOptExpression = OptExpression.create(global, distinctLocalExpression);
         return Lists.newArrayList(globalOptExpression);
     }
 
-    private LogicalAggregationOperator createNormalAgg(AggType aggType,
-                                                       List<ColumnRefOperator> groupKeys,
-                                                       Map<ColumnRefOperator, CallOperator> aggregationMap) {
-        LogicalAggregationOperator aggregate = new LogicalAggregationOperator(
-                aggType, groupKeys, Maps.newHashMap());
-
-        for (Map.Entry<ColumnRefOperator, CallOperator> entry : aggregationMap
-                .entrySet()) {
+    private Map<ColumnRefOperator, CallOperator> createNormalAgg(AggType aggType,
+                                                                 Map<ColumnRefOperator, CallOperator> aggregationMap) {
+        Map<ColumnRefOperator, CallOperator> newAggregationMap = Maps.newHashMap();
+        for (Map.Entry<ColumnRefOperator, CallOperator> entry : aggregationMap.entrySet()) {
             ColumnRefOperator column = entry.getKey();
             CallOperator aggregation = entry.getValue();
 
@@ -346,11 +494,20 @@ public class SplitAggregateRule extends TransformationRule {
             Type intermediateType = getIntermediateType(aggregation);
             // For merge agg function, we need to replace the agg input args to the update agg function result
             if (aggType.isGlobal()) {
+                List<ScalarOperator> arguments =
+                        Lists.newArrayList(new ColumnRefOperator(column.getId(), intermediateType, column.getName(),
+                                column.isNullable()));
+                // For Multi args aggregation functions, if they have const args,
+                // We should also pass the const args to merge phase aggregator for performance.
+                // For example, for intersect_count(user_id, dt, '20191111'),
+                // We should pass '20191111' to update and merge phase aggregator in BE both.
+                if (aggregation.getChildren().size() > 1) {
+                    aggregation.getChildren().stream().filter(ScalarOperator::isConstantRef).forEach(arguments::add);
+                }
                 callOperator = new CallOperator(
                         aggregation.getFnName(),
                         aggregation.getType(),
-                        Lists.newArrayList(new ColumnRefOperator(column.getId(), intermediateType, column.getName(),
-                                column.isNullable())),
+                        arguments,
                         aggregation.getFunction());
             } else {
                 callOperator = new CallOperator(aggregation.getFnName(), intermediateType,
@@ -358,12 +515,12 @@ public class SplitAggregateRule extends TransformationRule {
                         aggregation.isDistinct());
             }
 
-            aggregate.addAggregation(
+            newAggregationMap.put(
                     new ColumnRefOperator(column.getId(), column.getType(), column.getName(), column.isNullable()),
                     callOperator);
         }
 
-        return aggregate;
+        return newAggregationMap;
     }
 
     private Type getIntermediateType(CallOperator aggregation) {
@@ -373,14 +530,10 @@ public class SplitAggregateRule extends TransformationRule {
     }
 
     // The phase concept please refer to AggregateInfo::AggPhase
-    private LogicalAggregationOperator createDistinctAggForSecondPhase(List<ColumnRefOperator> groupKeys,
-                                                                       Map<ColumnRefOperator, CallOperator> aggregationMap,
-                                                                       AggType aggType) {
-        LogicalAggregationOperator aggregate = new LogicalAggregationOperator(
-                aggType, groupKeys, Maps.newHashMap());
-
-        for (Map.Entry<ColumnRefOperator, CallOperator> entry : aggregationMap
-                .entrySet()) {
+    private Map<ColumnRefOperator, CallOperator> createDistinctAggForSecondPhase(
+            AggType aggType, Map<ColumnRefOperator, CallOperator> aggregationMap) {
+        Map<ColumnRefOperator, CallOperator> newAggregationMap = Maps.newHashMap();
+        for (Map.Entry<ColumnRefOperator, CallOperator> entry : aggregationMap.entrySet()) {
             ColumnRefOperator column = entry.getKey();
             CallOperator aggregation = entry.getValue();
             CallOperator callOperator;
@@ -418,10 +571,9 @@ public class SplitAggregateRule extends TransformationRule {
                 callOperator = new CallOperator(aggregation.getFnName(), aggregation.getType(),
                         aggregation.getChildren(), aggregation.getFunction());
             }
-            aggregate.addAggregation(column, callOperator);
+            newAggregationMap.put(column, callOperator);
         }
-
-        return aggregate;
+        return newAggregationMap;
     }
 
     /**

@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/analysis/BackendStmtTest.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -81,7 +77,7 @@ public class BackendStmtTest {
     public void initBackendsTest4() throws Exception {
         BackendClause stmt = createStmt(4);
         stmt.analyze(analyzer);
-        Assert.assertEquals("ADD FREE BACKEND \"192.168.1.1:12345\"", stmt.toSql());
+        Assert.assertEquals("ADD BACKEND \"192.168.1.1:12345\"", stmt.toSql());
     }
 
     @Test

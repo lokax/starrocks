@@ -21,31 +21,24 @@
 
 package com.starrocks.common.util;
 
+import com.starrocks.common.Pair;
+import org.apache.commons.validator.routines.InetAddressValidator;
+
+import java.io.IOException;
 import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
+import java.net.Socket;
 import java.net.SocketException;
+import java.net.UnknownHostException;
+import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.List;
 
 public class NetUtils {
 
-    // Target format is "host:port"
-    public static InetSocketAddress createSocketAddr(String target) {
-        int colonIndex = target.indexOf(':');
-        if (colonIndex < 0) {
-            throw new RuntimeException("Not a host:port pair : " + target);
-        }
-
-        String hostname = target.substring(0, colonIndex);
-        int port = Integer.parseInt(target.substring(colonIndex + 1));
-
-        return new InetSocketAddress(hostname, port);
-    }
-
-    public static void getHosts(List<InetAddress> hosts) {
+    public static List<InetAddress> getHosts() {
         Enumeration<NetworkInterface> n = null;
-
+        List<InetAddress> hosts = new ArrayList<>();
         try {
             n = NetworkInterface.getNetworkInterfaces();
         } catch (SocketException e1) {
@@ -60,5 +53,34 @@ public class NetUtils {
                 hosts.add(addr);
             }
         }
+        return hosts;
+    }
+
+    public static boolean isPortUsing(String host, int port) throws UnknownHostException {
+        boolean flag = false;
+        try (Socket socket = new Socket(host, port)) {
+            flag = true;
+        } catch (IOException e) {
+            // do nothing
+        }
+        return flag;
+    }
+
+    public static Pair<String, String> getIpAndFqdnByHost(String host) throws UnknownHostException {
+
+        String ip = "";
+        String fqdn = "";
+        if (InetAddressValidator.getInstance().isValidInet4Address(host)) {
+            // ipOrFqdn is ip
+            ip = host;
+        } else {
+            // ipOrFqdn is fqdn
+            ip = InetAddress.getByName(host).getHostAddress();
+            if (null == ip || ip.equals("")) {
+                throw new UnknownHostException("got a wrong ip");
+            }
+            fqdn = host;
+        }
+        return new Pair<String, String>(ip, fqdn);
     }
 }

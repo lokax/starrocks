@@ -32,11 +32,11 @@ import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.ImportColumnDesc;
 import com.starrocks.analysis.LiteralExpr;
 import com.starrocks.catalog.AggregateType;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.DistributionInfo;
 import com.starrocks.catalog.DistributionInfo.DistributionInfoType;
+import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.HashDistributionInfo;
 import com.starrocks.catalog.HiveTable;
 import com.starrocks.catalog.KeysType;
@@ -66,6 +66,8 @@ import com.starrocks.load.loadv2.etl.EtlJobConfig.EtlPartitionInfo;
 import com.starrocks.load.loadv2.etl.EtlJobConfig.EtlTable;
 import com.starrocks.load.loadv2.etl.EtlJobConfig.FilePatternVersion;
 import com.starrocks.load.loadv2.etl.EtlJobConfig.SourceType;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.transaction.TransactionState;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -131,7 +133,7 @@ public class SparkLoadPendingTask extends LoadTask {
     }
 
     private void createEtlJobConf() throws LoadException {
-        Database db = Catalog.getCurrentCatalog().getDb(dbId);
+        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
         if (db == null) {
             throw new LoadException("db does not exist. id: " + dbId);
         }
@@ -165,7 +167,7 @@ public class SparkLoadPendingTask extends LoadTask {
                     tables.put(tableId, etlTable);
 
                     // add table indexes to transaction state
-                    TransactionState txnState = Catalog.getCurrentGlobalTransactionMgr()
+                    TransactionState txnState = GlobalStateMgr.getCurrentGlobalTransactionMgr()
                             .getTransactionState(dbId, transactionId);
                     if (txnState == null) {
                         throw new LoadException("txn does not exist. id: " + transactionId);
@@ -294,10 +296,15 @@ public class SparkLoadPendingTask extends LoadTask {
 
         // default value
         String defaultValue = null;
-        if (column.getDefaultValue() != null) {
-            defaultValue = column.getDefaultValue();
+        Column.DefaultValueType defaultValueType = column.getDefaultValueType();
+        if (defaultValueType == Column.DefaultValueType.VARY) {
+            throw new SemanticException("Column " + column.getName() + " has unsupported default value:" +
+                    column.getDefaultExpr().getExpr());
         }
-        if (column.isAllowNull() && column.getDefaultValue() == null) {
+        if (defaultValueType == Column.DefaultValueType.CONST) {
+            defaultValue = column.calculatedDefaultValue();
+        }
+        if (column.isAllowNull() && defaultValueType == Column.DefaultValueType.NULL) {
             defaultValue = "\\N";
         }
 
@@ -346,17 +353,21 @@ public class SparkLoadPendingTask extends LoadTask {
                 // bucket num
                 int bucketNum = partition.getDistributionInfo().getBucketNum();
 
-                // is max partition
+                // is min|max partition
                 Range<PartitionKey> range = entry.getValue();
                 boolean isMaxPartition = range.upperEndpoint().isMaxValue();
+                boolean isMinPartition = range.lowerEndpoint().isMinValue();
 
                 // start keys
-                List<LiteralExpr> rangeKeyExprs = range.lowerEndpoint().getKeys();
+                List<LiteralExpr> rangeKeyExprs = null;
                 List<Object> startKeys = Lists.newArrayList();
-                for (int i = 0; i < rangeKeyExprs.size(); ++i) {
-                    LiteralExpr literalExpr = rangeKeyExprs.get(i);
-                    Object keyValue = literalExpr.getRealValue();
-                    startKeys.add(keyValue);
+                if (!isMinPartition) {
+                    rangeKeyExprs = range.lowerEndpoint().getKeys();
+                    for (int i = 0; i < rangeKeyExprs.size(); ++i) {
+                        LiteralExpr literalExpr = rangeKeyExprs.get(i);
+                        Object keyValue = literalExpr.getRealValue();
+                        startKeys.add(keyValue);
+                    }
                 }
 
                 // end keys
@@ -371,7 +382,8 @@ public class SparkLoadPendingTask extends LoadTask {
                     }
                 }
 
-                etlPartitions.add(new EtlPartition(partitionId, startKeys, endKeys, isMaxPartition, bucketNum));
+                etlPartitions.add(
+                        new EtlPartition(partitionId, startKeys, endKeys, isMinPartition, isMaxPartition, bucketNum));
             }
         } else {
             Preconditions.checkState(type == PartitionType.UNPARTITIONED);
@@ -387,7 +399,7 @@ public class SparkLoadPendingTask extends LoadTask {
                 int bucketNum = partition.getDistributionInfo().getBucketNum();
 
                 etlPartitions.add(new EtlPartition(partitionId, Lists.newArrayList(), Lists.newArrayList(),
-                        true, bucketNum));
+                        true, true, bucketNum));
             }
         }
 
@@ -526,7 +538,7 @@ public class SparkLoadPendingTask extends LoadTask {
         }
         FunctionCallExpr fn = (FunctionCallExpr) expr;
         String functionName = fn.getFnName().getFunction();
-        if (!functionName.equalsIgnoreCase("hll_hash")
+        if (!functionName.equalsIgnoreCase(FunctionSet.HLL_HASH)
                 && !functionName.equalsIgnoreCase("hll_empty")) {
             throw new LoadException(msg);
         }
@@ -544,9 +556,9 @@ public class SparkLoadPendingTask extends LoadTask {
         }
         FunctionCallExpr fn = (FunctionCallExpr) expr;
         String functionName = fn.getFnName().getFunction();
-        if (!functionName.equalsIgnoreCase("to_bitmap")
-                && !functionName.equalsIgnoreCase("bitmap_hash")
-                && !functionName.equalsIgnoreCase("bitmap_dict")) {
+        if (!functionName.equalsIgnoreCase(FunctionSet.TO_BITMAP)
+                && !functionName.equalsIgnoreCase(FunctionSet.BITMAP_HASH)
+                && !functionName.equalsIgnoreCase(FunctionSet.BITMAP_DICT)) {
             throw new LoadException(msg);
         }
 

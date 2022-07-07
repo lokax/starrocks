@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/bitmap_functions.h"
 
@@ -6,20 +6,24 @@
 #include "column/column_builder.h"
 #include "column/column_helper.h"
 #include "column/column_viewer.h"
+#include "column/nullable_column.h"
+#include "exprs/base64.h"
 #include "exprs/vectorized/binary_function.h"
 #include "exprs/vectorized/unary_function.h"
+#include "gutil/casts.h"
 #include "gutil/strings/split.h"
 #include "gutil/strings/substitute.h"
+#include "udf/udf.h"
+#include "util/phmap/phmap.h"
 #include "util/string_parser.hpp"
 
-namespace starrocks {
-namespace vectorized {
+namespace starrocks::vectorized {
 
 ColumnPtr BitmapFunctions::to_bitmap(FunctionContext* context, const starrocks::vectorized::Columns& columns) {
     ColumnViewer<TYPE_VARCHAR> viewer(columns[0]);
-    ColumnBuilder<TYPE_OBJECT> builder;
 
     size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_OBJECT> builder(size);
     for (int row = 0; row < size; ++row) {
         if (viewer.is_null(row)) {
             builder.append_null();
@@ -53,9 +57,9 @@ ColumnPtr BitmapFunctions::to_bitmap(FunctionContext* context, const starrocks::
 
 ColumnPtr BitmapFunctions::bitmap_hash(FunctionContext* context, const starrocks::vectorized::Columns& columns) {
     ColumnViewer<TYPE_VARCHAR> viewer(columns[0]);
-    ColumnBuilder<TYPE_OBJECT> builder;
 
     size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_OBJECT> builder(size);
     for (int row = 0; row < size; ++row) {
         BitmapValue bitmap;
 
@@ -74,9 +78,9 @@ ColumnPtr BitmapFunctions::bitmap_hash(FunctionContext* context, const starrocks
 
 ColumnPtr BitmapFunctions::bitmap_count(FunctionContext* context, const starrocks::vectorized::Columns& columns) {
     ColumnViewer<TYPE_OBJECT> viewer(columns[0]);
-    ColumnBuilder<TYPE_BIGINT> builder;
 
     size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_BIGINT> builder(size);
     for (int row = 0; row < size; ++row) {
         int64_t value = viewer.is_null(row) ? 0 : viewer.value(row)->cardinality();
         builder.append(value);
@@ -96,9 +100,8 @@ ColumnPtr BitmapFunctions::bitmap_or(FunctionContext* context, const starrocks::
     ColumnViewer<TYPE_OBJECT> lhs(columns[0]);
     ColumnViewer<TYPE_OBJECT> rhs(columns[1]);
 
-    ColumnBuilder<TYPE_OBJECT> builder;
-
     size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_OBJECT> builder(size);
     for (int row = 0; row < size; ++row) {
         if (lhs.is_null(row) || rhs.is_null(row)) {
             builder.append_null();
@@ -121,9 +124,8 @@ ColumnPtr BitmapFunctions::bitmap_and(FunctionContext* context, const starrocks:
     ColumnViewer<TYPE_OBJECT> lhs(columns[0]);
     ColumnViewer<TYPE_OBJECT> rhs(columns[1]);
 
-    ColumnBuilder<TYPE_OBJECT> builder;
-
     size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_OBJECT> builder(size);
     for (int row = 0; row < size; ++row) {
         if (lhs.is_null(row) || rhs.is_null(row)) {
             builder.append_null();
@@ -153,11 +155,10 @@ ColumnPtr BitmapFunctions::bitmap_from_string(FunctionContext* context, const Co
     RETURN_IF_COLUMNS_ONLY_NULL(columns);
 
     ColumnViewer<TYPE_VARCHAR> viewer(columns[0]);
-    ColumnBuilder<TYPE_OBJECT> builder;
-
     std::vector<uint64_t> bits;
 
     size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_OBJECT> builder(size);
     for (int row = 0; row < size; ++row) {
         if (viewer.is_null(row)) {
             builder.append_null();
@@ -208,9 +209,8 @@ ColumnPtr BitmapFunctions::bitmap_andnot(FunctionContext* context, const starroc
     ColumnViewer<TYPE_OBJECT> lhs(columns[0]);
     ColumnViewer<TYPE_OBJECT> rhs(columns[1]);
 
-    ColumnBuilder<TYPE_OBJECT> builder;
-
     size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_OBJECT> builder(size);
     for (int row = 0; row < size; ++row) {
         if (lhs.is_null(row) || rhs.is_null(row)) {
             builder.append_null();
@@ -233,9 +233,8 @@ ColumnPtr BitmapFunctions::bitmap_xor(FunctionContext* context, const starrocks:
     ColumnViewer<TYPE_OBJECT> lhs(columns[0]);
     ColumnViewer<TYPE_OBJECT> rhs(columns[1]);
 
-    ColumnBuilder<TYPE_OBJECT> builder;
-
     size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_OBJECT> builder(size);
     for (int row = 0; row < size; ++row) {
         if (lhs.is_null(row) || rhs.is_null(row)) {
             builder.append_null();
@@ -258,9 +257,8 @@ ColumnPtr BitmapFunctions::bitmap_remove(FunctionContext* context, const starroc
     ColumnViewer<TYPE_OBJECT> lhs(columns[0]);
     ColumnViewer<TYPE_BIGINT> rhs(columns[1]);
 
-    ColumnBuilder<TYPE_OBJECT> builder;
-
     size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_OBJECT> builder(size);
     for (int row = 0; row < size; ++row) {
         if (lhs.is_null(row) || rhs.is_null(row)) {
             builder.append_null();
@@ -339,5 +337,134 @@ ColumnPtr BitmapFunctions::bitmap_to_array(FunctionContext* context, const starr
     }
 }
 
-} // namespace vectorized
-} // namespace starrocks
+ColumnPtr BitmapFunctions::array_to_bitmap(FunctionContext* context, const starrocks::vectorized::Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+    const constexpr PrimitiveType TYPE = TYPE_BIGINT;
+    size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_OBJECT> builder(size);
+
+    Column* data_column = ColumnHelper::get_data_column(columns[0].get());
+    NullData::pointer null_data = columns[0]->is_nullable()
+                                          ? down_cast<NullableColumn*>(columns[0].get())->null_column_data().data()
+                                          : nullptr;
+    ArrayColumn* array_column = down_cast<ArrayColumn*>(data_column);
+
+    RunTimeColumnType<TYPE>::Container& element_container =
+            array_column->elements_column()->is_nullable()
+                    ? down_cast<RunTimeColumnType<TYPE>*>(
+                              down_cast<NullableColumn*>(array_column->elements_column().get())->data_column().get())
+                              ->get_data()
+                    : down_cast<RunTimeColumnType<TYPE>*>(array_column->elements_column().get())->get_data();
+    const auto& offsets = array_column->offsets_column()->get_data();
+
+    NullColumn::Container::pointer element_null_data =
+            array_column->elements_column()->is_nullable()
+                    ? down_cast<NullableColumn*>(array_column->elements_column().get())->null_column_data().data()
+                    : nullptr;
+
+    for (int row = 0; row < size; ++row) {
+        uint32_t offset = offsets[row];
+        uint32_t length = offsets[row + 1] - offsets[row];
+        if (null_data && null_data[row]) {
+            builder.append_null();
+            continue;
+        }
+        // build bitmap
+        BitmapValue bitmap;
+        for (int j = offset; j < offset + length; j++) {
+            if (element_null_data && element_null_data[j]) {
+                continue;
+            }
+            if (element_container[j] >= 0) {
+                bitmap.add(element_container[j]);
+            }
+        }
+        // append bitmap
+        builder.append(std::move(bitmap));
+    }
+    return builder.build(ColumnHelper::is_all_const(columns));
+}
+
+ColumnPtr BitmapFunctions::bitmap_max(FunctionContext* context, const starrocks::vectorized::Columns& columns) {
+    ColumnViewer<TYPE_OBJECT> viewer(columns[0]);
+
+    size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_LARGEINT> builder(size);
+    for (int row = 0; row < size; ++row) {
+        if (viewer.is_null(row)) {
+            builder.append_null();
+        } else {
+            if (auto max_value = viewer.value(row)->max(); max_value.has_value()) {
+                int128_t value128 = max_value.value();
+                builder.append(value128);
+            } else {
+                builder.append_null();
+            }
+        }
+    }
+
+    return builder.build(ColumnHelper::is_all_const(columns));
+}
+
+ColumnPtr BitmapFunctions::bitmap_min(FunctionContext* context, const starrocks::vectorized::Columns& columns) {
+    ColumnViewer<TYPE_OBJECT> viewer(columns[0]);
+
+    size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_LARGEINT> builder(size);
+    for (int row = 0; row < size; ++row) {
+        if (viewer.is_null(row)) {
+            builder.append_null();
+        } else {
+            if (auto min_value = viewer.value(row)->min(); min_value.has_value()) {
+                int128_t value128 = min_value.value();
+                builder.append(value128);
+            } else {
+                builder.append_null();
+            }
+        }
+    }
+
+    return builder.build(ColumnHelper::is_all_const(columns));
+}
+
+ColumnPtr BitmapFunctions::base64_to_bitmap(FunctionContext* context, const starrocks::vectorized::Columns& columns) {
+    ColumnViewer<TYPE_VARCHAR> viewer(columns[0]);
+    size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_OBJECT> builder(size);
+    std::unique_ptr<char[]> p;
+    int last_len = 0;
+    int curr_len = 0;
+
+    for (int row = 0; row < size; ++row) {
+        if (viewer.is_null(row)) {
+            builder.append_null();
+            continue;
+        }
+
+        auto src_value = viewer.value(row);
+        int ssize = src_value.size;
+        if (ssize == 0) {
+            builder.append_null();
+            continue;
+        }
+
+        curr_len = ssize + 3;
+        if (last_len < curr_len) {
+            p.reset(new char[curr_len]);
+            last_len = curr_len;
+        }
+
+        int decode_res = base64_decode2(src_value.data, ssize, p.get());
+        if (decode_res < 0) {
+            builder.append_null();
+            continue;
+        }
+
+        BitmapValue bitmap;
+        bitmap.deserialize(p.get());
+        builder.append(std::move(bitmap));
+    }
+    return builder.build(ColumnHelper::is_all_const(columns));
+}
+
+} // namespace starrocks::vectorized

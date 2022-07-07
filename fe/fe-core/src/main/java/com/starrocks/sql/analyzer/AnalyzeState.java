@@ -1,14 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.analyzer;
 
 import com.starrocks.analysis.AnalyticExpr;
 import com.starrocks.analysis.Expr;
+import com.starrocks.analysis.ExprId;
 import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.LimitElement;
 import com.starrocks.analysis.OrderByElement;
-import com.starrocks.sql.analyzer.relation.QuerySpecification;
-import com.starrocks.sql.analyzer.relation.Relation;
+import com.starrocks.common.IdGenerator;
+import com.starrocks.sql.ast.Relation;
+import com.starrocks.sql.ast.SelectRelation;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -37,7 +40,6 @@ public class AnalyzeState {
     private List<Expr> groupingFunctionCallExprs;
 
     private List<OrderByElement> orderBy;
-    private List<String> columnOutputNames;
 
     private List<Expr> orderSourceExpressions;
 
@@ -49,6 +51,18 @@ public class AnalyzeState {
      * whether two expressions come from the same column
      */
     private final Map<Expr, FieldId> columnReferences = new HashMap<>();
+
+    /**
+     * Non-deterministic functions should be mapped multiple times in the project,
+     * which requires different hashes for each non-deterministic function,
+     * so in Expression Analyzer, each non-deterministic function will be numbered to achieve different hash values.
+     */
+    private final IdGenerator<ExprId> nondeterministicIdGenerator = ExprId.createGenerator();
+
+    /**
+     * Columns that do not appear in GroupBy for use with MODE_ONLY_FULL_GROUP_BY.
+     * */
+    private final List<Expr> columnNotInGroupBy = new ArrayList<>();
 
     public AnalyzeState() {
     }
@@ -65,23 +79,37 @@ public class AnalyzeState {
         return columnReferences;
     }
 
-    public QuerySpecification build() {
-        return new QuerySpecification(
-                outputExpressions, columnOutputNames, isDistinct,
-                outputScope, orderScope, orderSourceExpressions,
+    public SelectRelation build() {
+        SelectRelation selectRelation = new SelectRelation(
+                outputExpressions, isDistinct,
+                orderScope, orderSourceExpressions,
                 relation, predicate, limit,
                 groupBy, aggregate, groupingSetsList, groupingFunctionCallExprs,
                 orderBy, having,
                 outputAnalytic, orderByAnalytic,
                 columnReferences);
+        selectRelation.setScope(new Scope(RelationId.of(selectRelation), outputScope.getRelationFields()));
+        return selectRelation;
+    }
+
+    public Scope getOrderScope() {
+        return orderScope;
     }
 
     public void setOrderScope(Scope orderScope) {
         this.orderScope = orderScope;
     }
 
+    public List<Expr> getOrderSourceExpressions() {
+        return orderSourceExpressions;
+    }
+
     public void setOrderSourceExpressions(List<Expr> orderSourceExpressions) {
         this.orderSourceExpressions = orderSourceExpressions;
+    }
+
+    public List<Expr> getOutputExpressions() {
+        return outputExpressions;
     }
 
     public void setOutputExpression(List<Expr> outputExpressions) {
@@ -90,6 +118,10 @@ public class AnalyzeState {
 
     public void setOutputScope(Scope outputScope) {
         this.outputScope = outputScope;
+    }
+
+    public boolean isDistinct() {
+        return isDistinct;
     }
 
     public void setIsDistinct(boolean isDistinct) {
@@ -104,24 +136,48 @@ public class AnalyzeState {
         return relation;
     }
 
+    public Expr getPredicate() {
+        return predicate;
+    }
+
     public void setPredicate(Expr predicate) {
         this.predicate = predicate;
+    }
+
+    public LimitElement getLimit() {
+        return limit;
     }
 
     public void setLimit(LimitElement limit) {
         this.limit = limit;
     }
 
+    public List<Expr> getGroupBy() {
+        return groupBy;
+    }
+
     public void setGroupBy(List<Expr> groupBy) {
         this.groupBy = groupBy;
+    }
+
+    public List<List<Expr>> getGroupingSetsList() {
+        return groupingSetsList;
     }
 
     public void setGroupingSetsList(List<List<Expr>> groupingSetsList) {
         this.groupingSetsList = groupingSetsList;
     }
 
+    public List<Expr> getGroupingFunctionCallExprs() {
+        return groupingFunctionCallExprs;
+    }
+
     public void setGroupingFunctionCallExprs(List<Expr> groupingFunctionCallExprs) {
         this.groupingFunctionCallExprs = groupingFunctionCallExprs;
+    }
+
+    public List<FunctionCallExpr> getAggregate() {
+        return aggregate;
     }
 
     public void setAggregate(List<FunctionCallExpr> aggregate) {
@@ -136,19 +192,35 @@ public class AnalyzeState {
         return having;
     }
 
+    public List<OrderByElement> getOrderBy() {
+        return orderBy;
+    }
+
     public void setOrderBy(List<OrderByElement> orderBy) {
         this.orderBy = orderBy;
     }
 
-    public void setColumnOutputNames(List<String> columnOutputNames) {
-        this.columnOutputNames = columnOutputNames;
+    public List<AnalyticExpr> getOutputAnalytic() {
+        return outputAnalytic;
     }
 
     public void setOutputAnalytic(List<AnalyticExpr> outputAnalytic) {
         this.outputAnalytic = outputAnalytic;
     }
 
+    public List<AnalyticExpr> getOrderByAnalytic() {
+        return orderByAnalytic;
+    }
+
     public void setOrderByAnalytic(List<AnalyticExpr> orderByAnalytic) {
         this.orderByAnalytic = orderByAnalytic;
+    }
+
+    public ExprId getNextNondeterministicId() {
+        return nondeterministicIdGenerator.getNextId();
+    }
+
+    public List<Expr> getColumnNotInGroupBy() {
+        return columnNotInGroupBy;
     }
 }

@@ -31,15 +31,15 @@
 #include <sstream>
 
 #include "common/config.h"
+#include "common/status.h"
+#include "common/tracer.h"
 #include "http/ev_http_server.h"
 #include "http/http_channel.h"
 #include "http/http_handler.h"
 #include "http/http_headers.h"
 #include "http/http_request.h"
 #include "http/http_response.h"
-#include "runtime/exec_env.h"
 #include "util/bfd_parser.h"
-#include "util/file_utils.h"
 
 namespace starrocks {
 
@@ -49,14 +49,6 @@ static const int kPprofDefaultSampleSecs = 30;
 
 // Protect, only one thread can work
 static std::mutex kPprofActionMutex;
-
-class HeapAction : public HttpHandler {
-public:
-    HeapAction() {}
-    virtual ~HeapAction() {}
-
-    virtual void handle(HttpRequest* req) override;
-};
 
 void HeapAction::handle(HttpRequest* req) {
 #if defined(ADDRESS_SANITIZER) || defined(LEAK_SANITIZER) || defined(THREAD_SANITIZER)
@@ -90,14 +82,6 @@ void HeapAction::handle(HttpRequest* req) {
 #endif
 }
 
-class GrowthAction : public HttpHandler {
-public:
-    GrowthAction() {}
-    virtual ~GrowthAction() {}
-
-    virtual void handle(HttpRequest* req) override;
-};
-
 void GrowthAction::handle(HttpRequest* req) {
 #if defined(ADDRESS_SANITIZER) || defined(LEAK_SANITIZER) || defined(THREAD_SANITIZER)
     std::string str = "Growth profiling is not available with address sanitizer builds.";
@@ -112,20 +96,13 @@ void GrowthAction::handle(HttpRequest* req) {
 #endif
 }
 
-class ProfileAction : public HttpHandler {
-public:
-    ProfileAction() {}
-    virtual ~ProfileAction() {}
-
-    virtual void handle(HttpRequest* req) override;
-};
-
 void ProfileAction::handle(HttpRequest* req) {
 #if defined(ADDRESS_SANITIZER) || defined(LEAK_SANITIZER) || defined(THREAD_SANITIZER)
     std::string str = "CPU profiling is not available with address sanitizer builds.";
     HttpChannel::send_reply(req, str);
 #else
     std::lock_guard<std::mutex> lock(kPprofActionMutex);
+    auto scoped_span = trace::Scope(Tracer::Instance().start_trace("http_handle_profile"));
 
     int seconds = kPprofDefaultSampleSecs;
     const std::string& seconds_str = req->param(SECOND_KEY);
@@ -155,28 +132,6 @@ void ProfileAction::handle(HttpRequest* req) {
 #endif
 }
 
-class PmuProfileAction : public HttpHandler {
-public:
-    PmuProfileAction() {}
-    virtual ~PmuProfileAction() {}
-    virtual void handle(HttpRequest* req) override {}
-};
-
-class ContentionAction : public HttpHandler {
-public:
-    ContentionAction() {}
-    virtual ~ContentionAction() {}
-
-    virtual void handle(HttpRequest* req) override {}
-};
-
-class CmdlineAction : public HttpHandler {
-public:
-    CmdlineAction() {}
-    virtual ~CmdlineAction() {}
-    virtual void handle(HttpRequest* req) override;
-};
-
 void CmdlineAction::handle(HttpRequest* req) {
     FILE* fp = fopen("/proc/self/cmdline", "r");
     if (fp == nullptr) {
@@ -186,23 +141,14 @@ void CmdlineAction::handle(HttpRequest* req) {
         return;
     }
     char buf[1024];
-    fscanf(fp, "%s ", buf);
+    if (fscanf(fp, "%s ", buf) != 1) {
+        strcpy(buf, "read cmdline failed");
+    }
     fclose(fp);
     std::string str = buf;
 
     HttpChannel::send_reply(req, str);
 }
-
-class SymbolAction : public HttpHandler {
-public:
-    SymbolAction(BfdParser* parser) : _parser(parser) {}
-    virtual ~SymbolAction() {}
-
-    virtual void handle(HttpRequest* req) override;
-
-private:
-    BfdParser* _parser;
-};
 
 void SymbolAction::handle(HttpRequest* req) {
     // TODO: Implement symbol resolution. Without this, the binary needs to be passed
@@ -241,24 +187,6 @@ void SymbolAction::handle(HttpRequest* req) {
 
         HttpChannel::send_reply(req, result);
     }
-}
-
-Status PprofActions::setup(ExecEnv* exec_env, EvHttpServer* http_server) {
-    if (!config::pprof_profile_dir.empty()) {
-        FileUtils::create_dir(config::pprof_profile_dir);
-    }
-
-    http_server->register_handler(HttpMethod::GET, "/pprof/heap", new HeapAction());
-    http_server->register_handler(HttpMethod::GET, "/pprof/growth", new GrowthAction());
-    http_server->register_handler(HttpMethod::GET, "/pprof/profile", new ProfileAction());
-    http_server->register_handler(HttpMethod::GET, "/pprof/pmuprofile", new PmuProfileAction());
-    http_server->register_handler(HttpMethod::GET, "/pprof/contention", new ContentionAction());
-    http_server->register_handler(HttpMethod::GET, "/pprof/cmdline", new CmdlineAction());
-    auto action = new SymbolAction(exec_env->bfd_parser());
-    http_server->register_handler(HttpMethod::GET, "/pprof/symbol", action);
-    http_server->register_handler(HttpMethod::HEAD, "/pprof/symbol", action);
-    http_server->register_handler(HttpMethod::POST, "/pprof/symbol", action);
-    return Status::OK();
 }
 
 } // namespace starrocks

@@ -1,16 +1,18 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
-#include "column/column.h"
 #include "column/column_builder.h"
-#include "column/column_viewer.h"
+#include "column/vectorized_fwd.h"
 #include "exprs/vectorized/builtin_functions.h"
 #include "exprs/vectorized/function_helper.h"
 #include "udf/udf.h"
+#include "util/timezone_hsscan.h"
 
 namespace starrocks {
 namespace vectorized {
+
+// TODO:
 class TimeFunctions {
 public:
     /**
@@ -45,6 +47,14 @@ public:
 
     /**
      * @paramType columns: [TimestampColumn]
+     * @return Int16Column
+     */
+    DEFINE_VECTORIZED_FN(yearV2);
+
+    DEFINE_VECTORIZED_FN(yearV3);
+
+    /**
+     * @paramType columns: [TimestampColumn]
      * @return IntColumn
      */
     DEFINE_VECTORIZED_FN(quarter);
@@ -56,6 +66,16 @@ public:
      * @return IntColumn    Code of a month in a year: [1, 12].
      */
     DEFINE_VECTORIZED_FN(month);
+
+    /**
+     * Get month of the timestamp.
+     * @param context
+     * @param columns [TimestampColumn] Columns that hold timestamps.
+     * @return Int8Column Code of a month in a year: [1, 12].
+     */
+    DEFINE_VECTORIZED_FN(monthV2);
+
+    DEFINE_VECTORIZED_FN(monthV3);
 
     /**
      * Get day of week of the timestamp.
@@ -81,6 +101,16 @@ public:
     DEFINE_VECTORIZED_FN(day);
 
     /**
+     * Get day of the timestamp.
+     * @param context
+     * @param columns [TimestampColumn] Columns that hold timestamps.
+     * @return  Int8Column Day of the week:
+     */
+    DEFINE_VECTORIZED_FN(dayV2);
+
+    DEFINE_VECTORIZED_FN(dayV3);
+
+    /**
      * Get day of the year.
      * @param context
      * @param columns [TimestampColumn] Columns that hold timestamps.
@@ -97,12 +127,38 @@ public:
     DEFINE_VECTORIZED_FN(week_of_year);
 
     /**
+     * Get week of the year.
+     * @param context
+     * @param column[0] [TimestampColumn] Columns that hold timestamps.
+     * @param mode's value is default 0.
+     * @return  IntColumn week of the year:
+     */
+    DEFINE_VECTORIZED_FN(week_of_year_with_default_mode);
+
+    /**
+     * Get week of the year.
+     * @param context
+     * @param column[0] [TimestampColumn] Columns that hold timestamps.
+     * @param column[1] [IntColumn] Columns that hold mode.
+     * @return  IntColumn week of the year:
+     */
+    DEFINE_VECTORIZED_FN(week_of_year_with_mode);
+
+    /**
      * Get hour of the day
      * @param context
      * @param columns [TimestampColumn] Columns that hold timestamps.
      * @return  IntColumn hour of the day:
      */
     DEFINE_VECTORIZED_FN(hour);
+
+    /**
+     * Get hour of the day
+     * @param context
+     * @param columns [TimestampColumn] Columns that hold timestamps.
+     * @return  Int8Column hour of the day:
+     */
+    DEFINE_VECTORIZED_FN(hourV2);
 
     /**
      * Get minute of the hour
@@ -113,12 +169,28 @@ public:
     DEFINE_VECTORIZED_FN(minute);
 
     /**
+     * Get minute of the hour
+     * @param context
+     * @param columns [TimestampColumn] Columns that hold timestamps.
+     * @return  Int8Column minute of the hour:
+     */
+    DEFINE_VECTORIZED_FN(minuteV2);
+
+    /**
      * Get second of the minute
      * @param context
      * @param columns [TimestampColumn] Columns that hold timestamps.
      * @return  IntColumn second of the minute:
      */
     DEFINE_VECTORIZED_FN(second);
+
+    /**
+     * Get second of the minute
+     * @param context
+     * @param columns [TimestampColumn] Columns that hold timestamps.
+     * @return  IntColumn second of the minute:
+     */
+    DEFINE_VECTORIZED_FN(secondV2);
 
     /*
      * Called by datetime_trunc
@@ -145,6 +217,25 @@ public:
     static Status datetime_trunc_close(starrocks_udf::FunctionContext* context,
                                        starrocks_udf::FunctionContext::FunctionStateScope scope);
 
+    /*
+     * Called by time_slice
+     * Floor to the corresponding period
+     */
+    DEFINE_VECTORIZED_FN(time_slice_second);
+    DEFINE_VECTORIZED_FN(time_slice_minute);
+    DEFINE_VECTORIZED_FN(time_slice_hour);
+    DEFINE_VECTORIZED_FN(time_slice_day);
+    DEFINE_VECTORIZED_FN(time_slice_month);
+    DEFINE_VECTORIZED_FN(time_slice_year);
+    DEFINE_VECTORIZED_FN(time_slice_week);
+    DEFINE_VECTORIZED_FN(time_slice_quarter);
+    // time_slice for sql.
+    DEFINE_VECTORIZED_FN(time_slice);
+
+    static Status time_slice_prepare(starrocks_udf::FunctionContext* context,
+                                     starrocks_udf::FunctionContext::FunctionStateScope scope);
+    static Status time_slice_close(starrocks_udf::FunctionContext* context,
+                                   starrocks_udf::FunctionContext::FunctionStateScope scope);
     /*
      * Called by date_trunc
      * Truncate to the corresponding part
@@ -364,11 +455,19 @@ public:
     static ColumnPtr str_to_date_uncommon(FunctionContext* context, const starrocks::vectorized::Columns& columns);
     /**
      *
+     * cast string to datetime
      * @param context
      * @param columns [BinaryColumn of TYPE_VARCHAR, BinaryColumn of TYPE_VARCHAR]  The first column holds the datetime string, the second column holds the format.
      * @return  TimestampColumn
      */
     DEFINE_VECTORIZED_FN(str_to_date);
+
+    /**
+     *
+     * cast string to date, the function will call by FE getStrToDateFunction, and is invisible to user
+     *
+     */
+    DEFINE_VECTORIZED_FN(str2date);
 
     static bool is_date_format(const Slice& slice, char** start);
     static bool is_datetime_format(const Slice& slice, char** start);
@@ -458,6 +557,21 @@ public:
      */
     DEFINE_VECTORIZED_FN(time_to_sec);
 
+    // Following const variables used to obtains number days of year
+    constexpr static int NUMBER_OF_LEAP_YEAR = 366;
+    constexpr static int NUMBER_OF_NON_LEAP_YEAR = 365;
+
+    static long compute_daynr(uint year, uint month, uint day);
+    static int compute_weekday(long daynr, bool sunday_first_day_of_week);
+    static uint32_t compute_days_in_year(uint year);
+    static uint week_mode(uint mode);
+    static int32_t compute_week(uint year, uint month, uint day, uint week_behaviour);
+
+    /** Flags for calc_week() function.  */
+    constexpr static const unsigned int WEEK_MONDAY_FIRST = 1;
+    constexpr static const unsigned int WEEK_YEAR = 2;
+    constexpr static const unsigned int WEEK_FIRST_WEEKDAY = 4;
+
 private:
     // internal approach to process string content, based on any string format.
     static void str_to_date_internal(TimestampValue* ts, const Slice& fmt, const Slice& str,
@@ -492,9 +606,9 @@ public:
 
 private:
     struct FromUnixState {
-        bool const_format;
+        bool const_format{false};
         std::string format_content;
-        FromUnixState() : const_format(false), format_content("") {}
+        FromUnixState() {}
     };
 
     // The context used for convert tz
@@ -518,7 +632,7 @@ private:
         char* fmt;
     };
 
-    // method for datetime_trunc
+    // method for datetime_trunc and time_slice
     struct DateTruncCtx {
         ScalarFunction function;
     };

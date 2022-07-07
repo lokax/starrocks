@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -249,6 +249,73 @@ TEST_F(LikeTest, patternEmptyLike) {
                         .ok());
 }
 
+TEST_F(LikeTest, patternStrAndPatternBothEmptyLike) {
+    auto context = FunctionContext::create_test_context();
+    std::unique_ptr<FunctionContext> ctx(context);
+    Columns columns;
+
+    auto str = BinaryColumn::create();
+    auto pattern = ColumnHelper::create_const_column<TYPE_VARCHAR>("", 1);
+
+    for (int j = 0; j < 20; ++j) {
+        str->append("");
+    }
+
+    columns.push_back(str);
+    columns.push_back(pattern);
+
+    context->impl()->set_constant_columns(columns);
+
+    ASSERT_TRUE(LikePredicate::like_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL).ok());
+
+    auto result = LikePredicate::like(context, columns);
+
+    ASSERT_TRUE(result->is_numeric());
+
+    auto v = ColumnHelper::cast_to<TYPE_BOOLEAN>(result);
+
+    for (int l = 0; l < 20; ++l) {
+        ASSERT_TRUE(v->get_data()[l]);
+    }
+
+    ASSERT_TRUE(LikePredicate::like_close(context, FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                        .ok());
+}
+
+TEST_F(LikeTest, patternStrAndPatternBothEmptyExplicitNullPtrLike) {
+    auto context = FunctionContext::create_test_context();
+    std::unique_ptr<FunctionContext> ctx(context);
+    Columns columns;
+
+    auto str = BinaryColumn::create();
+    auto pattern = ColumnHelper::create_const_column<TYPE_VARCHAR>("", 1);
+
+    const char* null_ptr = nullptr;
+    for (int j = 0; j < 20; ++j) {
+        str->append(Slice(null_ptr, 0));
+    }
+
+    columns.push_back(str);
+    columns.push_back(pattern);
+
+    context->impl()->set_constant_columns(columns);
+
+    ASSERT_TRUE(LikePredicate::like_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL).ok());
+
+    auto result = LikePredicate::like(context, columns);
+
+    ASSERT_TRUE(result->is_numeric());
+
+    auto v = ColumnHelper::cast_to<TYPE_BOOLEAN>(result);
+
+    for (int l = 0; l < 20; ++l) {
+        ASSERT_TRUE(v->get_data()[l]);
+    }
+
+    ASSERT_TRUE(LikePredicate::like_close(context, FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                        .ok());
+}
+
 TEST_F(LikeTest, patternOnlyNullLike) {
     auto context = FunctionContext::create_test_context();
     std::unique_ptr<FunctionContext> ctx(context);
@@ -398,6 +465,82 @@ TEST_F(LikeTest, rowsPatternRegex) {
         } else {
             ASSERT_FALSE(v->get_data()[l]);
         }
+    }
+
+    ASSERT_TRUE(LikePredicate::regex_close(context, FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                        .ok());
+}
+
+TEST_F(LikeTest, constValueLike) {
+    auto context = FunctionContext::create_test_context();
+    std::unique_ptr<FunctionContext> ctx(context);
+
+    const int num_rows = 10;
+
+    auto value_col = ColumnHelper::create_const_column<TYPE_VARCHAR>("abcd", num_rows);
+    auto pattern_col = BinaryColumn::create();
+    pattern_col->append("abc");
+    pattern_col->append("ab%");
+    pattern_col->append("abc_");
+    pattern_col->append("%cd");
+    pattern_col->append("_bcd");
+    pattern_col->append("a%d");
+    pattern_col->append("ab_d");
+    pattern_col->append("abcd");
+    pattern_col->append("abcm");
+    pattern_col->append("abcd_");
+
+    bool expected[num_rows] = {false, true, true, true, true, true, true, true, false, false};
+
+    Columns columns;
+    columns.emplace_back(std::move(value_col));
+    columns.emplace_back(std::move(pattern_col));
+    context->impl()->set_constant_columns(columns);
+
+    ASSERT_TRUE(LikePredicate::like_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL).ok());
+
+    auto result = LikePredicate::like(context, columns);
+    ASSERT_TRUE(result->is_numeric());
+    ASSERT_EQ(num_rows, result->size());
+
+    auto v = ColumnHelper::cast_to<TYPE_BOOLEAN>(result);
+    for (int i = 0; i < num_rows; ++i) {
+        ASSERT_EQ(expected[i], v->get_data()[i]);
+    }
+
+    ASSERT_TRUE(LikePredicate::like_close(context, FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                        .ok());
+}
+
+TEST_F(LikeTest, constValueRegexp) {
+    auto context = FunctionContext::create_test_context();
+    std::unique_ptr<FunctionContext> ctx(context);
+
+    const int num_rows = 4;
+
+    auto value_col = ColumnHelper::create_const_column<TYPE_VARCHAR>("abcd", num_rows);
+    auto pattern_col = BinaryColumn::create();
+    pattern_col->append("abc");
+    pattern_col->append("ab.*");
+    pattern_col->append("abcd");
+    pattern_col->append("abcm");
+
+    bool expected[num_rows] = {true, true, true, false};
+
+    Columns columns;
+    columns.emplace_back(std::move(value_col));
+    columns.emplace_back(std::move(pattern_col));
+    context->impl()->set_constant_columns(columns);
+
+    ASSERT_TRUE(LikePredicate::regex_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL).ok());
+
+    auto result = LikePredicate::regex(context, columns);
+    ASSERT_TRUE(result->is_numeric());
+    ASSERT_EQ(num_rows, result->size());
+
+    auto v = ColumnHelper::cast_to<TYPE_BOOLEAN>(result);
+    for (int i = 0; i < num_rows; ++i) {
+        ASSERT_EQ(expected[i], v->get_data()[i]);
     }
 
     ASSERT_TRUE(LikePredicate::regex_close(context, FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)

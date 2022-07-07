@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_QUERY_EXPRS_PREDICATE_H
-#define STARROCKS_BE_SRC_QUERY_EXPRS_PREDICATE_H
+#pragma once
 
 #include "exprs/expr.h"
 
@@ -29,12 +28,12 @@ namespace starrocks {
 class TExprNode;
 
 class Predicate : public Expr {
+public:
+    virtual Status merge(Predicate* predicate) { return Status::NotSupported("Not supported"); }
+
 protected:
     friend class Expr;
-
     Predicate(const TExprNode& node) : Expr(node) {}
 };
 
 } // namespace starrocks
-
-#endif

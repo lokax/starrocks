@@ -32,6 +32,7 @@
 #include <rapidjson/prettywriter.h>
 #include <thrift/protocol/TDebugProtocol.h>
 
+#include "agent/master_info.h"
 #include "common/logging.h"
 #include "common/utils.h"
 #include "gen_cpp/FrontendService.h"
@@ -44,6 +45,7 @@
 #include "http/http_response.h"
 #include "http/utils.h"
 #include "runtime/client_cache.h"
+#include "runtime/current_thread.h"
 #include "runtime/exec_env.h"
 #include "runtime/fragment_mgr.h"
 #include "runtime/load_path_mgr.h"
@@ -52,11 +54,14 @@
 #include "runtime/stream_load/stream_load_context.h"
 #include "runtime/stream_load/stream_load_executor.h"
 #include "runtime/stream_load/stream_load_pipe.h"
+#include "simdjson.h"
 #include "util/byte_buffer.h"
 #include "util/debug_util.h"
+#include "util/defer_op.h"
 #include "util/json_util.h"
 #include "util/metrics.h"
 #include "util/starrocks_metrics.h"
+#include "util/string_parser.hpp"
 #include "util/thrift_rpc_helper.h"
 #include "util/time.h"
 #include "util/uid_util.h"
@@ -115,7 +120,7 @@ StreamLoadAction::StreamLoadAction(ExecEnv* exec_env) : _exec_env(exec_env) {
                                                              &streaming_load_current_processing);
 }
 
-StreamLoadAction::~StreamLoadAction() {}
+StreamLoadAction::~StreamLoadAction() = default;
 
 void StreamLoadAction::handle(HttpRequest* req) {
     StreamLoadContext* ctx = (StreamLoadContext*)req->handler_ctx();
@@ -138,8 +143,8 @@ void StreamLoadAction::handle(HttpRequest* req) {
             _exec_env->stream_load_executor()->rollback_txn(ctx);
             ctx->need_rollback = false;
         }
-        if (ctx->body_sink.get() != nullptr) {
-            ctx->body_sink->cancel();
+        if (ctx->body_sink != nullptr) {
+            ctx->body_sink->cancel(ctx->status);
         }
     }
 
@@ -155,9 +160,9 @@ void StreamLoadAction::handle(HttpRequest* req) {
 
 Status StreamLoadAction::_handle(StreamLoadContext* ctx) {
     if (ctx->body_bytes > 0 && ctx->receive_bytes != ctx->body_bytes) {
-        LOG(WARNING) << "recevie body don't equal with body bytes, body_bytes=" << ctx->body_bytes
+        LOG(WARNING) << "receive body don't equal with body bytes, body_bytes=" << ctx->body_bytes
                      << ", receive_bytes=" << ctx->receive_bytes << ", id=" << ctx->id;
-        return Status::InternalError("receive body dont't equal with body bytes");
+        return Status::InternalError("receive body don't equal with body bytes");
     }
     if (!ctx->use_streaming) {
         // if we use non-streaming, we need to close file first,
@@ -166,6 +171,11 @@ Status StreamLoadAction::_handle(StreamLoadContext* ctx) {
         ctx->body_sink.reset();
         RETURN_IF_ERROR(_exec_env->stream_load_executor()->execute_plan_fragment(ctx));
     } else {
+        if (ctx->buffer != nullptr && ctx->buffer->pos > 0) {
+            ctx->buffer->flip();
+            ctx->body_sink->append(std::move(ctx->buffer));
+            ctx->buffer = nullptr;
+        }
         RETURN_IF_ERROR(ctx->body_sink->finish());
     }
 
@@ -206,8 +216,8 @@ int StreamLoadAction::on_header(HttpRequest* req) {
             _exec_env->stream_load_executor()->rollback_txn(ctx);
             ctx->need_rollback = false;
         }
-        if (ctx->body_sink.get() != nullptr) {
-            ctx->body_sink->cancel();
+        if (ctx->body_sink != nullptr) {
+            ctx->body_sink->cancel(st);
         }
         auto str = ctx->to_json();
         HttpChannel::send_reply(req, str);
@@ -235,6 +245,12 @@ Status StreamLoadAction::_on_header(HttpRequest* http_req, StreamLoadContext* ct
             ss << "body exceed max size: " << max_body_bytes << ", limit: " << max_body_bytes;
             return Status::InternalError(ss.str());
         }
+
+        if (ctx->format == TFileFormatType::FORMAT_JSON) {
+            // Allocate buffer in advance, since the json payload cannot be parsed in stream mode.
+            // For efficiency reasons, simdjson requires a string with a few bytes (simdjson::SIMDJSON_PADDING) at the end.
+            ctx->buffer = ByteBuffer::allocate(ctx->body_bytes + simdjson::SIMDJSON_PADDING);
+        }
     } else {
 #ifndef BE_TEST
         evhttp_connection_set_max_body_size(evhttp_request_get_connection(http_req->get_evhttp_request()),
@@ -254,10 +270,12 @@ Status StreamLoadAction::_on_header(HttpRequest* http_req, StreamLoadContext* ct
 
         if (ctx->format == TFileFormatType::FORMAT_JSON) {
             size_t max_body_bytes = config::streaming_load_max_batch_size_mb * 1024 * 1024;
-            if (ctx->body_bytes > max_body_bytes) {
+            auto ignore_json_size = boost::iequals(http_req->header(HTTP_IGNORE_JSON_SIZE), "true");
+            if (!ignore_json_size && ctx->body_bytes > max_body_bytes) {
                 std::stringstream ss;
                 ss << "The size of this batch exceed the max size [" << max_body_bytes << "]  of json type data "
-                   << " data [ " << ctx->body_bytes << " ]";
+                   << " data [ " << ctx->body_bytes
+                   << " ]. Set ignore_json_size to skip the check, although it may lead huge memory consuming.";
                 return Status::InternalError(ss.str());
             }
         }
@@ -289,24 +307,54 @@ void StreamLoadAction::on_chunk_data(HttpRequest* req) {
         return;
     }
 
+    SCOPED_THREAD_LOCAL_MEM_TRACKER_SETTER(ctx->instance_mem_tracker.get());
+
     struct evhttp_request* ev_req = req->get_evhttp_request();
     auto evbuf = evhttp_request_get_input_buffer(ev_req);
 
     int64_t start_read_data_time = MonotonicNanos();
-    while (evbuffer_get_length(evbuf) > 0) {
-        auto bb = ByteBuffer::allocate(4096);
-        auto remove_bytes = evbuffer_remove(evbuf, bb->ptr, bb->capacity);
-        bb->pos = remove_bytes;
-        bb->flip();
-        auto st = ctx->body_sink->append(bb);
-        if (!st.ok()) {
-            LOG(WARNING) << "append body content failed. errmsg=" << st.get_error_msg() << ctx->brief();
-            ctx->status = st;
-            return;
+
+    size_t len = 0;
+    while ((len = evbuffer_get_length(evbuf)) > 0) {
+        if (ctx->buffer == nullptr) {
+            // Initialize buffer.
+            ctx->buffer = ByteBuffer::allocate(
+                    ctx->format == TFileFormatType::FORMAT_JSON ? std::max(len, ctx->kDefaultBufferSize) : len);
+
+        } else if (ctx->buffer->remaining() < len) {
+            if (ctx->format == TFileFormatType::FORMAT_JSON) {
+                // For json format, we need build a complete json before we push the buffer to the pipe.
+                // buffer capacity is not enough, so we try to expand the buffer.
+                ByteBufferPtr buf = ByteBuffer::allocate(BitUtil::RoundUpToPowerOfTwo(ctx->buffer->pos + len));
+                buf->put_bytes(ctx->buffer->ptr, ctx->buffer->pos);
+                std::swap(buf, ctx->buffer);
+
+            } else {
+                // For non-json format, we could push buffer to the body_sink in streaming mode.
+                // buffer capacity is not enough, so we push the buffer to the pipe and allocate new one.
+                ctx->buffer->flip();
+                auto st = ctx->body_sink->append(std::move(ctx->buffer));
+                if (!st.ok()) {
+                    LOG(WARNING) << "append body content failed. errmsg=" << st << " context=" << ctx->brief();
+                    ctx->status = st;
+                    return;
+                }
+
+                ctx->buffer = ByteBuffer::allocate(std::max(len, ctx->kDefaultBufferSize));
+            }
         }
+
+        int remove_bytes;
+        {
+            // The memory is applied for in http server thread,
+            // so the release of this memory must be recorded in ProcessMemTracker
+            SCOPED_THREAD_LOCAL_MEM_TRACKER_SETTER(nullptr);
+            remove_bytes = evbuffer_remove(evbuf, ctx->buffer->ptr + ctx->buffer->pos, ctx->buffer->remaining());
+        }
+        ctx->buffer->pos += remove_bytes;
         ctx->receive_bytes += remove_bytes;
     }
-    ctx->read_data_cost_nanos += (MonotonicNanos() - start_read_data_time);
+    ctx->total_received_data_cost_nanos += (MonotonicNanos() - start_read_data_time);
 }
 
 void StreamLoadAction::free_handler_ctx(void* param) {
@@ -316,8 +364,9 @@ void StreamLoadAction::free_handler_ctx(void* param) {
     }
     // sender is going, make receiver know it
     if (ctx->body_sink != nullptr) {
-        ctx->body_sink->cancel();
+        ctx->body_sink->cancel(Status::Cancelled("Cancelled"));
     }
+    _exec_env->load_stream_mgr()->remove(ctx->id);
     if (ctx->unref()) {
         delete ctx;
     }
@@ -337,8 +386,7 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
     request.__set_loadId(ctx->id.to_thrift());
     if (ctx->use_streaming) {
         auto pipe =
-                std::make_shared<StreamLoadPipe>(1024 * 1024 /* max_buffered_bytes */, 64 * 1024 /* min_chunk_size */,
-                                                 ctx->body_bytes /* total_length */);
+                std::make_shared<StreamLoadPipe>(1024 * 1024 /* max_buffered_bytes */, 64 * 1024 /* min_chunk_size */);
         RETURN_IF_ERROR(_exec_env->load_stream_mgr()->put(ctx->id, pipe));
         request.fileType = TFileType::FILE_STREAM;
         ctx->body_sink = pipe;
@@ -396,7 +444,6 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
     if (!http_req->header(HTTP_LOAD_MEM_LIMIT).empty()) {
         try {
             auto load_mem_limit = std::stoll(http_req->header(HTTP_LOAD_MEM_LIMIT));
-            LOG(INFO) << "compaction load_mem_limit:" << load_mem_limit;
             if (load_mem_limit < 0) {
                 return Status::InvalidArgument("load_mem_limit must be equal or greater than 0");
             }
@@ -420,12 +467,32 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
     } else {
         request.__set_strip_outer_array(false);
     }
+    if (!http_req->header(HTTP_PARTIAL_UPDATE).empty()) {
+        if (boost::iequals(http_req->header(HTTP_PARTIAL_UPDATE), "false")) {
+            request.__set_partial_update(false);
+        } else if (boost::iequals(http_req->header(HTTP_PARTIAL_UPDATE), "true")) {
+            request.__set_partial_update(true);
+        } else {
+            return Status::InvalidArgument("Invalid partial update flag format. Must be bool type");
+        }
+    }
+    if (!http_req->header(HTTP_TRANSMISSION_COMPRESSION_TYPE).empty()) {
+        request.__set_transmission_compression_type(http_req->header(HTTP_TRANSMISSION_COMPRESSION_TYPE));
+    }
+    if (!http_req->header(HTTP_LOAD_DOP).empty()) {
+        try {
+            auto parallel_request_num = std::stoll(http_req->header(HTTP_LOAD_DOP));
+            request.__set_load_dop(parallel_request_num);
+        } catch (const std::invalid_argument& e) {
+            return Status::InvalidArgument("Invalid load_dop format");
+        }
+    }
     if (ctx->timeout_second != -1) {
         request.__set_timeout(ctx->timeout_second);
     }
     request.__set_thrift_rpc_timeout_ms(config::thrift_rpc_timeout_ms);
     // plan this load
-    TNetworkAddress master_addr = _exec_env->master_info()->network_address;
+    TNetworkAddress master_addr = get_master_address();
 #ifndef BE_TEST
     if (!http_req->header(HTTP_MAX_FILTER_RATIO).empty()) {
         ctx->max_filter_ratio = strtod(http_req->header(HTTP_MAX_FILTER_RATIO).c_str(), nullptr);
@@ -449,6 +516,14 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
     // to process this load
     if (!ctx->use_streaming) {
         return Status::OK();
+    }
+
+    if (!http_req->header(HTTP_EXEC_MEM_LIMIT).empty()) {
+        auto exec_mem_limit = std::stoll(http_req->header(HTTP_EXEC_MEM_LIMIT));
+        if (exec_mem_limit <= 0) {
+            return Status::InvalidArgument("exec_mem_limit must be greater than 0");
+        }
+        ctx->put_result.params.query_options.mem_limit = exec_mem_limit;
     }
 
     return _exec_env->stream_load_executor()->execute_plan_fragment(ctx);

@@ -32,6 +32,7 @@ import com.starrocks.catalog.Replica.ReplicaStatus;
 import com.starrocks.catalog.Table.TableType;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.FeConstants;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.system.SystemInfoService;
 
@@ -51,10 +52,10 @@ public class MetadataViewer {
                                                       ReplicaStatus statusFilter, Operator op) throws DdlException {
         List<List<String>> result = Lists.newArrayList();
 
-        Catalog catalog = Catalog.getCurrentCatalog();
-        SystemInfoService infoService = Catalog.getCurrentSystemInfo();
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        SystemInfoService infoService = GlobalStateMgr.getCurrentSystemInfo();
 
-        Database db = catalog.getDb(dbName);
+        Database db = globalStateMgr.getDb(dbName);
         if (db == null) {
             throw new DdlException("Database " + dbName + " does not exsit");
         }
@@ -90,7 +91,7 @@ public class MetadataViewer {
                     for (Tablet tablet : index.getTablets()) {
                         long tabletId = tablet.getId();
                         int count = replicationNum;
-                        for (Replica replica : tablet.getReplicas()) {
+                        for (Replica replica : ((LocalTablet) tablet).getReplicas()) {
                             --count;
                             List<String> row = Lists.newArrayList();
 
@@ -120,6 +121,7 @@ public class MetadataViewer {
                             row.add(String.valueOf(replica.getSchemaHash()));
                             row.add(String.valueOf(replica.getVersionCount()));
                             row.add(String.valueOf(replica.isBad()));
+                            row.add(String.valueOf(replica.isSetBadForce()));
                             row.add(replica.getState().name());
                             row.add(status.name());
                             result.add(row);
@@ -177,10 +179,10 @@ public class MetadataViewer {
 
         List<List<String>> result = Lists.newArrayList();
 
-        Catalog catalog = Catalog.getCurrentCatalog();
-        SystemInfoService infoService = Catalog.getCurrentSystemInfo();
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        SystemInfoService infoService = GlobalStateMgr.getCurrentSystemInfo();
 
-        Database db = catalog.getDb(dbName);
+        Database db = globalStateMgr.getDb(dbName);
         if (db == null) {
             throw new DdlException("Database " + dbName + " does not exsit");
         }
@@ -223,7 +225,7 @@ public class MetadataViewer {
                 Partition partition = olapTable.getPartition(partId);
                 for (MaterializedIndex index : partition.getMaterializedIndices(IndexExtState.VISIBLE)) {
                     for (Tablet tablet : index.getTablets()) {
-                        for (Replica replica : tablet.getReplicas()) {
+                        for (Replica replica : ((LocalTablet) tablet).getReplicas()) {
                             if (!countMap.containsKey(replica.getBackendId())) {
                                 continue;
                             }
@@ -254,7 +256,7 @@ public class MetadataViewer {
 
     private static String graph(int num, int totalNum, int mod) {
         StringBuilder sb = new StringBuilder();
-        int normalized = (int) Math.ceil(num * mod / totalNum);
+        int normalized = (int) Math.ceil(num * mod * 1.0 / totalNum);
         for (int i = 0; i < normalized; ++i) {
             sb.append(">");
         }

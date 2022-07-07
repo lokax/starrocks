@@ -24,45 +24,47 @@ package com.starrocks.planner;
 import com.google.common.base.MoreObjects;
 import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.TupleDescriptor;
-import com.starrocks.catalog.SchemaTable;
-import com.starrocks.common.Config;
 import com.starrocks.common.UserException;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.service.FrontendOptions;
 import com.starrocks.thrift.TPlanNode;
 import com.starrocks.thrift.TPlanNodeType;
 import com.starrocks.thrift.TScanRangeLocations;
 import com.starrocks.thrift.TSchemaScanNode;
 import com.starrocks.thrift.TUserIdentity;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.util.List;
 
 /**
  * Full scan of an SCHEMA table.
  */
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public class SchemaScanNode extends ScanNode {
-    private static final Logger LOG = LogManager.getLogger(SchemaTable.class);
-
     private final String tableName;
     private String schemaDb;
     private String schemaTable;
     private String schemaWild;
-    private String user;
-    private String userIp;
     private String frontendIP;
     private int frontendPort;
 
+    public void setSchemaDb(String schemaDb) {
+        this.schemaDb = schemaDb;
+    }
+
+    public void setSchemaTable(String schemaTable) {
+        this.schemaTable = schemaTable;
+    }
+
+    public String getSchemaDb() {
+        return schemaDb;
+    }
+
+    public String getSchemaTable() {
+        return schemaTable;
+    }
+
     public void setUser(String user) {
-        this.user = user;
     }
 
     public void setUserIp(String userIp) {
-        this.userIp = userIp;
     }
 
     public void setFrontendIP(String frontendIP) {
@@ -88,15 +90,7 @@ public class SchemaScanNode extends ScanNode {
     }
 
     @Override
-    public void finalize(Analyzer analyzer) throws UserException {
-        // Convert predicates to MySQL columns and filters.
-        schemaDb = analyzer.getSchemaDb();
-        schemaTable = analyzer.getSchemaTable();
-        schemaWild = analyzer.getSchemaWild();
-        user = analyzer.getQualifiedUser();
-        userIp = analyzer.getContext().getRemoteIP();
-        frontendIP = FrontendOptions.getLocalHostAddress();
-        frontendPort = Config.rpc_port;
+    public void finalizeStats(Analyzer analyzer) throws UserException {
     }
 
     @Override
@@ -145,13 +139,4 @@ public class SchemaScanNode extends ScanNode {
         return 1;
     }
 
-    @Override
-    public boolean isVectorized() {
-        return true;
-    }
-
-    @Override
-    public void setUseVectorized(boolean flag) {
-        this.useVectorized = flag;
-    }
 }

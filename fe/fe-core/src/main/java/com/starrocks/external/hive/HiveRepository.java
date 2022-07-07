@@ -1,24 +1,38 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.external.hive;
 
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.catalog.Catalog;
-import com.starrocks.catalog.Column;
+import com.starrocks.catalog.HiveMetaStoreTableInfo;
 import com.starrocks.catalog.HiveResource;
+import com.starrocks.catalog.HudiResource;
 import com.starrocks.catalog.PartitionKey;
 import com.starrocks.catalog.Resource;
 import com.starrocks.catalog.Resource.ResourceType;
+import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.ThreadPoolManager;
+import com.starrocks.server.GlobalStateMgr;
 import org.apache.hadoop.hive.metastore.api.Table;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.thrift.TException;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import static com.starrocks.external.HiveMetaStoreTableUtils.isInternalCatalog;
 
 public class HiveRepository {
     // hiveResourceName => HiveMetaClient
@@ -29,9 +43,16 @@ public class HiveRepository {
     Map<String, HiveMetaCache> metaCaches = Maps.newHashMap();
     ReadWriteLock metaCachesLock = new ReentrantReadWriteLock();
 
-    Executor executor = Executors.newFixedThreadPool(100);
+    Executor executor = new ThreadPoolExecutor(Config.hive_meta_cache_refresh_min_threads,
+            Integer.MAX_VALUE, 60L, TimeUnit.SECONDS, new SynchronousQueue<Runnable>());
+
+    private static final Logger LOG = LogManager.getLogger(HiveRepository.class);
+    private final ExecutorService partitionDaemonExecutor =
+            ThreadPoolManager.newDaemonFixedThreadPool(Config.hive_meta_load_concurrency,
+                    Integer.MAX_VALUE, "hive-meta-concurrency-pool", true);
 
     public HiveMetaClient getClient(String resourceName) throws DdlException {
+        boolean isInternalCatalog = isInternalCatalog(resourceName);
         HiveMetaClient client;
         metaClientsLock.readLock().lock();
         try {
@@ -50,15 +71,25 @@ public class HiveRepository {
             if (client != null) {
                 return client;
             }
-            Resource resource = Catalog.getCurrentCatalog().getResourceMgr().getResource(resourceName);
-            if (resource == null) {
+            Resource resource = GlobalStateMgr.getCurrentState().getResourceMgr().getResource(resourceName);
+            if (resource == null && isInternalCatalog) {
                 throw new DdlException("get hive client failed, resource[" + resourceName + "] not exists");
             }
-            if (resource.getType() != ResourceType.HIVE) {
-                throw new DdlException("resource [" + resourceName + "] is not hive resource");
+            if (isInternalCatalog && resource.getType() != ResourceType.HIVE &&
+                    resource.getType() != ResourceType.HUDI) {
+                throw new DdlException("resource [" + resourceName + "] is not hive/hudi resource");
             }
 
-            client = new HiveMetaClient(((HiveResource) resource).getHiveMetastoreURIs());
+            if (!isInternalCatalog) {
+                client = new HiveMetaClient(resourceName);
+            } else {
+                if (resource.getType() == ResourceType.HIVE) {
+                    client = new HiveMetaClient(((HiveResource) resource).getHiveMetastoreURIs());
+                } else if (resource.getType() == ResourceType.HUDI) {
+                    client = new HiveMetaClient(((HudiResource) resource).getHiveMetastoreURIs());
+                }
+            }
+
             metaClients.put(resourceName, client);
         } finally {
             metaClientsLock.writeLock().unlock();
@@ -87,7 +118,7 @@ public class HiveRepository {
                 return hiveMetaCache;
             }
 
-            hiveMetaCache = new HiveMetaCache(metaClient, executor);
+            hiveMetaCache = new HiveMetaCache(metaClient, executor, resourceName);
             metaCaches.put(resourceName, hiveMetaCache);
             return hiveMetaCache;
         } finally {
@@ -100,16 +131,30 @@ public class HiveRepository {
         return client.getTable(dbName, tableName);
     }
 
-    public ImmutableMap<PartitionKey, Long> getPartitionKeys(String resourceName, String dbName, String tableName,
-                                                             List<Column> partColumns) throws DdlException {
-        HiveMetaCache metaCache = getMetaCache(resourceName);
-        return metaCache.getPartitionKeys(dbName, tableName, partColumns);
+    public ImmutableMap<PartitionKey, Long> getPartitionKeys(HiveMetaStoreTableInfo hmsTable) throws DdlException {
+        HiveMetaCache metaCache = getMetaCache(hmsTable.getResourceName());
+        return metaCache.getPartitionKeys(hmsTable);
     }
 
-    public HivePartition getPartition(String resourceName, String dbName, String tableName,
-                                      PartitionKey partitionKey) throws DdlException {
-        HiveMetaCache metaCache = getMetaCache(resourceName);
-        return metaCache.getPartition(dbName, tableName, partitionKey);
+    public List<HivePartition> getPartitions(HiveMetaStoreTableInfo hmsTable, List<PartitionKey> partitionKeys)
+            throws DdlException {
+        HiveMetaCache metaCache = getMetaCache(hmsTable.getResourceName());
+        List<Future<HivePartition>> futures = Lists.newArrayList();
+        for (PartitionKey partitionKey : partitionKeys) {
+            Future<HivePartition> future = partitionDaemonExecutor
+                    .submit(() -> metaCache.getPartition(hmsTable, partitionKey));
+            futures.add(future);
+        }
+        List<HivePartition> result = Lists.newArrayList();
+        for (Future<HivePartition> future : futures) {
+            try {
+                result.add(future.get());
+            } catch (InterruptedException | ExecutionException e) {
+                LOG.warn("get table {}.{} partition meta info failed.", hmsTable.getDb(), hmsTable.getTable(), e);
+                throw new DdlException(e.getMessage());
+            }
+        }
+        return result;
     }
 
     public HiveTableStats getTableStats(String resourceName, String dbName, String tableName) throws DdlException {
@@ -117,39 +162,62 @@ public class HiveRepository {
         return metaCache.getTableStats(dbName, tableName);
     }
 
-    public HivePartitionStats getPartitionStats(String resourceName, String dbName,
-                                                String tableName, PartitionKey partitionKey) throws DdlException {
-        HiveMetaCache metaCache = getMetaCache(resourceName);
-        return metaCache.getPartitionStats(dbName, tableName, partitionKey);
+    public List<HivePartitionStats> getPartitionsStats(HiveMetaStoreTableInfo hmsTable,
+                                                       List<PartitionKey> partitionKeys) throws DdlException {
+        HiveMetaCache metaCache = getMetaCache(hmsTable.getResourceName());
+        List<Future<HivePartitionStats>> futures = Lists.newArrayList();
+        for (PartitionKey partitionKey : partitionKeys) {
+            Future<HivePartitionStats> future = partitionDaemonExecutor.
+                    submit(() -> metaCache.getPartitionStats(hmsTable, partitionKey));
+            futures.add(future);
+        }
+        List<HivePartitionStats> result = Lists.newArrayList();
+        for (Future<HivePartitionStats> future : futures) {
+            try {
+                result.add(future.get());
+            } catch (InterruptedException | ExecutionException e) {
+                LOG.warn("get table {}.{} partition stats meta info failed.", hmsTable.getDb(), hmsTable.getTable(), e);
+                throw new DdlException(e.getMessage());
+            }
+        }
+        return result;
     }
 
-    public ImmutableMap<String, HiveColumnStats> getTableLevelColumnStats(String resourceName, String dbName,
-                                                                          String tableName,
-                                                                          List<Column> partitionColumns,
-                                                                          List<String> columnNames)
+    public ImmutableMap<String, HiveColumnStats> getTableLevelColumnStats(HiveMetaStoreTableInfo hmsTable)
             throws DdlException {
-        HiveMetaCache metaCache = getMetaCache(resourceName);
-        return metaCache.getTableLevelColumnStats(dbName, tableName, partitionColumns, columnNames);
+        HiveMetaCache metaCache = getMetaCache(hmsTable.getResourceName());
+        return metaCache.getTableLevelColumnStats(hmsTable);
     }
 
-    public void refreshTableCache(String resourceName, String dbName, String tableName, List<Column> partColumns,
-                                  List<String> columnNames) throws DdlException {
-        HiveMetaCache metaCache = getMetaCache(resourceName);
-        metaCache.refreshTable(dbName, tableName, partColumns, columnNames);
+    public void refreshConnectorTable(String resource, String db, String table)
+            throws DdlException, TException, ExecutionException {
+        HiveMetaCache metaCache = getMetaCache(resource);
+        metaCache.refreshConnectorTable(db, table);
     }
 
-    public void refreshPartitionCache(String resourceName, String dbName, String tableName, List<String> partNames)
+    public void refreshTableCache(HiveMetaStoreTableInfo hmsTable) throws DdlException {
+        HiveMetaCache metaCache = getMetaCache(hmsTable.getResourceName());
+        metaCache.refreshTable(hmsTable);
+    }
+
+    public void refreshPartitionCache(HiveMetaStoreTableInfo hmsTable, List<String> partNames)
             throws DdlException {
-        HiveMetaCache metaCache = getMetaCache(resourceName);
-        metaCache.refreshPartition(dbName, tableName, partNames);
+        HiveMetaCache metaCache = getMetaCache(hmsTable.getResourceName());
+        metaCache.refreshPartition(hmsTable, partNames);
     }
 
-    public void clearCache(String resourceName, String dbName, String tableName) {
+    public void refreshTableColumnStats(HiveMetaStoreTableInfo hmsTable)
+            throws DdlException {
+        HiveMetaCache metaCache = getMetaCache(hmsTable.getResourceName());
+        metaCache.refreshColumnStats(hmsTable);
+    }
+
+    public void clearCache(HiveMetaStoreTableInfo hmsTable) {
         try {
-            HiveMetaCache metaCache = getMetaCache(resourceName);
-            metaCache.clearCache(dbName, tableName);
+            HiveMetaCache metaCache = getMetaCache(hmsTable.getResourceName());
+            metaCache.clearCache(hmsTable);
         } catch (DdlException e) {
-
+            LOG.warn("clean table {}.{} cache failed.", hmsTable.getDb(), hmsTable.getTable(), e);
         }
     }
 

@@ -19,12 +19,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_UTIL_TIME_H
-#define STARROCKS_BE_UTIL_TIME_H
+#pragma once
 
-#include <stdint.h>
-#include <time.h>
-
+#include <cstdint>
+#include <ctime>
 #include <string>
 
 #define NANOS_PER_SEC 1000000000ll
@@ -136,4 +134,3 @@ std::string ToStringFromUnixMicros(int64_t us, TimePrecision p = TimePrecision::
 std::string ToUtcStringFromUnixMicros(int64_t us, TimePrecision p = TimePrecision::Microsecond);
 
 } // namespace starrocks
-#endif

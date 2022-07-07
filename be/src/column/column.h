@@ -1,23 +1,29 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <type_traits>
 
-#include "column/datum.h"
+#include "column/column_visitor.h"
+#include "column/column_visitor_mutable.h"
 #include "column/vectorized_fwd.h"
+#include "common/statusor.h"
 #include "gutil/casts.h"
 #include "storage/delete_condition.h" // for DelCondSatisfied
-#include "util/slice.h"
 
 namespace starrocks {
 
 class MemPool;
 class MysqlRowBuffer;
+class Slice;
 
 namespace vectorized {
+
+// Forward declaration
+class Datum;
 
 class Column {
 public:
@@ -36,6 +42,9 @@ public:
     // 256  |   8s210ms
     // From the result, we can see when fixed length is 128, we can get speed up for column read.
     enum { APPEND_OVERFLOW_MAX_SIZE = 128 };
+
+    static const uint64_t MAX_CAPACITY_LIMIT = static_cast<uint64_t>(UINT32_MAX) + 1;
+    static const uint64_t MAX_LARGE_CAPACITY_LIMIT = UINT64_MAX;
 
     // mutable operations cannot be applied to shared data when concurrent
     using Ptr = std::shared_ptr<Column>;
@@ -59,6 +68,8 @@ public:
 
     virtual bool is_binary() const { return false; }
 
+    virtual bool is_large_binary() const { return false; }
+
     virtual bool is_decimal() const { return false; }
 
     virtual bool is_date() const { return false; }
@@ -75,8 +86,12 @@ public:
 
     virtual uint8_t* mutable_raw_data() = 0;
 
+    virtual const uint8_t* continuous_data() const { return raw_data(); }
+
     // Return number of values in column.
     virtual size_t size() const = 0;
+
+    virtual size_t capacity() const = 0;
 
     bool empty() const { return size() == 0; }
 
@@ -99,6 +114,24 @@ public:
 
     virtual void resize(size_t n) = 0;
 
+    // If the column has already overflow, upgrade to one larger Column type,
+    // Return internal error if upgrade failed.
+    // Return null, if the column is not overflow.
+    // Return the new larger column, if upgrade success
+    // Current, only support upgrade BinaryColumn to LargeBinaryColumn
+    virtual StatusOr<ColumnPtr> upgrade_if_overflow() = 0;
+
+    // Downgrade the column from large column to normal column.
+    // Return internal error if downgrade failed.
+    // Return null, if the column is already normal column, no need to downgrade.
+    // Return the new normal column, if downgrade success
+    // Current, only support downgrade LargeBinaryColumn to BinaryColumn
+    virtual StatusOr<ColumnPtr> downgrade() = 0;
+
+    // Check if the column contains large column.
+    // Current, only used to check if it contains LargeBinaryColumn or BinaryColumn
+    virtual bool has_large_column() const = 0;
+
     virtual void resize_uninitialized(size_t n) { resize(n); }
 
     // Assign specified idx element to the column container content,
@@ -117,6 +150,19 @@ public:
 
     virtual void append(const Column& src) { append(src, 0, src.size()); }
 
+    // Update elements to default value which hit by the filter
+    virtual void fill_default(const Filter& filter) = 0;
+
+    // This function will update data from src according to the input indexes. 'indexes' contains
+    // the row index will be update
+    // For example:
+    //      input indexes: [0, 3]
+    //      column data: [0, 1, 2, 3, 4]
+    //      src_column data: [5, 6]
+    // After call this function, column data will be set as [5, 1, 2, 6, 4]
+    // The values in indexes is incremented
+    virtual Status update_rows(const Column& src, const uint32_t* indexes) = 0;
+
     // This function will append data from src according to the input indexes. 'indexes' contains
     // the row index of the src.
     // This function will get row index from indexes and append the data to this column.
@@ -128,6 +174,10 @@ public:
     // This function will copy the [3, 2] row of src to this column.
     virtual void append_selective(const Column& src, const uint32_t* indexes, uint32_t from, uint32_t size) = 0;
 
+    void append_selective(const Column& src, const Buffer<uint32_t>& indexes) {
+        return append_selective(src, indexes.data(), 0, indexes.size());
+    }
+
     // This function will get row through 'from' index from src, and copy size elements to this column.
     virtual void append_value_multiple_times(const Column& src, uint32_t index, uint32_t size) = 0;
 
@@ -137,21 +187,17 @@ public:
 
     // Append multiple strings into this column.
     // Return false if the column is not a binary column.
-    [[nodiscard]] virtual bool append_strings(const std::vector<Slice>& strs) = 0;
+    [[nodiscard]] virtual bool append_strings(const Buffer<Slice>& strs) = 0;
 
     // Like append_strings. To achieve higher performance, this function will read 16 bytes out of
     // bounds. So the caller must make sure that no invalid address access exception occurs for
     // out-of-bounds reads
-    [[nodiscard]] virtual bool append_strings_overflow(const std::vector<Slice>& strs, size_t max_length) {
-        return false;
-    }
+    [[nodiscard]] virtual bool append_strings_overflow(const Buffer<Slice>& strs, size_t max_length) { return false; }
 
     // Like `append_strings` but the corresponding storage of each slice is adjacent to the
     // next one's, the implementation can take advantage of this feature, e.g, copy the whole
     // memory at once.
-    [[nodiscard]] virtual bool append_continuous_strings(const std::vector<Slice>& strs) {
-        return append_strings(strs);
-    }
+    [[nodiscard]] virtual bool append_continuous_strings(const Buffer<Slice>& strs) { return append_strings(strs); }
 
     // Copy |length| bytes from |buff| into this column and cast them as integers.
     // The count of copied integers depends on |length| and the size of column value:
@@ -208,25 +254,17 @@ public:
         return 0;
     };
 
+    // A dedicated serialization method used by NullableColumn to serialize data columns with null_masks.
+    virtual void serialize_batch_with_null_masks(uint8_t* dst, Buffer<uint32_t>& slice_sizes, size_t chunk_size,
+                                                 uint32_t max_one_row_size, uint8_t* null_masks, bool has_null);
+
     // deserialize one data and append to this column
     virtual const uint8_t* deserialize_and_append(const uint8_t* pos) = 0;
 
-    virtual void deserialize_and_append_batch(std::vector<Slice>& srcs, size_t batch_size) = 0;
+    virtual void deserialize_and_append_batch(Buffer<Slice>& srcs, size_t chunk_size) = 0;
 
     // One element serialize_size
     virtual uint32_t serialize_size(size_t idx) const = 0;
-
-    // The serialize bytes size when serialize by directly copy whole column data
-    virtual size_t serialize_size() const = 0;
-
-    // Serialize whole column data to dst
-    // The return value is dst + column serialize_size
-    virtual uint8_t* serialize_column(uint8_t* dst) = 0;
-
-    // Deserialize whole column from the src
-    // The return value is src + column serialize_size
-    // TODO(kks): validate the input src column data
-    virtual const uint8_t* deserialize_column(const uint8_t* src) = 0;
 
     // return new empty column with the same type
     virtual MutablePtr clone_empty() const = 0;
@@ -263,10 +301,16 @@ public:
 
     // Compute fvn hash, mainly used by shuffle column data
     // Note: shuffle hash function should be different from Aggregate and Join Hash map hash function
-    virtual void fvn_hash(uint32_t* seed, uint16_t from, uint16_t to) const = 0;
+    virtual void fnv_hash(uint32_t* seed, uint32_t from, uint32_t to) const = 0;
 
     // used by data loading compute tablet bucket
-    virtual void crc32_hash(uint32_t* seed, uint16_t from, uint16_t to) const = 0;
+    virtual void crc32_hash(uint32_t* seed, uint32_t from, uint32_t to) const = 0;
+
+    virtual void crc32_hash_at(uint32_t* seed, int32_t idx) const { crc32_hash(seed - idx, idx, idx + 1); }
+
+    virtual void fnv_hash_at(uint32_t* seed, int32_t idx) const { fnv_hash(seed - idx, idx, idx + 1); }
+
+    virtual int64_t xor_checksum(uint32_t from, uint32_t to) const = 0;
 
     // Push one row to MysqlRowBuffer
     virtual void put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx) const = 0;
@@ -296,7 +340,6 @@ public:
     //   2.1 object column: element serialize data size.
     //   2.2 other columns: 0.
     virtual size_t memory_usage() const { return container_memory_usage() + element_memory_usage(); }
-    virtual size_t shrink_memory_usage() const = 0;
     virtual size_t container_memory_usage() const = 0;
     virtual size_t element_memory_usage() const { return element_memory_usage(0, size()); }
     virtual size_t element_memory_usage(size_t from, size_t size) const { return 0; }
@@ -305,7 +348,18 @@ public:
 
     virtual void reset_column() { _delete_state = DEL_NOT_SATISFIED; }
 
+    virtual bool capacity_limit_reached(std::string* msg = nullptr) const = 0;
+
+    virtual Status accept(ColumnVisitor* visitor) const = 0;
+
+    virtual Status accept_mutable(ColumnVisitorMutable* visitor) = 0;
+
+    virtual void check_or_die() const = 0;
+
 protected:
+    static StatusOr<ColumnPtr> downgrade_helper_func(ColumnPtr* col);
+    static StatusOr<ColumnPtr> upgrade_helper_func(ColumnPtr* col);
+
     DelCondSatisfied _delete_state = DEL_NOT_SATISFIED;
 };
 
@@ -331,29 +385,37 @@ public:
 
     template <typename... Args>
     static Ptr create(Args&&... args) {
-        return Ptr(new Derived(std::forward<Args>(args)...));
+        return std::make_shared<Derived>(std::forward<Args>(args)...);
     }
 
     template <typename... Args>
     static MutablePtr create_mutable(Args&&... args) {
-        return MutablePtr(new Derived(std::forward<Args>(args)...));
+        return std::make_unique<Derived>(std::forward<Args>(args)...);
     }
 
     template <typename T>
     static Ptr create(std::initializer_list<T>&& arg) {
-        return Ptr(new Derived(std::forward<std::initializer_list<T>>(arg)));
+        return std::make_shared<Derived>(std::forward<std::initializer_list<T>>(arg));
     }
 
     template <typename T>
     static MutablePtr create_mutable(std::initializer_list<T>&& arg) {
-        return MutablePtr(new Derived(std::forward<std::initializer_list<T>>(arg)));
+        return std::make_unique<Derived>(std::forward<std::initializer_list<T>>(arg));
     }
 
-    typename AncestorBaseType::MutablePtr clone() const {
+    typename AncestorBaseType::MutablePtr clone() const override {
         return typename AncestorBase::MutablePtr(new Derived(*derived()));
     }
 
-    typename AncestorBaseType::Ptr clone_shared() const { return typename AncestorBase::Ptr(new Derived(*derived())); }
+    typename AncestorBaseType::Ptr clone_shared() const override {
+        return typename AncestorBase::Ptr(new Derived(*derived()));
+    }
+
+    Status accept(ColumnVisitor* visitor) const override { return visitor->visit(*static_cast<const Derived*>(this)); }
+
+    Status accept_mutable(ColumnVisitorMutable* visitor) override {
+        return visitor->visit(static_cast<Derived*>(this));
+    }
 };
 
 } // namespace vectorized

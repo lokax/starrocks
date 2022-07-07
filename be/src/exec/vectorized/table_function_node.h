@@ -1,8 +1,7 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
-#include "column/column_helper.h"
 #include "column/type_traits.h"
 #include "column/vectorized_fwd.h"
 #include "exec/exec_node.h"
@@ -14,26 +13,27 @@
 namespace starrocks::vectorized {
 class TableFunctionNode final : public ExecNode {
 public:
-    TableFunctionNode(ObjectPool* pool, const TPlanNode& node, const DescriptorTbl& desc);
+    TableFunctionNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& desc);
 
     ~TableFunctionNode() override;
 
-    Status init(const TPlanNode& node, RuntimeState* state) override;
+    Status init(const TPlanNode& tnode, RuntimeState* state) override;
     Status open(RuntimeState* state) override;
     Status prepare(RuntimeState* state) override;
     Status get_next(RuntimeState* state, ChunkPtr* chunk, bool* eos) override;
     Status reset(RuntimeState* state) override;
     Status close(RuntimeState* state) override;
 
-    // Only for compatibility
-    Status get_next(RuntimeState* state, RowBatch* row_batch, bool* eos) override;
-
     Status build_chunk(ChunkPtr* chunk, const std::vector<ColumnPtr>& output_columns);
 
     Status get_next_input_chunk(RuntimeState* state, bool* eos);
 
+    std::vector<std::shared_ptr<pipeline::OperatorFactory>> decompose_to_pipeline(
+            pipeline::PipelineBuilderContext* context) override;
+
 private:
-    const TableFunction* _table_function;
+    const TPlanNode& _tnode;
+    const TableFunction* _table_function = nullptr;
 
     //Slots of output by table function
     std::vector<SlotId> _fn_result_slots;
@@ -42,20 +42,18 @@ private:
     //Slots of table function input parameters
     std::vector<SlotId> _param_slots;
 
-    //Chunk context between multi get_next
-
     //Input chunk currently being processed
-    ChunkPtr _input_chunk_ptr;
+    ChunkPtr _input_chunk_ptr = nullptr;
     //The current chunk is processed to which row
-    int _input_chunk_seek_rows;
+    int _input_chunk_seek_rows = 0;
     //The current outer line needs to be repeated several times
-    int _outer_column_remain_repeat_times;
+    int _outer_column_remain_repeat_times = 0;
     //table function result
     std::pair<Columns, ColumnPtr> _table_function_result;
     //table function return result end ?
-    bool _table_function_result_eos;
+    bool _table_function_result_eos = false;
     //table function param and return offset
-    TableFunctionState* _table_function_state;
+    TableFunctionState* _table_function_state = nullptr;
 
     //Profile
     RuntimeProfile::Counter* _table_function_exec_timer = nullptr;

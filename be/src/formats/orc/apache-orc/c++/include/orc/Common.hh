@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/orc/tree/main/c++/include/orc/Common.hh
-
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
@@ -20,8 +16,7 @@
  * limitations under the License.
  */
 
-#ifndef ORC_COMMON_HH
-#define ORC_COMMON_HH
+#pragma once
 
 #include <string>
 
@@ -70,6 +65,8 @@ enum WriterId {
     UNKNOWN_WRITER = INT32_MAX
 };
 
+std::string writerIdToString(uint32_t id);
+
 enum CompressionKind {
     CompressionKind_NONE = 0,
     CompressionKind_ZLIB = 1,
@@ -93,6 +90,9 @@ enum WriterVersion {
     WriterVersion_HIVE_13083 = 4,
     WriterVersion_ORC_101 = 5,
     WriterVersion_ORC_135 = 6,
+    WriterVersion_ORC_517 = 7,
+    WriterVersion_ORC_203 = 8,
+    WriterVersion_ORC_14 = 9,
     WriterVersion_MAX = INT32_MAX
 };
 
@@ -286,5 +286,3 @@ inline bool operator==(const Decimal& lhs, const Decimal& rhs) {
 }
 
 } // namespace orc
-
-#endif

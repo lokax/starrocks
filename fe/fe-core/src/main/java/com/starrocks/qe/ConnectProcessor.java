@@ -23,24 +23,22 @@ package com.starrocks.qe;
 
 import com.google.common.base.Strings;
 import com.starrocks.analysis.KillStmt;
-import com.starrocks.analysis.SqlParser;
-import com.starrocks.analysis.SqlScanner;
+import com.starrocks.analysis.QueryStmt;
 import com.starrocks.analysis.StatementBase;
 import com.starrocks.analysis.UserIdentity;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Table;
-import com.starrocks.cluster.ClusterNamespace;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.UserException;
 import com.starrocks.common.util.DebugUtil;
-import com.starrocks.common.util.SqlParserUtils;
 import com.starrocks.common.util.UUIDUtil;
 import com.starrocks.metric.MetricRepo;
+import com.starrocks.metric.ResourceGroupMetricMgr;
 import com.starrocks.mysql.MysqlChannel;
 import com.starrocks.mysql.MysqlCommand;
 import com.starrocks.mysql.MysqlPacket;
@@ -49,18 +47,24 @@ import com.starrocks.mysql.MysqlSerializer;
 import com.starrocks.mysql.MysqlServerStatusFlag;
 import com.starrocks.plugin.AuditEvent.EventType;
 import com.starrocks.proto.PQueryStatistics;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.FrontendOptions;
+import com.starrocks.sql.common.SqlDigestBuilder;
+import com.starrocks.sql.parser.ParsingException;
 import com.starrocks.thrift.TMasterOpRequest;
 import com.starrocks.thrift.TMasterOpResult;
 import com.starrocks.thrift.TQueryOptions;
+import org.apache.commons.codec.binary.Hex;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
-import java.io.StringReader;
 import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
 import java.nio.channels.AsynchronousCloseException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.List;
 
 /**
@@ -80,14 +84,13 @@ public class ConnectProcessor {
 
     // COM_INIT_DB: change current database of this session.
     private void handleInitDb() {
-        String dbName = new String(packetBuf.array(), 1, packetBuf.limit() - 1);
+        String identifier = new String(packetBuf.array(), 1, packetBuf.limit() - 1);
         if (Strings.isNullOrEmpty(ctx.getClusterName())) {
             ctx.getState().setError("Please enter cluster");
             return;
         }
-        dbName = ClusterNamespace.getFullName(ctx.getClusterName(), dbName);
         try {
-            ctx.getCatalog().changeDb(ctx, dbName);
+            ctx.getGlobalStateMgr().changeCatalogDb(ctx, identifier);
         } catch (DdlException e) {
             ctx.getState().setError(e.getMessage());
             return;
@@ -130,28 +133,37 @@ public class ConnectProcessor {
         ctx.resetSessionVariable();
     }
 
-    private void auditAfterExec(String origStmt, StatementBase parsedStmt, PQueryStatistics statistics) {
+    public void auditAfterExec(String origStmt, StatementBase parsedStmt, PQueryStatistics statistics) {
         // slow query
         long endTime = System.currentTimeMillis();
         long elapseMs = endTime - ctx.getStartTime();
 
         ctx.getAuditEventBuilder().setEventType(EventType.AFTER_QUERY)
-                .setState(ctx.getState().toString()).setQueryTime(elapseMs)
-                .setScanBytes(statistics == null ? 0 : statistics.scan_bytes)
-                .setScanRows(statistics == null ? 0 : statistics.scan_rows)
+                .setState(ctx.getState().toString()).setErrorCode(ctx.getErrorCode()).setQueryTime(elapseMs)
+                .setScanBytes(statistics == null ? 0 : statistics.scanBytes)
+                .setScanRows(statistics == null ? 0 : statistics.scanRows)
+                .setCpuCostNs(statistics == null || statistics.cpuCostNs == null ? 0 : statistics.cpuCostNs)
+                .setMemCostBytes(statistics == null || statistics.memCostBytes == null ? 0 : statistics.memCostBytes)
                 .setReturnRows(ctx.getReturnRows())
                 .setStmtId(ctx.getStmtId())
                 .setQueryId(ctx.getQueryId() == null ? "NaN" : ctx.getQueryId().toString());
 
         if (ctx.getState().isQuery()) {
             MetricRepo.COUNTER_QUERY_ALL.increase(1L);
+            ResourceGroupMetricMgr.increaseQuery(ctx, 1L);
             if (ctx.getState().getStateType() == QueryState.MysqlStateType.ERR) {
                 // err query
                 MetricRepo.COUNTER_QUERY_ERR.increase(1L);
+                ResourceGroupMetricMgr.increaseQueryErr(ctx, 1L);
             } else {
                 // ok query
                 MetricRepo.COUNTER_QUERY_SUCCESS.increase(1L);
                 MetricRepo.HISTO_QUERY_LATENCY.update(elapseMs);
+                ResourceGroupMetricMgr.updateQueryLatency(ctx, elapseMs);
+                if (elapseMs > Config.qe_slow_log_ms || ctx.getSessionVariable().isEnableSQLDigest()) {
+                    MetricRepo.COUNTER_SLOW_QUERY.increase(1L);
+                    ctx.getAuditEventBuilder().setDigest(computeStatementDigest(parsedStmt));
+                }
             }
             ctx.getAuditEventBuilder().setIsQuery(true);
         } else {
@@ -170,7 +182,24 @@ public class ConnectProcessor {
             ctx.getAuditEventBuilder().setStmt(origStmt.replace("\n", " "));
         }
 
-        Catalog.getCurrentAuditEventProcessor().handleAuditEvent(ctx.getAuditEventBuilder().build());
+        GlobalStateMgr.getCurrentAuditEventProcessor().handleAuditEvent(ctx.getAuditEventBuilder().build());
+    }
+
+    public String computeStatementDigest(StatementBase queryStmt) {
+        String digest;
+        if (queryStmt instanceof QueryStmt) {
+            digest = ((QueryStmt) queryStmt).toDigest();
+        } else {
+            digest = SqlDigestBuilder.build(queryStmt);
+        }
+        try {
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            md.reset();
+            md.update(digest.getBytes());
+            return Hex.encodeHexString(md.digest());
+        } catch (NoSuchAlgorithmException e) {
+            return "";
+        }
     }
 
     private boolean containsComment(String sql) {
@@ -178,6 +207,9 @@ public class ConnectProcessor {
     }
 
     private void addFinishedQueryDetail() {
+        if (!Config.enable_collect_query_detail_info) {
+            return;
+        }
         QueryDetail queryDetail = ctx.getQueryDetail();
         if (queryDetail == null || !queryDetail.getQueryId().equals(DebugUtil.printId(ctx.getQueryId()))) {
             return;
@@ -194,6 +226,7 @@ public class ConnectProcessor {
         }
         queryDetail.setEndTime(endTime);
         queryDetail.setLatency(elapseMs);
+        queryDetail.setWorkGroupName(ctx.getWorkGroup() != null ? ctx.getWorkGroup().getName() : "");
         QueryDetailQueue.addAndRemoveTimeoutQueryDetail(queryDetail);
     }
 
@@ -202,31 +235,31 @@ public class ConnectProcessor {
         MetricRepo.COUNTER_REQUEST_ALL.increase(1L);
         // convert statement to Java string
         String originStmt = null;
-        try {
-            byte[] bytes = packetBuf.array();
-            int ending = packetBuf.limit() - 1;
-            while (ending >= 1 && bytes[ending] == '\0') {
-                ending--;
-            }
-            originStmt = new String(bytes, 1, ending, "UTF-8");
-        } catch (UnsupportedEncodingException e) {
-            // impossible
-            LOG.error("UTF8 is not supported in this environment.");
-            ctx.getState().setError("Unsupported character set(UTF-8)");
-            return;
+        byte[] bytes = packetBuf.array();
+        int ending = packetBuf.limit() - 1;
+        while (ending >= 1 && bytes[ending] == '\0') {
+            ending--;
         }
+        originStmt = new String(bytes, 1, ending, StandardCharsets.UTF_8);
         ctx.getAuditEventBuilder().reset();
         ctx.getAuditEventBuilder()
                 .setTimestamp(System.currentTimeMillis())
                 .setClientIp(ctx.getMysqlChannel().getRemoteHostPortString())
                 .setUser(ctx.getQualifiedUser())
                 .setDb(ctx.getDatabase());
+        ctx.getPlannerProfile().reset();
 
         // execute this query.
         StatementBase parsedStmt = null;
         try {
             ctx.setQueryId(UUIDUtil.genUUID());
-            List<StatementBase> stmts = analyze(originStmt);
+            List<StatementBase> stmts;
+            try {
+                stmts = com.starrocks.sql.parser.SqlParser.parse(originStmt, ctx.getSessionVariable().getSqlMode());
+            } catch (ParsingException parsingException) {
+                throw new AnalysisException(parsingException.getMessage());
+            }
+
             for (int i = 0; i < stmts.size(); ++i) {
                 ctx.getState().reset();
                 if (i > 0) {
@@ -291,45 +324,12 @@ public class ConnectProcessor {
         addFinishedQueryDetail();
     }
 
-    // analyze the origin stmt and return multi-statements
-    private List<StatementBase> analyze(String originStmt) throws AnalysisException {
-        LOG.debug("the originStmts are: {}", originStmt);
-        // Parse statement with parser generated by CUP&FLEX
-        SqlScanner input = new SqlScanner(new StringReader(originStmt), ctx.getSessionVariable().getSqlMode());
-        SqlParser parser = new SqlParser(input);
-        try {
-            return SqlParserUtils.getMultiStmts(parser);
-        } catch (Error e) {
-            throw new AnalysisException("Please check your sql, we meet an error when parsing.", e);
-        } catch (AnalysisException e) {
-            LOG.warn("origin_stmt: " + originStmt + "; Analyze error message: " + parser.getErrorMsg(originStmt), e);
-            String errorMessage = parser.getErrorMsg(originStmt);
-            if (errorMessage == null) {
-                throw e;
-            } else {
-                throw new AnalysisException(errorMessage, e);
-            }
-        } catch (Exception e) {
-            // TODO(lingbin): we catch 'Exception' to prevent unexpected error,
-            // should be removed this try-catch clause future.
-            LOG.warn("origin_stmt: " + originStmt + "; exception: ", e);
-            String errorMessage = e.getMessage();
-            if (errorMessage == null) {
-                throw new AnalysisException("Internal Error");
-            } else {
-                throw new AnalysisException("Internal Error: " + errorMessage);
-            }
-        }
-    }
-
     // Get the column definitions of a table
     private void handleFieldList() throws IOException {
         // Already get command code.
         String tableName = null;
-        String pattern = null;
         try {
             tableName = new String(MysqlProto.readNulTerminateString(packetBuf), "UTF-8");
-            pattern = new String(MysqlProto.readEofString(packetBuf), "UTF-8");
         } catch (UnsupportedEncodingException e) {
             // Impossible!!!
             LOG.error("Unknown UTF-8 character set.");
@@ -339,7 +339,7 @@ public class ConnectProcessor {
             ctx.getState().setError("Empty tableName");
             return;
         }
-        Database db = ctx.getCatalog().getDb(ctx.getDatabase());
+        Database db = ctx.getGlobalStateMgr().getDb(ctx.getDatabase());
         if (db == null) {
             ctx.getState().setError("Unknown database(" + ctx.getDatabase() + ")");
             return;
@@ -381,6 +381,8 @@ public class ConnectProcessor {
         }
         ctx.setCommand(command);
         ctx.setStartTime();
+        ctx.setWorkGroup(null);
+        ctx.setErrorCode("");
 
         switch (command) {
             case COM_INIT_DB:
@@ -485,7 +487,7 @@ public class ConnectProcessor {
     public TMasterOpResult proxyExecute(TMasterOpRequest request) {
         ctx.setDatabase(request.db);
         ctx.setQualifiedUser(request.user);
-        ctx.setCatalog(Catalog.getCurrentCatalog());
+        ctx.setGlobalStateMgr(GlobalStateMgr.getCurrentState());
         ctx.getState().reset();
         if (request.isSetCluster()) {
             ctx.setCluster(request.cluster);
@@ -565,7 +567,7 @@ public class ConnectProcessor {
             TMasterOpResult result = new TMasterOpResult();
             ctx.getState().setError(
                     "Missing current user identity. You need to upgrade this Frontend to the same version as Master Frontend.");
-            result.setMaxJournalId(Catalog.getCurrentCatalog().getMaxJournalId().longValue());
+            result.setMaxJournalId(GlobalStateMgr.getCurrentState().getMaxJournalId());
             result.setPacket(getResultPacket());
             return result;
         }
@@ -589,7 +591,7 @@ public class ConnectProcessor {
         // no matter the master execute success or fail, the master must transfer the result to follower
         // and tell the follower the current jounalID.
         TMasterOpResult result = new TMasterOpResult();
-        result.setMaxJournalId(Catalog.getCurrentCatalog().getMaxJournalId().longValue());
+        result.setMaxJournalId(GlobalStateMgr.getCurrentState().getMaxJournalId());
         // following stmt will not be executed, when current stmt is failed,
         // so only set SERVER_MORE_RESULTS_EXISTS Flag when stmt executed successfully
         if (!ctx.getIsLastStmt()

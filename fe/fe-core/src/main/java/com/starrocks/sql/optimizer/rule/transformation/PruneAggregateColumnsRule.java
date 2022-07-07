@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
@@ -8,6 +8,7 @@ import com.google.common.collect.Maps;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptimizerContext;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
+import com.starrocks.sql.optimizer.operator.AggType;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.logical.LogicalAggregationOperator;
 import com.starrocks.sql.optimizer.operator.pattern.Pattern;
@@ -31,7 +32,7 @@ public class PruneAggregateColumnsRule extends TransformationRule {
 
         ColumnRefSet requiredInputColumns = new ColumnRefSet(aggOperator.getGroupingKeys());
 
-        ColumnRefSet requiredOutputColumns = context.getTaskContext().get(0).getRequiredColumns();
+        ColumnRefSet requiredOutputColumns = context.getTaskContext().getRequiredColumns();
 
         // Agg required input provide the having used columns
         if (aggOperator.getPredicate() != null) {
@@ -75,12 +76,10 @@ public class PruneAggregateColumnsRule extends TransformationRule {
         if (newAggregations.keySet().equals(aggregations.keySet())) {
             return Collections.emptyList();
         }
-
-        LogicalAggregationOperator newAggOperator = new LogicalAggregationOperator(
-                aggOperator.getGroupingKeys(),
-                newAggregations);
-        newAggOperator.setPredicate(aggOperator.getPredicate());
-        newAggOperator.setLimit(aggOperator.getLimit());
+        LogicalAggregationOperator newAggOperator = new LogicalAggregationOperator.Builder().withOperator(aggOperator)
+                .setType(AggType.GLOBAL)
+                .setAggregations(newAggregations)
+                .build();
 
         return Lists.newArrayList(OptExpression.create(newAggOperator, input.getInputs()));
     }

@@ -31,23 +31,29 @@
 #include "gutil/macros.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/mem_tracker.h"
+#include "storage/olap_common.h"
+#include "storage/olap_define.h"
 #include "storage/rowset/rowset_meta.h"
-#include "storage/vectorized/chunk_iterator.h"
+#include "storage/rowset/segment.h"
 
 namespace starrocks {
 
 class DataDir;
 class OlapTuple;
-class RowCursor;
+class PrimaryIndex;
 class Rowset;
 using RowsetSharedPtr = std::shared_ptr<Rowset>;
 class RowsetFactory;
 class RowsetReader;
 class TabletSchema;
+class KVStore;
 
 namespace vectorized {
 class RowsetReadOptions;
 class Schema;
+
+class ChunkIterator;
+using ChunkIteratorPtr = std::shared_ptr<ChunkIterator>;
 } // namespace vectorized
 
 // the rowset state transfer graph:
@@ -69,7 +75,7 @@ enum RowsetState {
 
 class RowsetStateMachine {
 public:
-    RowsetStateMachine() : _rowset_state(ROWSET_UNLOADED) {}
+    RowsetStateMachine() {}
 
     Status on_load() {
         switch (_rowset_state) {
@@ -112,12 +118,22 @@ public:
     RowsetState rowset_state() { return _rowset_state; }
 
 private:
-    RowsetState _rowset_state;
+    RowsetState _rowset_state{ROWSET_UNLOADED};
 };
 
 class Rowset : public std::enable_shared_from_this<Rowset> {
 public:
     virtual ~Rowset() = default;
+
+    Rowset(const TabletSchema* schema, std::string rowset_path, RowsetMetaSharedPtr rowset_meta);
+
+    static std::shared_ptr<Rowset> create(MemTracker* mem_tracker, const TabletSchema* schema, std::string rowset_path,
+                                          RowsetMetaSharedPtr rowset_meta) {
+        auto rowset = std::shared_ptr<Rowset>(new Rowset(schema, std::move(rowset_path), std::move(rowset_meta)),
+                                              DeleterWithMemTracker<Rowset>(mem_tracker));
+        mem_tracker->consume(rowset->mem_usage());
+        return rowset;
+    }
 
     // Open all segment files in this rowset and load necessary metadata.
     //
@@ -125,35 +141,51 @@ public:
     // Derived class implements the load logic by overriding the `do_load_once()` method.
     Status load();
 
+    // reload this rowset after the underlying segment file is changed
+    Status reload();
+
     const TabletSchema& schema() const { return *_schema; }
+    void set_schema(const TabletSchema* schema) { _schema = schema; }
 
-    // returns OLAP_ERR_ROWSET_CREATE_READER when failed to create reader
-    virtual OLAPStatus create_reader(std::shared_ptr<RowsetReader>* result) = 0;
-
-    virtual StatusOr<vectorized::ChunkIteratorPtr> new_iterator(const vectorized::Schema& schema,
-                                                                const vectorized::RowsetReadOptions& options) = 0;
+    StatusOr<vectorized::ChunkIteratorPtr> new_iterator(const vectorized::Schema& schema,
+                                                        const vectorized::RowsetReadOptions& options);
 
     // For each segment in this rowset, create a `ChunkIterator` for it and *APPEND* it into
     // |segment_iterators|. If segments in this rowset has no overlapping, a single `UnionIterator`,
     // instead of multiple `ChunkIterator`s, will be created and appended into |segment_iterators|.
-    virtual Status get_segment_iterators(const vectorized::Schema& schema, const vectorized::RowsetReadOptions& options,
-                                         std::vector<vectorized::ChunkIteratorPtr>* seg_iterators) = 0;
+    Status get_segment_iterators(const vectorized::Schema& schema, const vectorized::RowsetReadOptions& options,
+                                 std::vector<vectorized::ChunkIteratorPtr>* seg_iterators);
 
-    // Split range denoted by `start_key` and `end_key` into sub-ranges, each contains roughly
-    // `request_block_row_count` rows. Sub-range is represented by pair of OlapTuples and added to `ranges`.
-    //
-    // e.g., if the function generates 2 sub-ranges, the result `ranges` should contain 4 tuple: t1, t2, t2, t3.
-    // Note that the end tuple of sub-range i is the same as the start tuple of sub-range i+1.
-    //
-    // The first/last tuple must be start_key/end_key.to_tuple(). If we can't divide the input range,
-    // the result `ranges` should be [start_key.to_tuple(), end_key.to_tuple()]
-    virtual OLAPStatus split_range(const RowCursor& start_key, const RowCursor& end_key,
-                                   uint64_t request_block_row_count, std::vector<OlapTuple>* ranges) = 0;
+    // estimate the number of compaction segment iterator
+    StatusOr<int64_t> estimate_compaction_segment_iterator_num();
 
     const RowsetMetaSharedPtr& rowset_meta() const { return _rowset_meta; }
 
+    std::vector<SegmentSharedPtr>& segments() { return _segments; }
+
+    // only used for updatable tablets' rowset
+    // simply get iterators to iterate all rows without complex options like predicates
+    // |schema| read schema
+    // |meta| olap meta, used for get delvec, if null do not fetch&use delvec
+    // |version| read version, use for get delvec
+    // |stats| used for iterator read stats
+    // return iterator list, an iterator for each segment,
+    // if the segment is empty, put an empty pointer in list
+    // caller is also responsible to call rowset's acquire/release
+    StatusOr<std::vector<vectorized::ChunkIteratorPtr>> get_segment_iterators2(const vectorized::Schema& schema,
+                                                                               KVStore* meta, int64_t version,
+                                                                               OlapReaderStatistics* stats);
+
+    int64_t mem_usage() const {
+        int64_t size = sizeof(Rowset);
+        if (_rowset_meta != nullptr) {
+            size += _rowset_meta->mem_usage();
+        }
+        return size;
+    }
+
     // publish rowset to make it visible to read
-    void make_visible(Version version, VersionHash version_hash);
+    void make_visible(Version version);
 
     // like make_visible but updatable tablet has different mechanism
     // NOTE: only used for updatable tablet's rowset
@@ -162,7 +194,6 @@ public:
     // helper class to access RowsetMeta
     int64_t start_version() const { return rowset_meta()->version().first; }
     int64_t end_version() const { return rowset_meta()->version().second; }
-    VersionHash version_hash() const { return rowset_meta()->version_hash(); }
     size_t index_disk_size() const { return rowset_meta()->index_disk_size(); }
     size_t data_disk_size() const { return rowset_meta()->total_disk_size(); }
     bool empty() const { return rowset_meta()->empty(); }
@@ -179,10 +210,11 @@ public:
     bool delete_flag() const { return rowset_meta()->delete_flag(); }
     int64_t num_segments() const { return rowset_meta()->num_segments(); }
     uint32_t num_delete_files() const { return rowset_meta()->get_num_delete_files(); }
+    bool has_data_files() const { return num_segments() > 0 || num_delete_files() > 0; }
 
     // remove all files in this rowset
     // TODO should we rename the method to remove_files() to be more specific?
-    virtual OLAPStatus remove() = 0;
+    Status remove();
 
     // close to clear the resource owned by rowset
     // including: open files, indexes and so on
@@ -215,13 +247,19 @@ public:
     }
 
     // hard link all files in this rowset to `dir` to form a new rowset with id `new_rowset_id`.
-    virtual Status link_files_to(const std::string& dir, RowsetId new_rowset_id) = 0;
+    Status link_files_to(const std::string& dir, RowsetId new_rowset_id);
 
     // copy all files to `dir`
-    virtual OLAPStatus copy_files_to(const std::string& dir) = 0;
+    Status copy_files_to(const std::string& dir);
+
+    static std::string segment_file_path(const std::string& segment_dir, const RowsetId& rowset_id, int segment_id);
+    static std::string segment_temp_file_path(const std::string& dir, const RowsetId& rowset_id, int segment_id);
+    static std::string segment_del_file_path(const std::string& segment_dir, const RowsetId& rowset_id, int segment_id);
+    static std::string segment_srcrssid_file_path(const std::string& segment_dir, const RowsetId& rowset_id,
+                                                  int segment_id);
 
     // return whether `path` is one of the files in this rowset
-    virtual bool check_path(const std::string& path) = 0;
+    bool check_path(const std::string& path);
 
     // return an unique identifier string for this rowset
     std::string unique_id() const { return _rowset_path + "/" + rowset_id().to_string(); }
@@ -244,7 +282,7 @@ public:
     void release() {
         // if the refs by reader is 0 and the rowset is closed, should release the resouce
         uint64_t current_refs = --_refs_by_reader;
-        if (current_refs == 0 && _rowset_state_machine.rowset_state() == ROWSET_UNLOADING) {
+        if (current_refs == 0) {
             {
                 std::lock_guard<std::mutex> release_lock(_lock);
                 // rejudge _refs_by_reader because we do not add lock in create reader
@@ -262,27 +300,47 @@ public:
         }
     }
 
+    static StatusOr<size_t> get_segment_num(const std::vector<RowsetSharedPtr>& rowsets) {
+        size_t num_segments = 0;
+        for (int i = 0; i < rowsets.size(); i++) {
+            auto iterator_num_res = rowsets[i]->estimate_compaction_segment_iterator_num();
+            if (!iterator_num_res.ok()) {
+                return iterator_num_res.status();
+            }
+            num_segments += iterator_num_res.value();
+        }
+        return num_segments;
+    }
+
+    static void acquire_readers(const std::vector<RowsetSharedPtr>& rowsets) {
+        std::for_each(rowsets.begin(), rowsets.end(), [](const RowsetSharedPtr& rowset) { rowset->acquire(); });
+    }
+
+    static void release_readers(const std::vector<RowsetSharedPtr>& rowsets) {
+        std::for_each(rowsets.begin(), rowsets.end(), [](const RowsetSharedPtr& rowset) { rowset->release(); });
+    }
+
+    static void close_rowsets(const std::vector<RowsetSharedPtr>& rowsets) {
+        std::for_each(rowsets.begin(), rowsets.end(), [](const RowsetSharedPtr& rowset) { rowset->close(); });
+    }
+
 protected:
     friend class RowsetFactory;
 
-    DISALLOW_COPY_AND_ASSIGN(Rowset);
-    // this is non-public because all clients should use RowsetFactory to obtain pointer to initialized Rowset
-    Rowset(MemTracker* mem_tracker, const TabletSchema* schema, std::string rowset_path,
-           RowsetMetaSharedPtr rowset_meta);
+    Rowset(const Rowset&) = delete;
+    const Rowset& operator=(const Rowset&) = delete;
 
     // this is non-public because all clients should use RowsetFactory to obtain pointer to initialized Rowset
-    virtual OLAPStatus init() = 0;
+    Status init();
 
     // The actual implementation of load(). Guaranteed by to called exactly once.
-    virtual Status do_load() = 0;
+    Status do_load();
 
     // release resources in this api
-    virtual void do_close() = 0;
+    void do_close();
 
     // allow subclass to add custom logic when rowset is being published
-    virtual void make_visible_extra(Version version, VersionHash version_hash) {}
-
-    std::unique_ptr<MemTracker> _mem_tracker = nullptr;
+    virtual void make_visible_extra(Version version) {}
 
     const TabletSchema* _schema;
     std::string _rowset_path;
@@ -293,8 +351,10 @@ protected:
     bool _need_delete_file = false;
     // variable to indicate how many rowset readers owned this rowset
     std::atomic<uint64_t> _refs_by_reader;
-    // rowset state machine
     RowsetStateMachine _rowset_state_machine;
+
+private:
+    std::vector<SegmentSharedPtr> _segments;
 };
 
 class RowsetReleaseGuard {

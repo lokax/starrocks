@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.external.hive;
 
@@ -196,7 +196,8 @@ public class HiveMetaClientTest {
 
         HiveMetaClient client = new HiveMetaClient("thrift://127.0.0.1:9030");
         Map<String, HiveColumnStats> stats =
-                client.getTableLevelColumnStatsForPartTable("db", "tbl", partitionKeys, partColumns, allColumnNames);
+                client.getTableLevelColumnStatsForPartTable("db", "tbl", partitionKeys, partColumns, allColumnNames,
+                        false);
         HiveColumnStats partitionStats = stats.get("col1");
         Assert.assertEquals(partitionStats.getNumNulls(), 4L);
         Assert.assertEquals(partitionStats.getNumDistinctValues(), 3L);

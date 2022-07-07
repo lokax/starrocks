@@ -19,77 +19,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_QUERY_EXEC_OLAP_UTILS_H
-#define STARROCKS_BE_SRC_QUERY_EXEC_OLAP_UTILS_H
+#pragma once
 
-#include <math.h>
+#include <cmath>
 
+#include "column/type_traits.h"
 #include "common/logging.h"
+#include "gen_cpp/Exprs_types.h"
 #include "gen_cpp/Opcodes_types.h"
 #include "runtime/datetime_value.h"
 #include "runtime/primitive_type.h"
+#include "runtime/primitive_type_infra.h"
 #include "storage/tuple.h"
 
 namespace starrocks {
-
-typedef bool (*CompareLargeFunc)(const void*, const void*);
-
-template <class T>
-inline bool compare_large(const void* lhs, const void* rhs) {
-    return *reinterpret_cast<const T*>(lhs) > *reinterpret_cast<const T*>(rhs);
-}
-
-inline CompareLargeFunc get_compare_func(PrimitiveType type) {
-    switch (type) {
-    case TYPE_BOOLEAN:
-        return compare_large<bool>;
-
-    case TYPE_TINYINT:
-        return compare_large<int8_t>;
-
-    case TYPE_SMALLINT:
-        return compare_large<int16_t>;
-
-    case TYPE_INT:
-        return compare_large<int32_t>;
-
-    case TYPE_BIGINT:
-        return compare_large<int64_t>;
-
-    case TYPE_LARGEINT:
-        return compare_large<__int128>;
-
-    case TYPE_FLOAT:
-        return compare_large<float>;
-
-    case TYPE_DOUBLE:
-        return compare_large<double>;
-
-    case TYPE_DATE:
-    case TYPE_DATETIME:
-        return compare_large<DateTimeValue>;
-
-    case TYPE_DECIMAL:
-        return compare_large<DecimalValue>;
-
-    case TYPE_DECIMALV2:
-        return compare_large<DecimalV2Value>;
-
-    case TYPE_CHAR:
-    case TYPE_VARCHAR:
-        return compare_large<StringValue>;
-
-    default:
-        CHECK(false) << "Unsupport Compare type";
-    }
-}
 
 static const char* NEGATIVE_INFINITY = "-oo";
 static const char* POSITIVE_INFINITY = "+oo";
 
 typedef struct OlapScanRange {
 public:
-    OlapScanRange() : begin_include(true), end_include(true) {
+    OlapScanRange() {
         begin_scan_range.add_value(NEGATIVE_INFINITY);
         end_scan_range.add_value(POSITIVE_INFINITY);
     }
@@ -97,8 +47,8 @@ public:
                   const std::vector<std::string>& end_range)
             : begin_include(begin), end_include(end), begin_scan_range(begin_range), end_scan_range(end_range) {}
 
-    bool begin_include;
-    bool end_include;
+    bool begin_include{true};
+    bool end_include{true};
     OlapTuple begin_scan_range;
     OlapTuple end_scan_range;
 } OlapScanRange;
@@ -114,7 +64,7 @@ static const char base64_pad = '=';
 inline size_t base64_encode(const char* data, size_t length, char* encoded_data) {
     size_t output_length = (size_t)(4.0 * ceil((double)length / 3.0));
 
-    if (encoded_data == NULL) {
+    if (encoded_data == nullptr) {
         return 0;
     }
 
@@ -207,6 +157,9 @@ inline SQLFilterOp to_olap_filter_type(TExprOpcode::type type, bool opposite) {
     case TExprOpcode::NE:
         return opposite ? FILTER_IN : FILTER_NOT_IN;
 
+    case TExprOpcode::EQ_FOR_NULL:
+        return FILTER_IN;
+
     default:
         VLOG(1) << "TExprOpcode: " << type;
         DCHECK(false);
@@ -216,5 +169,3 @@ inline SQLFilterOp to_olap_filter_type(TExprOpcode::type type, bool opposite) {
 }
 
 } // namespace starrocks
-
-#endif

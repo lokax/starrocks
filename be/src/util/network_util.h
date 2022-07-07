@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_COMMON_UTIL_NETWORK_UTIL_H
-#define STARROCKS_BE_SRC_COMMON_UTIL_NETWORK_UTIL_H
+#pragma once
 
 #include <vector>
 
@@ -46,6 +45,10 @@ private:
 // is returned, addresses may still be of zero length.
 Status hostname_to_ip_addrs(const std::string& name, std::vector<std::string>* addresses);
 
+bool is_valid_ip(const std::string& ip);
+
+std::string hostname_to_ip(const std::string& host);
+
 // Finds the first non-localhost IP address in the given list. Returns
 // true if such an address was found, false otherwise.
 bool find_first_non_localhost(const std::vector<std::string>& addresses, std::string* addr);
@@ -62,5 +65,3 @@ TNetworkAddress make_network_address(const std::string& hostname, int port);
 Status get_inet_interfaces(std::vector<std::string>* interfaces, bool include_ipv6 = false);
 
 } // namespace starrocks
-
-#endif

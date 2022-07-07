@@ -35,7 +35,7 @@ import com.starrocks.common.DdlException;
  * It just a intermediate variable between semantic analysis and final handler.
  */
 public class MVColumnItem {
-    private String name;
+    private final String name;
     // the origin type of slot ref
     private Type type;
     private boolean isKey;
@@ -43,7 +43,7 @@ public class MVColumnItem {
     private boolean isAllowNull;
     private boolean isAggregationTypeImplicit;
     private Expr defineExpr;
-    private String baseColumnName;
+    private final String baseColumnName;
 
     public MVColumnItem(String name, Type type, AggregateType aggregateType, boolean isAllowNull,
                         boolean isAggregationTypeImplicit, Expr defineExpr, String baseColumnName) {
@@ -116,7 +116,7 @@ public class MVColumnItem {
         if (baseColumn == null) {
             Preconditions.checkNotNull(defineExpr);
             Column result = new Column(name, type, isKey, aggregationType, isAllowNull,
-                    ColumnDef.DefaultValue.ZERO, "");
+                    ColumnDef.DefaultValueDef.EMPTY_VALUE, "");
             result.setDefineExpr(defineExpr);
             return result;
         } else {

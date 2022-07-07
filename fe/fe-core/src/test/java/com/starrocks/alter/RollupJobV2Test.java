@@ -27,21 +27,18 @@ import com.starrocks.analysis.AccessTestUtil;
 import com.starrocks.analysis.AddRollupClause;
 import com.starrocks.analysis.AlterClause;
 import com.starrocks.analysis.Analyzer;
+import com.starrocks.analysis.ColumnDef;
 import com.starrocks.analysis.CreateMaterializedViewStmt;
-import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionCallExpr;
-import com.starrocks.analysis.FunctionName;
-import com.starrocks.analysis.MVColumnItem;
-import com.starrocks.analysis.SlotRef;
-import com.starrocks.analysis.TableName;
+import com.starrocks.analysis.StringLiteral;
 import com.starrocks.catalog.AggregateType;
-import com.starrocks.catalog.Catalog;
-import com.starrocks.catalog.CatalogTestUtil;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
-import com.starrocks.catalog.FakeCatalog;
 import com.starrocks.catalog.FakeEditLog;
+import com.starrocks.catalog.FakeGlobalStateMgr;
+import com.starrocks.catalog.GlobalStateMgrTestUtil;
 import com.starrocks.catalog.KeysType;
+import com.starrocks.catalog.LocalTablet;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
 import com.starrocks.catalog.OlapTable;
@@ -58,16 +55,15 @@ import com.starrocks.common.UserException;
 import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.meta.MetaContext;
 import com.starrocks.qe.OriginStatement;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.task.AgentTask;
 import com.starrocks.task.AgentTaskQueue;
 import com.starrocks.thrift.TStorageFormat;
 import com.starrocks.thrift.TTaskType;
 import com.starrocks.transaction.FakeTransactionIDGenerator;
 import com.starrocks.transaction.GlobalTransactionMgr;
-import mockit.Expectations;
 import mockit.Mock;
 import mockit.MockUp;
-import mockit.Mocked;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -92,51 +88,49 @@ public class RollupJobV2Test {
     private static FakeTransactionIDGenerator fakeTransactionIDGenerator;
     private static GlobalTransactionMgr masterTransMgr;
     private static GlobalTransactionMgr slaveTransMgr;
-    private static Catalog masterCatalog;
-    private static Catalog slaveCatalog;
+    private static GlobalStateMgr masterGlobalStateMgr;
+    private static GlobalStateMgr slaveGlobalStateMgr;
 
     private static String transactionSource = "localfe";
     private static Analyzer analyzer;
     private static AddRollupClause clause;
     private static AddRollupClause clause2;
 
-    private FakeCatalog fakeCatalog;
+    private FakeGlobalStateMgr fakeGlobalStateMgr;
     private FakeEditLog fakeEditLog;
 
     @Before
     public void setUp() throws InstantiationException, IllegalAccessException, IllegalArgumentException,
             InvocationTargetException, NoSuchMethodException, SecurityException, AnalysisException {
-        fakeCatalog = new FakeCatalog();
+        fakeGlobalStateMgr = new FakeGlobalStateMgr();
         fakeEditLog = new FakeEditLog();
         fakeTransactionIDGenerator = new FakeTransactionIDGenerator();
-        masterCatalog = CatalogTestUtil.createTestCatalog();
-        slaveCatalog = CatalogTestUtil.createTestCatalog();
+        masterGlobalStateMgr = GlobalStateMgrTestUtil.createTestState();
+        slaveGlobalStateMgr = GlobalStateMgrTestUtil.createTestState();
         MetaContext metaContext = new MetaContext();
         metaContext.setMetaVersion(FeMetaVersion.VERSION_61);
         metaContext.setThreadLocalInfo();
-        // masterCatalog.setJournalVersion(FeMetaVersion.VERSION_40);
-        // slaveCatalog.setJournalVersion(FeMetaVersion.VERSION_40);
-        masterTransMgr = masterCatalog.getGlobalTransactionMgr();
-        masterTransMgr.setEditLog(masterCatalog.getEditLog());
+        masterTransMgr = masterGlobalStateMgr.getGlobalTransactionMgr();
+        masterTransMgr.setEditLog(masterGlobalStateMgr.getEditLog());
 
-        slaveTransMgr = slaveCatalog.getGlobalTransactionMgr();
-        slaveTransMgr.setEditLog(slaveCatalog.getEditLog());
+        slaveTransMgr = slaveGlobalStateMgr.getGlobalTransactionMgr();
+        slaveTransMgr.setEditLog(slaveGlobalStateMgr.getEditLog());
         analyzer = AccessTestUtil.fetchAdminAnalyzer(false);
-        clause = new AddRollupClause(CatalogTestUtil.testRollupIndex2, Lists.newArrayList("k1", "v"), null,
-                CatalogTestUtil.testIndex1, null);
+        clause = new AddRollupClause(GlobalStateMgrTestUtil.testRollupIndex2, Lists.newArrayList("k1", "v"), null,
+                GlobalStateMgrTestUtil.testIndex1, null);
         clause.analyze(analyzer);
 
-        clause2 = new AddRollupClause(CatalogTestUtil.testRollupIndex3, Lists.newArrayList("k1", "v"), null,
-                CatalogTestUtil.testIndex1, null);
+        clause2 = new AddRollupClause(GlobalStateMgrTestUtil.testRollupIndex3, Lists.newArrayList("k1", "v"), null,
+                GlobalStateMgrTestUtil.testIndex1, null);
         clause2.analyze(analyzer);
 
         FeConstants.runningUnitTest = true;
         AgentTaskQueue.clearAllTasks();
 
-        new MockUp<Catalog>() {
+        new MockUp<GlobalStateMgr>() {
             @Mock
-            public Catalog getCurrentCatalog() {
-                return masterCatalog;
+            public GlobalStateMgr getCurrentState() {
+                return masterGlobalStateMgr;
             }
         };
     }
@@ -149,37 +143,37 @@ public class RollupJobV2Test {
 
     @Test
     public void testRunRollupJobConcurrentLimit() throws UserException {
-        fakeCatalog = new FakeCatalog();
+        fakeGlobalStateMgr = new FakeGlobalStateMgr();
         fakeEditLog = new FakeEditLog();
-        FakeCatalog.setCatalog(masterCatalog);
-        MaterializedViewHandler materializedViewHandler = Catalog.getCurrentCatalog().getRollupHandler();
+        FakeGlobalStateMgr.setGlobalStateMgr(masterGlobalStateMgr);
+        MaterializedViewHandler materializedViewHandler = GlobalStateMgr.getCurrentState().getRollupHandler();
         ArrayList<AlterClause> alterClauses = new ArrayList<>();
         alterClauses.add(clause);
         alterClauses.add(clause2);
-        Database db = masterCatalog.getDb(CatalogTestUtil.testDbId1);
-        OlapTable olapTable = (OlapTable) db.getTable(CatalogTestUtil.testTableId1);
-        materializedViewHandler.process(alterClauses, db.getClusterName(), db, olapTable);
+        Database db = masterGlobalStateMgr.getDb(GlobalStateMgrTestUtil.testDbId1);
+        OlapTable olapTable = (OlapTable) db.getTable(GlobalStateMgrTestUtil.testTableId1);
+        materializedViewHandler.process(alterClauses, db, olapTable);
         Map<Long, AlterJobV2> alterJobsV2 = materializedViewHandler.getAlterJobsV2();
 
         materializedViewHandler.runAfterCatalogReady();
 
         Assert.assertEquals(Config.max_running_rollup_job_num_per_table,
-                materializedViewHandler.getTableRunningJobMap().get(CatalogTestUtil.testTableId1).size());
+                materializedViewHandler.getTableRunningJobMap().get(GlobalStateMgrTestUtil.testTableId1).size());
         Assert.assertEquals(2, alterJobsV2.size());
         Assert.assertEquals(OlapTableState.ROLLUP, olapTable.getState());
     }
 
     @Test
     public void testAddSchemaChange() throws UserException {
-        fakeCatalog = new FakeCatalog();
+        fakeGlobalStateMgr = new FakeGlobalStateMgr();
         fakeEditLog = new FakeEditLog();
-        FakeCatalog.setCatalog(masterCatalog);
-        MaterializedViewHandler materializedViewHandler = Catalog.getCurrentCatalog().getRollupHandler();
+        FakeGlobalStateMgr.setGlobalStateMgr(masterGlobalStateMgr);
+        MaterializedViewHandler materializedViewHandler = GlobalStateMgr.getCurrentState().getRollupHandler();
         ArrayList<AlterClause> alterClauses = new ArrayList<>();
         alterClauses.add(clause);
-        Database db = masterCatalog.getDb(CatalogTestUtil.testDbId1);
-        OlapTable olapTable = (OlapTable) db.getTable(CatalogTestUtil.testTableId1);
-        materializedViewHandler.process(alterClauses, db.getClusterName(), db, olapTable);
+        Database db = masterGlobalStateMgr.getDb(GlobalStateMgrTestUtil.testDbId1);
+        OlapTable olapTable = (OlapTable) db.getTable(GlobalStateMgrTestUtil.testTableId1);
+        materializedViewHandler.process(alterClauses, db, olapTable);
         Map<Long, AlterJobV2> alterJobsV2 = materializedViewHandler.getAlterJobsV2();
         Assert.assertEquals(1, alterJobsV2.size());
         Assert.assertEquals(OlapTableState.ROLLUP, olapTable.getState());
@@ -188,18 +182,18 @@ public class RollupJobV2Test {
     // start a schema change, then finished
     @Test
     public void testSchemaChange1() throws Exception {
-        fakeCatalog = new FakeCatalog();
+        fakeGlobalStateMgr = new FakeGlobalStateMgr();
         fakeEditLog = new FakeEditLog();
-        FakeCatalog.setCatalog(masterCatalog);
-        MaterializedViewHandler materializedViewHandler = Catalog.getCurrentCatalog().getRollupHandler();
+        FakeGlobalStateMgr.setGlobalStateMgr(masterGlobalStateMgr);
+        MaterializedViewHandler materializedViewHandler = GlobalStateMgr.getCurrentState().getRollupHandler();
 
         // add a rollup job
         ArrayList<AlterClause> alterClauses = new ArrayList<>();
         alterClauses.add(clause);
-        Database db = masterCatalog.getDb(CatalogTestUtil.testDbId1);
-        OlapTable olapTable = (OlapTable) db.getTable(CatalogTestUtil.testTableId1);
-        Partition testPartition = olapTable.getPartition(CatalogTestUtil.testPartitionId1);
-        materializedViewHandler.process(alterClauses, db.getClusterName(), db, olapTable);
+        Database db = masterGlobalStateMgr.getDb(GlobalStateMgrTestUtil.testDbId1);
+        OlapTable olapTable = (OlapTable) db.getTable(GlobalStateMgrTestUtil.testTableId1);
+        Partition testPartition = olapTable.getPartition(GlobalStateMgrTestUtil.testPartitionId1);
+        materializedViewHandler.process(alterClauses, db, olapTable);
         Map<Long, AlterJobV2> alterJobsV2 = materializedViewHandler.getAlterJobsV2();
         Assert.assertEquals(1, alterJobsV2.size());
         RollupJobV2 rollupJob = (RollupJobV2) alterJobsV2.values().stream().findAny().get();
@@ -227,83 +221,31 @@ public class RollupJobV2Test {
         }
         MaterializedIndex shadowIndex = testPartition.getMaterializedIndices(IndexExtState.SHADOW).get(0);
         for (Tablet shadowTablet : shadowIndex.getTablets()) {
-            for (Replica shadowReplica : shadowTablet.getReplicas()) {
-                shadowReplica.updateVersionInfo(testPartition.getVisibleVersion(),
-                        testPartition.getVisibleVersionHash(), shadowReplica.getDataSize(),
+            for (Replica shadowReplica : ((LocalTablet) shadowTablet).getReplicas()) {
+                shadowReplica.updateRowCount(testPartition.getVisibleVersion(),
+                        shadowReplica.getDataSize(),
                         shadowReplica.getRowCount());
             }
         }
 
         materializedViewHandler.runAfterCatalogReady();
         Assert.assertEquals(JobState.FINISHED, rollupJob.getJobState());
-
-        /*
-        Assert.assertEquals(CatalogTestUtil.testIndexId1, rollupJob.getBaseIndexId());
-        Assert.assertEquals(CatalogTestUtil.testRollupIndex2, rollupJob.getRollupIndexName());
-        MaterializedIndex rollupIndex = rollupJob.getRollupIndex(CatalogTestUtil.testPartitionId1);
-        MaterializedIndex baseIndex = testPartition.getBaseIndex();
-        assertEquals(IndexState.ROLLUP, rollupIndex.getState());
-        assertEquals(IndexState.NORMAL, baseIndex.getState());
-        assertEquals(OlapTableState.ROLLUP, olapTable.getState());
-        assertEquals(PartitionState.ROLLUP, testPartition.getState());
-        Tablet rollupTablet = rollupIndex.getTablets().get(0);
-        List<Replica> replicas = rollupTablet.getReplicas();
-        Replica rollupReplica1 = replicas.get(0);
-        Replica rollupReplica2 = replicas.get(1);
-        Replica rollupReplica3 = replicas.get(2);
-        
-        assertEquals(-1, rollupReplica1.getVersion());
-        assertEquals(-1, rollupReplica2.getVersion());
-        assertEquals(-1, rollupReplica3.getVersion());
-        assertEquals(CatalogTestUtil.testStartVersion, rollupReplica1.getLastFailedVersion());
-        assertEquals(CatalogTestUtil.testStartVersion, rollupReplica2.getLastFailedVersion());
-        assertEquals(CatalogTestUtil.testStartVersion, rollupReplica3.getLastFailedVersion());
-        assertEquals(-1, rollupReplica1.getLastSuccessVersion());
-        assertEquals(-1, rollupReplica2.getLastSuccessVersion());
-        assertEquals(-1, rollupReplica3.getLastSuccessVersion());
-        
-        // rollup handler run one cycle, agent task is generated and send tasks
-        rollupHandler.runOneCycle();
-        AgentTask task1 = AgentTaskQueue.getTask(rollupReplica1.getBackendId(), TTaskType.ROLLUP, rollupTablet.getId());
-        AgentTask task2 = AgentTaskQueue.getTask(rollupReplica2.getBackendId(), TTaskType.ROLLUP, rollupTablet.getId());
-        AgentTask task3 = AgentTaskQueue.getTask(rollupReplica3.getBackendId(), TTaskType.ROLLUP, rollupTablet.getId());
-        
-        // be report finishe rollup success
-        TTabletInfo tTabletInfo = new TTabletInfo(rollupTablet.getId(), CatalogTestUtil.testSchemaHash1,
-                CatalogTestUtil.testStartVersion, CatalogTestUtil.testStartVersionHash, 0, 0);
-        rollupHandler.handleFinishedReplica(task1, tTabletInfo, -1);
-        rollupHandler.handleFinishedReplica(task2, tTabletInfo, -1);
-        rollupHandler.handleFinishedReplica(task3, tTabletInfo, -1);
-        
-        // rollup hander run one cycle again, the rollup job is finishing
-        rollupHandler.runOneCycle();
-        Assert.assertEquals(JobState.FINISHING, rollupJob.getState());
-        assertEquals(CatalogTestUtil.testStartVersion, rollupReplica1.getVersion());
-        assertEquals(CatalogTestUtil.testStartVersion, rollupReplica2.getVersion());
-        assertEquals(CatalogTestUtil.testStartVersion, rollupReplica3.getVersion());
-        assertEquals(-1, rollupReplica1.getLastFailedVersion());
-        assertEquals(-1, rollupReplica2.getLastFailedVersion());
-        assertEquals(-1, rollupReplica3.getLastFailedVersion());
-        assertEquals(CatalogTestUtil.testStartVersion, rollupReplica1.getLastSuccessVersion());
-        assertEquals(CatalogTestUtil.testStartVersion, rollupReplica1.getLastSuccessVersion());
-        assertEquals(CatalogTestUtil.testStartVersion, rollupReplica1.getLastSuccessVersion());
-        */
     }
 
     @Test
     public void testSchemaChangeWhileTabletNotStable() throws Exception {
-        fakeCatalog = new FakeCatalog();
+        fakeGlobalStateMgr = new FakeGlobalStateMgr();
         fakeEditLog = new FakeEditLog();
-        FakeCatalog.setCatalog(masterCatalog);
-        MaterializedViewHandler materializedViewHandler = Catalog.getCurrentCatalog().getRollupHandler();
+        FakeGlobalStateMgr.setGlobalStateMgr(masterGlobalStateMgr);
+        MaterializedViewHandler materializedViewHandler = GlobalStateMgr.getCurrentState().getRollupHandler();
 
         // add a rollup job
         ArrayList<AlterClause> alterClauses = new ArrayList<>();
         alterClauses.add(clause);
-        Database db = masterCatalog.getDb(CatalogTestUtil.testDbId1);
-        OlapTable olapTable = (OlapTable) db.getTable(CatalogTestUtil.testTableId1);
-        Partition testPartition = olapTable.getPartition(CatalogTestUtil.testPartitionId1);
-        materializedViewHandler.process(alterClauses, db.getClusterName(), db, olapTable);
+        Database db = masterGlobalStateMgr.getDb(GlobalStateMgrTestUtil.testDbId1);
+        OlapTable olapTable = (OlapTable) db.getTable(GlobalStateMgrTestUtil.testTableId1);
+        Partition testPartition = olapTable.getPartition(GlobalStateMgrTestUtil.testPartitionId1);
+        materializedViewHandler.process(alterClauses, db, olapTable);
         Map<Long, AlterJobV2> alterJobsV2 = materializedViewHandler.getAlterJobsV2();
         Assert.assertEquals(1, alterJobsV2.size());
         RollupJobV2 rollupJob = (RollupJobV2) alterJobsV2.values().stream().findAny().get();
@@ -313,21 +255,21 @@ public class RollupJobV2Test {
         assertEquals(Partition.PartitionState.NORMAL, testPartition.getState());
         assertEquals(OlapTableState.ROLLUP, olapTable.getState());
 
-        Tablet baseTablet = baseIndex.getTablets().get(0);
+        LocalTablet baseTablet = (LocalTablet) baseIndex.getTablets().get(0);
         List<Replica> replicas = baseTablet.getReplicas();
         Replica replica1 = replicas.get(0);
         Replica replica2 = replicas.get(1);
         Replica replica3 = replicas.get(2);
 
-        assertEquals(CatalogTestUtil.testStartVersion, replica1.getVersion());
-        assertEquals(CatalogTestUtil.testStartVersion, replica2.getVersion());
-        assertEquals(CatalogTestUtil.testStartVersion, replica3.getVersion());
+        assertEquals(GlobalStateMgrTestUtil.testStartVersion, replica1.getVersion());
+        assertEquals(GlobalStateMgrTestUtil.testStartVersion, replica2.getVersion());
+        assertEquals(GlobalStateMgrTestUtil.testStartVersion, replica3.getVersion());
         assertEquals(-1, replica1.getLastFailedVersion());
         assertEquals(-1, replica2.getLastFailedVersion());
         assertEquals(-1, replica3.getLastFailedVersion());
-        assertEquals(CatalogTestUtil.testStartVersion, replica1.getLastSuccessVersion());
-        assertEquals(CatalogTestUtil.testStartVersion, replica2.getLastSuccessVersion());
-        assertEquals(CatalogTestUtil.testStartVersion, replica3.getLastSuccessVersion());
+        assertEquals(GlobalStateMgrTestUtil.testStartVersion, replica1.getLastSuccessVersion());
+        assertEquals(GlobalStateMgrTestUtil.testStartVersion, replica2.getLastSuccessVersion());
+        assertEquals(GlobalStateMgrTestUtil.testStartVersion, replica3.getLastSuccessVersion());
 
         // runPendingJob
         replica1.setState(Replica.ReplicaState.DECOMMISSION);
@@ -358,9 +300,9 @@ public class RollupJobV2Test {
         }
         MaterializedIndex shadowIndex = testPartition.getMaterializedIndices(IndexExtState.SHADOW).get(0);
         for (Tablet shadowTablet : shadowIndex.getTablets()) {
-            for (Replica shadowReplica : shadowTablet.getReplicas()) {
-                shadowReplica.updateVersionInfo(testPartition.getVisibleVersion(),
-                        testPartition.getVisibleVersionHash(), shadowReplica.getDataSize(),
+            for (Replica shadowReplica : ((LocalTablet) shadowTablet).getReplicas()) {
+                shadowReplica.updateRowCount(testPartition.getVisibleVersion(),
+                        shadowReplica.getDataSize(),
                         shadowReplica.getRowCount());
             }
         }
@@ -370,7 +312,7 @@ public class RollupJobV2Test {
     }
 
     @Test
-    public void testSerializeOfRollupJob(@Mocked CreateMaterializedViewStmt stmt) throws IOException,
+    public void testSerializeOfRollupJob() throws IOException,
             AnalysisException {
         Config.enable_materialized_view = true;
         // prepare file
@@ -380,8 +322,9 @@ public class RollupJobV2Test {
 
         short keysCount = 1;
         List<Column> columns = Lists.newArrayList();
-        String mvColumnName = CreateMaterializedViewStmt.MATERIALIZED_VIEW_NAME_PREFIX + "to_bitmap_" + "c1";
-        Column column = new Column(mvColumnName, Type.BITMAP, false, AggregateType.BITMAP_UNION, false, "1", "");
+        String mvColumnName = CreateMaterializedViewStmt.MATERIALIZED_VIEW_NAME_PREFIX + "bitmap_union_" + "c1";
+        Column column = new Column(mvColumnName, Type.BITMAP, false, AggregateType.BITMAP_UNION, false,
+                new ColumnDef.DefaultValueDef(true, new StringLiteral("1")), "");
         columns.add(column);
         RollupJobV2 rollupJobV2 = new RollupJobV2(1, 1, 1, "test", 1, 1, 1, "test", "rollup", columns, 1, 1,
                 KeysType.AGG_KEYS, keysCount,
@@ -393,20 +336,6 @@ public class RollupJobV2Test {
         rollupJobV2.write(out);
         out.flush();
         out.close();
-
-        List<Expr> params = Lists.newArrayList();
-        SlotRef param1 = new SlotRef(new TableName(null, "test"), "c1");
-        params.add(param1);
-        MVColumnItem mvColumnItem = new MVColumnItem(mvColumnName, Type.BITMAP);
-        mvColumnItem.setDefineExpr(new FunctionCallExpr(new FunctionName("to_bitmap"), params));
-        List<MVColumnItem> mvColumnItemList = Lists.newArrayList();
-        mvColumnItemList.add(mvColumnItem);
-        new Expectations() {
-            {
-                stmt.getMVColumnItemList();
-                result = mvColumnItemList;
-            }
-        };
 
         // read objects from file
         MetaContext metaContext = new MetaContext();

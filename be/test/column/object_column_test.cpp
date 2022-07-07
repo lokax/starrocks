@@ -1,29 +1,16 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/test/column/object_column_test.cpp
-
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "column/object_column.h"
 
 #include <gtest/gtest.h>
 
+#include "column/column_helper.h"
 #include "column/const_column.h"
+#include "exprs/vectorized/percentile_functions.h"
+#include "runtime/types.h"
+#include "types/hll.h"
+#include "util/percentile_value.h"
+#include "util/phmap/phmap.h"
 
 namespace starrocks::vectorized {
 
@@ -31,7 +18,7 @@ namespace starrocks::vectorized {
 TEST(ObjectColumnTest, HLL_test_filter) {
     // keep all.
     {
-        auto c = HyperLogLogColumn::create();
+        auto c = ColumnHelper::create_column(TypeDescriptor::create_hll_type(), false);
         c->resize(100);
         ASSERT_EQ(100, c->size());
 
@@ -143,6 +130,27 @@ TEST(ObjectColumnTest, HLL_test_filter_range) {
 }
 
 // NOLINTNEXTLINE
+TEST(ObjectColumnTest, test_object_column_upgrade_if_overflow) {
+    auto c = HyperLogLogColumn::create();
+    c->append(HyperLogLog());
+
+    auto ret = c->upgrade_if_overflow();
+    ASSERT_TRUE(ret.ok());
+    ASSERT_TRUE(ret.value() == nullptr);
+}
+
+// NOLINTNEXTLINE
+TEST(ObjectColumnTest, test_object_column_downgrade) {
+    auto c = HyperLogLogColumn::create();
+    c->append(HyperLogLog());
+
+    auto ret = c->downgrade();
+    ASSERT_TRUE(ret.ok());
+    ASSERT_TRUE(ret.value() == nullptr);
+    ASSERT_FALSE(c->has_large_column());
+}
+
+// NOLINTNEXTLINE
 TEST(ObjectColumnTest, HLL_test_reset_column) {
     auto c = HyperLogLogColumn::create();
 
@@ -184,6 +192,41 @@ TEST(ObjectColumnTest, HLL_test_swap_column) {
     ASSERT_EQ(1, c2->get_data().size());
     ASSERT_EQ(3, c1->size());
     ASSERT_EQ(3, c1->get_data().size());
+}
+
+TEST(ObjectColumnTest, Percentile_test_swap_column) {
+    Columns columns;
+    FunctionContext* ctx = FunctionContext::create_test_context();
+    auto s = DoubleColumn::create();
+    s->append(1);
+    s->append(2);
+    s->append(3);
+    columns.push_back(s);
+
+    auto column = PercentileFunctions::percentile_hash(ctx, columns);
+    ASSERT_TRUE(column->is_object());
+
+    auto percentile = ColumnHelper::cast_to<TYPE_PERCENTILE>(column);
+    ASSERT_EQ(1, percentile->get_object(0)->quantile(1));
+    ASSERT_EQ(2, percentile->get_object(1)->quantile(1));
+    ASSERT_EQ(3, percentile->get_object(2)->quantile(1));
+
+    auto s1 = DoubleColumn::create();
+    s1->append(4);
+    columns.clear();
+    columns.push_back(s1);
+    auto column1 = PercentileFunctions::percentile_hash(ctx, columns);
+    ASSERT_TRUE(column1->is_object());
+
+    std::vector<uint32_t> idx = {1};
+    ASSERT_TRUE(column->update_rows(*column1.get(), idx.data()).ok());
+
+    percentile = ColumnHelper::cast_to<TYPE_PERCENTILE>(column);
+    ASSERT_EQ(1, percentile->get_object(0)->quantile(1));
+    ASSERT_EQ(4, percentile->get_object(1)->quantile(1));
+    ASSERT_EQ(3, percentile->get_object(2)->quantile(1));
+
+    delete ctx;
 }
 
 } // namespace starrocks::vectorized

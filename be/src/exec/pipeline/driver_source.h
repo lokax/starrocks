@@ -1,11 +1,11 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
 #include <memory>
 #include <vector>
 
-#include "exec/pipeline/morsel.h"
+#include "exec/pipeline/scan/morsel.h"
 
 namespace starrocks {
 namespace pipeline {

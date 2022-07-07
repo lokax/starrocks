@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_QUERY_RUNTIME_DECIMAL_VALUE_H
-#define STARROCKS_BE_SRC_QUERY_RUNTIME_DECIMAL_VALUE_H
+#pragma once
 
 #include <cctype>
 #include <climits>
@@ -33,7 +32,6 @@
 #include "common/compiler_util.h"
 #include "common/logging.h"
 #include "gutil/strings/numbers.h"
-#include "udf/udf.h"
 #include "util/hash_util.hpp"
 #include "util/mysql_global.h"
 
@@ -291,8 +289,8 @@ public:
            << "_sign: " << _sign << "; "
            << "_buffer_length: " << _buffer_length << "; ";
         ss << "_buffer: [";
-        for (int i = 0; i < DIG_PER_DEC1; ++i) {
-            ss << _buffer[i] << ", ";
+        for (int i : _buffer) {
+            ss << i << ", ";
         }
         ss << "]; ";
         return ss.str();
@@ -303,8 +301,8 @@ public:
         value._sign = true;
         value._int_length = DECIMAL_MAX_POSSIBLE_PRECISION;
         value._frac_length = 0;
-        for (int i = 0; i < DIG_PER_DEC1; ++i) {
-            value._buffer[i] = DIG_BASE - 1;
+        for (int& i : value._buffer) {
+            i = DIG_BASE - 1;
         }
         return value;
     }
@@ -314,34 +312,10 @@ public:
         value._sign = false;
         value._int_length = DECIMAL_MAX_POSSIBLE_PRECISION;
         value._frac_length = 0;
-        for (int i = 0; i < DIG_PER_DEC1; ++i) {
-            value._buffer[i] = DIG_BASE - 1;
+        for (int& i : value._buffer) {
+            i = DIG_BASE - 1;
         }
         return value;
-    }
-
-    static DecimalValue from_decimal_val(const starrocks_udf::DecimalVal& val) {
-        DecimalValue result;
-        result._int_length = val.int_len;
-        result._frac_length = val.frac_len;
-        result._sign = val.sign;
-
-        result._buffer_length = DECIMAL_BUFF_LENGTH;
-
-        DIAGNOSTIC_PUSH
-        DIAGNOSTIC_IGNORE("-Warray-bounds")
-        DIAGNOSTIC_IGNORE("-Wstringop-overflow=")
-        memcpy(result._buffer, val.buffer, sizeof(int32_t) * DECIMAL_BUFF_LENGTH);
-        DIAGNOSTIC_POP
-
-        return result;
-    }
-
-    void to_decimal_val(starrocks_udf::DecimalVal* value) const {
-        value->int_len = _int_length;
-        value->frac_len = _frac_length;
-        value->sign = _sign;
-        memcpy(value->buffer, _buffer, sizeof(int32_t) * DECIMAL_BUFF_LENGTH);
     }
 
     // set DecimalValue to zero
@@ -537,5 +511,3 @@ struct hash<starrocks::DecimalValue> {
     size_t operator()(const starrocks::DecimalValue& v) const { return starrocks::hash_value(v); }
 };
 } // namespace std
-
-#endif // STARROCKS_BE_SRC_QUERY_RUNTIME_DECIMAL_VALUE_H

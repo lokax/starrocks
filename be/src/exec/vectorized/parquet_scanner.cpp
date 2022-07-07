@@ -1,20 +1,15 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 #include "exec/vectorized/parquet_scanner.h"
 
-#include <env/env_broker.h>
-#include <exec/broker_reader.h>
-#include <exprs/vectorized/cast_expr.h>
-#include <exprs/vectorized/column_ref.h>
-
+#include "column/chunk.h"
 #include "column/column_helper.h"
-#include "env/env_util.h"
-#include "exec/parquet_reader.h"
-#include "exec/text_converter.h"
+#include "exprs/vectorized/cast_expr.h"
+#include "exprs/vectorized/column_ref.h"
+#include "fs/fs_broker.h"
 #include "runtime/exec_env.h"
-#include "runtime/mem_tracker.h"
+#include "runtime/runtime_state.h"
 #include "runtime/stream_load/load_stream_mgr.h"
 #include "runtime/stream_load/stream_load_pipe.h"
-#include "runtime/tuple.h"
 #include "simd/simd.h"
 
 namespace starrocks::vectorized {
@@ -26,16 +21,14 @@ ParquetScanner::ParquetScanner(RuntimeState* state, RuntimeProfile* profile, con
           _next_file(0),
           _curr_file_reader(nullptr),
           _scanner_eof(false),
-          _max_chunk_size(config::vector_chunk_size ? config::vector_chunk_size : 4096),
+          _max_chunk_size(state->chunk_size() ? state->chunk_size() : 4096),
           _batch_start_idx(0),
           _chunk_start_idx(0) {
     _chunk_filter.reserve(_max_chunk_size);
     _conv_ctx.state = state;
 }
 
-ParquetScanner::~ParquetScanner() {
-    close();
-}
+ParquetScanner::~ParquetScanner() = default;
 
 Status ParquetScanner::open() {
     RETURN_IF_ERROR(FileScanner::open());
@@ -63,6 +56,7 @@ Status ParquetScanner::open() {
 }
 
 Status ParquetScanner::initialize_src_chunk(ChunkPtr* chunk) {
+    SCOPED_RAW_TIMER(&_counter->init_chunk_ns);
     _pool.clear();
     (*chunk) = std::make_shared<Chunk>();
     size_t column_pos = 0;
@@ -82,6 +76,7 @@ Status ParquetScanner::initialize_src_chunk(ChunkPtr* chunk) {
 }
 
 Status ParquetScanner::append_batch_to_src_chunk(ChunkPtr* chunk) {
+    SCOPED_RAW_TIMER(&_counter->fill_ns);
     size_t num_elements =
             std::min<size_t>((_max_chunk_size - _chunk_start_idx), (_batch->num_rows() - _batch_start_idx));
     size_t column_pos = 0;
@@ -114,22 +109,25 @@ Status ParquetScanner::finalize_src_chunk(ChunkPtr* chunk) {
     auto num_rows = (*chunk)->filter(_chunk_filter);
     _counter->num_rows_filtered += _chunk_start_idx - num_rows;
     ChunkPtr cast_chunk = std::make_shared<Chunk>();
-    for (auto i = 0; i < _num_of_columns_from_file; ++i) {
-        SlotDescriptor* slot_desc = _src_slot_descriptors[i];
-        if (slot_desc == nullptr) {
-            continue;
-        }
+    {
+        SCOPED_RAW_TIMER(&_counter->cast_chunk_ns);
+        for (auto i = 0; i < _num_of_columns_from_file; ++i) {
+            SlotDescriptor* slot_desc = _src_slot_descriptors[i];
+            if (slot_desc == nullptr) {
+                continue;
+            }
 
-        auto column = _cast_exprs[i]->evaluate(nullptr, (*chunk).get());
-        column = ColumnHelper::unfold_const_column(slot_desc->type(), (*chunk)->num_rows(), column);
-        cast_chunk->append_column(column, slot_desc->id());
+            auto column = _cast_exprs[i]->evaluate(nullptr, (*chunk).get());
+            column = ColumnHelper::unfold_const_column(slot_desc->type(), (*chunk)->num_rows(), column);
+            cast_chunk->append_column(column, slot_desc->id());
+        }
+        auto range = _scan_range.ranges.at(_next_file - 1);
+        if (range.__isset.num_of_columns_from_file) {
+            fill_columns_from_path(cast_chunk, range.num_of_columns_from_file, range.columns_from_path,
+                                   cast_chunk->num_rows());
+        }
     }
-    auto range = _scan_range.ranges.at(_next_file - 1);
-    if (range.__isset.num_of_columns_from_file) {
-        fill_columns_from_path(cast_chunk, range.num_of_columns_from_file, range.columns_from_path,
-                               cast_chunk->num_rows());
-    }
-    auto dest_chunk = materialize(*chunk, cast_chunk);
+    ASSIGN_OR_RETURN(auto dest_chunk, materialize(*chunk, cast_chunk));
     *chunk = dest_chunk;
     _chunk_start_idx = 0;
     return Status::OK();
@@ -190,8 +188,7 @@ Status ParquetScanner::new_column(const arrow::DataType* arrow_type, const SlotD
         auto precision = discrete_type->precision();
         auto scale = discrete_type->scale();
         if (precision < 1 || precision > decimal_precision_limit<int128_t> || scale < 0 || scale > precision) {
-            return Status::InternalError(
-                    strings::Substitute("Illegal decimal type Decimal128($0, $1):", precision, scale));
+            return Status::InternalError(strings::Substitute("Decimal($0, $1) is out of range.", precision, scale));
         }
         strict_type_desc->precision = precision;
         strict_type_desc->scale = scale;
@@ -209,7 +206,8 @@ Status ParquetScanner::new_column(const arrow::DataType* arrow_type, const SlotD
     case TYPE_DECIMAL32:
     case TYPE_DECIMAL64: {
         return Status::InternalError(
-                strings::Substitute("Illegal strict type corresponding to arrow type($0)", arrow_type->name()));
+                strings::Substitute("Apache Arrow type($0) does not match the type($1) in StarRocks",
+                                    arrow_type->name(), type_to_string(strict_pt)));
     }
     default:
         break;
@@ -226,7 +224,7 @@ Status ParquetScanner::new_column(const arrow::DataType* arrow_type, const SlotD
 }
 
 Status ParquetScanner::convert_array_to_column(ConvertFunc conv_func, size_t num_elements, const arrow::Array* array,
-                                               const TypeDescriptor* type_desc, ColumnPtr column) {
+                                               const TypeDescriptor* type_desc, const ColumnPtr& column) {
     uint8_t* null_data;
     Column* data_column;
     if (column->is_nullable()) {
@@ -252,8 +250,15 @@ Status ParquetScanner::convert_array_to_column(ConvertFunc conv_func, size_t num
         return illegal_converting_error(array->type()->name(), type_desc->debug_string());
     } else {
         auto* filter_data = (&_chunk_filter.front()) + _chunk_start_idx;
-        return conv_func(array, _batch_start_idx, num_elements, data_column, _chunk_start_idx, null_data, filter_data,
-                         &_conv_ctx);
+        auto st = conv_func(array, _batch_start_idx, num_elements, data_column, _chunk_start_idx, null_data,
+                            filter_data, &_conv_ctx);
+        if (st.ok()) {
+            // in some scene such as string length exceeds limit, the column will be set NULL, so we need reset has_null
+            if (column->is_nullable()) {
+                down_cast<NullableColumn*>(column.get())->update_has_null();
+            }
+        }
+        return st;
     }
 }
 
@@ -265,6 +270,7 @@ bool ParquetScanner::batch_is_exhausted() {
 }
 
 StatusOr<ChunkPtr> ParquetScanner::get_next() {
+    SCOPED_RAW_TIMER(&_counter->total_ns);
     ChunkPtr chunk;
     if (batch_is_exhausted()) {
         while (true) {
@@ -315,6 +321,7 @@ StatusOr<ChunkPtr> ParquetScanner::get_next() {
 }
 
 Status ParquetScanner::next_batch() {
+    SCOPED_RAW_TIMER(&_counter->read_batch_ns);
     _batch_start_idx = 0;
     if (_curr_file_reader == nullptr) {
         RETURN_IF_ERROR(open_next_reader());
@@ -341,12 +348,13 @@ Status ParquetScanner::open_next_reader() {
         Status st = create_random_access_file(range_desc, _scan_range.broker_addresses[0], _scan_range.params,
                                               CompressionTypePB::NO_COMPRESSION, &file);
         if (!st.ok()) {
-            LOG(WARNING) << "Failed to create random-access files: " << st.to_string();
+            LOG(WARNING) << "Failed to create random-access files. status: " << st.to_string();
             return st;
         }
-        _conv_ctx.current_file = file->file_name();
+        _conv_ctx.current_file = file->filename();
         auto parquet_file = std::make_shared<ParquetChunkFile>(file, 0);
-        auto parquet_reader = std::make_shared<ParquetReaderWrap>(std::move(parquet_file), _num_of_columns_from_file);
+        auto parquet_reader = std::make_shared<ParquetReaderWrap>(std::move(parquet_file), _num_of_columns_from_file,
+                                                                  range_desc.start_offset, range_desc.size);
         _next_file++;
         int64_t file_size;
         RETURN_IF_ERROR(parquet_reader->size(&file_size));
@@ -362,6 +370,7 @@ Status ParquetScanner::open_next_reader() {
 }
 
 void ParquetScanner::close() {
+    FileScanner::close();
     _curr_file_reader.reset();
     _pool.clear();
 }

@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exec/pipeline/exchange/local_exchange_sink_operator.h"
 
@@ -7,8 +7,8 @@
 
 namespace starrocks::pipeline {
 Status LocalExchangeSinkOperator::prepare(RuntimeState* state) {
+    RETURN_IF_ERROR(Operator::prepare(state));
     _exchanger->increment_sink_number();
-    Operator::prepare(state);
     return Status::OK();
 }
 
@@ -20,14 +20,14 @@ StatusOr<vectorized::ChunkPtr> LocalExchangeSinkOperator::pull_chunk(RuntimeStat
     return Status::InternalError("Shouldn't call pull_chunk from local exchange sink.");
 }
 
-void LocalExchangeSinkOperator::finish(RuntimeState* state) {
+Status LocalExchangeSinkOperator::set_finishing(RuntimeState* state) {
     _is_finished = true;
     _exchanger->finish(state);
+    return Status::OK();
 }
 
 Status LocalExchangeSinkOperator::push_chunk(RuntimeState* state, const vectorized::ChunkPtr& chunk) {
-    _exchanger->accept(std::move(chunk));
-    return Status::OK();
+    return _exchanger->accept(chunk, _driver_sequence);
 }
 
 } // namespace starrocks::pipeline

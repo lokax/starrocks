@@ -26,9 +26,15 @@
 
 #include "util/coding.h"
 #define private public
-#include "util/bitmap_value.h"
+#include "column/vectorized_fwd.h"
+#include "exprs/vectorized/bitmap_functions.h"
+#include "types/bitmap_value.h"
+#include "types/bitmap_value_detail.h"
+#include "udf/udf.h"
+#include "util/phmap/phmap.h"
 
 namespace starrocks {
+namespace vectorized {
 
 TEST(BitmapValueTest, bitmap_union) {
     BitmapValue empty;
@@ -137,6 +143,13 @@ std::string convert_bitmap_to_string(BitmapValue& bitmap) {
 }
 
 TEST(BitmapValueTest, bitmap_serde) {
+    bool use_v1 = config::bitmap_serialize_version == 1;
+    BitmapTypeCode::type type_bitmap32 = BitmapTypeCode::BITMAP32_SERIV2;
+    BitmapTypeCode::type type_bitmap64 = BitmapTypeCode::BITMAP64_SERIV2;
+    if (use_v1) {
+        type_bitmap32 = BitmapTypeCode::BITMAP32;
+        type_bitmap64 = BitmapTypeCode::BITMAP64;
+    }
     { // EMPTY
         BitmapValue empty;
         std::string buffer = convert_bitmap_to_string(empty);
@@ -165,9 +178,9 @@ TEST(BitmapValueTest, bitmap_serde) {
         Roaring roaring;
         roaring.add(0);
         roaring.add(UINT32_MAX);
-        std::string expect_buffer(1, BitmapTypeCode::BITMAP32);
-        expect_buffer.resize(1 + roaring.getSizeInBytes());
-        roaring.write(&expect_buffer[1]);
+        std::string expect_buffer(1, type_bitmap32);
+        expect_buffer.resize(1 + roaring.getSizeInBytes(use_v1));
+        roaring.write(&expect_buffer[1], use_v1);
         ASSERT_EQ(expect_buffer, buffer);
 
         BitmapValue out(buffer.data());
@@ -193,13 +206,13 @@ TEST(BitmapValueTest, bitmap_serde) {
 
         Roaring roaring;
         roaring.add(0);
-        std::string expect_buffer(1, BitmapTypeCode::BITMAP64);
+        std::string expect_buffer(1, type_bitmap64);
         put_varint64(&expect_buffer, 2); // map size
         for (uint32_t i = 0; i < 2; ++i) {
             std::string map_entry;
             put_fixed32_le(&map_entry, i); // map key
-            map_entry.resize(sizeof(uint32_t) + roaring.getSizeInBytes());
-            roaring.write(&map_entry[4]); // map value
+            map_entry.resize(sizeof(uint32_t) + roaring.getSizeInBytes(use_v1));
+            roaring.write(&map_entry[4], use_v1); // map value
 
             expect_buffer.append(map_entry);
         }
@@ -229,9 +242,9 @@ TEST(BitmapValueTest, Roaring64Map) {
     }
     ASSERT_TRUE(r1.contains((uint64_t)14000000000000000500ull));
     ASSERT_EQ(1800, r1.cardinality());
-    size_t size_before = r1.getSizeInBytes();
+    size_t size_before = r1.getSizeInBytes(config::bitmap_serialize_version);
     r1.runOptimize();
-    size_t size_after = r1.getSizeInBytes();
+    size_t size_after = r1.getSizeInBytes(config::bitmap_serialize_version);
     ASSERT_LT(size_after, size_before);
 
     Roaring64Map r2 = Roaring64Map::bitmapOf(5, 1ull, 2ull, 234294967296ull, 195839473298ull, 14000000000000000100ull);
@@ -273,9 +286,9 @@ TEST(BitmapValueTest, Roaring64Map) {
     ASSERT_EQ(1, i1_2.cardinality());
 
     // we can write a bitmap to a pointer and recover it later
-    uint32_t expectedsize = r1.getSizeInBytes();
+    uint32_t expectedsize = r1.getSizeInBytes(config::bitmap_serialize_version);
     char* serializedbytes = new char[expectedsize];
-    r1.write(serializedbytes);
+    r1.write(serializedbytes, config::bitmap_serialize_version);
     Roaring64Map t = Roaring64Map::read(serializedbytes);
     ASSERT_TRUE(r1 == t);
     delete[] serializedbytes;
@@ -321,9 +334,78 @@ TEST(BitmapValueTest, bitmap_single_convert) {
     ASSERT_EQ(BitmapValue::SINGLE, bitmap._type);
 
     bitmap_u.add(2);
-    ASSERT_EQ(BitmapValue::BITMAP, bitmap_u._type);
+    ASSERT_EQ(BitmapValue::SET, bitmap_u._type);
 
     bitmap |= bitmap_u;
-    ASSERT_EQ(BitmapValue::BITMAP, bitmap._type);
+    ASSERT_EQ(BitmapValue::SET, bitmap._type);
 }
+
+TEST(BitmapValueTest, bitmap_max) {
+    std::unique_ptr<FunctionContext> ctx_ptr;
+    FunctionContext* ctx;
+    ctx_ptr.reset(FunctionContext::create_test_context());
+    ctx = ctx_ptr.get();
+
+    BitmapValue bitmap;
+    Columns columns;
+    auto s = BitmapColumn::create();
+    s->append(&bitmap);
+    columns.push_back(s);
+    auto column = BitmapFunctions::bitmap_max(ctx, columns);
+    ASSERT_TRUE(column->is_null(0));
+
+    bitmap.add(0);
+    ASSERT_EQ(bitmap.max(), 0);
+    bitmap.add(1);
+    ASSERT_EQ(bitmap.max(), 1);
+    bitmap.add(std::numeric_limits<uint64_t>::max());
+    ASSERT_EQ(bitmap.max(), std::numeric_limits<uint64_t>::max());
+    bitmap.add(std::numeric_limits<uint64_t>::lowest());
+    ASSERT_EQ(bitmap.max(), std::numeric_limits<uint64_t>::max());
+}
+
+TEST(BitmapValueTest, bitmap_min) {
+    std::unique_ptr<FunctionContext> ctx_ptr;
+    FunctionContext* ctx;
+    ctx_ptr.reset(FunctionContext::create_test_context());
+    ctx = ctx_ptr.get();
+
+    BitmapValue bitmap;
+    Columns columns;
+    auto s = BitmapColumn::create();
+    s->append(&bitmap);
+    columns.push_back(s);
+    auto column = BitmapFunctions::bitmap_min(ctx, columns);
+    ASSERT_TRUE(column->is_null(0));
+
+    bitmap.add(std::numeric_limits<uint64_t>::max());
+    ASSERT_EQ(bitmap.min(), std::numeric_limits<uint64_t>::max());
+    bitmap.add(1);
+    ASSERT_EQ(bitmap.min(), 1);
+    bitmap.add(5);
+    ASSERT_EQ(bitmap.min(), 1);
+    bitmap.add(0);
+    ASSERT_EQ(bitmap.min(), 0);
+}
+
+TEST(BitmapValueTest, bitmap_xor) {
+    // {3} ^ {1,2} = {1,2,3}
+    {
+        BitmapValue bm1;
+        bm1.add(3);
+        BitmapValue bm2;
+        bm2.add(1);
+        bm2.add(2);
+
+        bm1 ^= bm2;
+        ASSERT_EQ(3, bm1.cardinality());
+        ASSERT_EQ(3, bm1.max());
+        ASSERT_EQ(1, bm1.min());
+
+        // and b2 should not be changed
+        ASSERT_EQ(2, bm2.cardinality());
+    }
+}
+
+} // namespace vectorized
 } // namespace starrocks

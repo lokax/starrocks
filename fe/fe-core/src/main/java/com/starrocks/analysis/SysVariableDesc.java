@@ -21,15 +21,8 @@
 
 package com.starrocks.analysis;
 
-import com.google.common.base.Strings;
-import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.common.DdlException;
-import com.starrocks.common.ErrorReport;
-import com.starrocks.qe.SessionVariable;
-import com.starrocks.qe.SqlModeHelper;
-import com.starrocks.qe.VariableMgr;
-import com.starrocks.sql.analyzer.ExprVisitor;
+import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.thrift.TBoolLiteral;
 import com.starrocks.thrift.TExprNode;
 import com.starrocks.thrift.TExprNodeType;
@@ -37,11 +30,13 @@ import com.starrocks.thrift.TFloatLiteral;
 import com.starrocks.thrift.TIntLiteral;
 import com.starrocks.thrift.TStringLiteral;
 
+import java.util.Objects;
+
 // System variable
 // Converted to StringLiteral in analyze, if this variable is not exist, throw AnalysisException.
 public class SysVariableDesc extends Expr {
-    private String name;
-    private SetType setType;
+    private final String name;
+    private final SetType setType;
     private boolean boolValue;
     private long intValue;
     private double floatValue;
@@ -73,15 +68,6 @@ public class SysVariableDesc extends Expr {
 
     @Override
     public void analyzeImpl(Analyzer analyzer) throws AnalysisException {
-        VariableMgr.fillValue(analyzer.getContext().getSessionVariable(), this);
-        if (!Strings.isNullOrEmpty(name) && name.equalsIgnoreCase(SessionVariable.SQL_MODE)) {
-            setType(Type.VARCHAR);
-            try {
-                setStringValue(SqlModeHelper.decode(intValue));
-            } catch (DdlException e) {
-                ErrorReport.reportAnalysisException(e.getMessage());
-            }
-        }
     }
 
     public String getName() {
@@ -164,28 +150,33 @@ public class SysVariableDesc extends Expr {
         return toSql();
     }
 
-    public Expr getResultValue() throws AnalysisException {
-        switch (type.getPrimitiveType()) {
-            case BOOLEAN:
-                return new BoolLiteral(this.boolValue);
-            case TINYINT:
-            case SMALLINT:
-            case INT:
-            case BIGINT:
-                return new IntLiteral(this.intValue);
-            case FLOAT:
-            case DOUBLE:
-                return new FloatLiteral(this.floatValue);
-            default:
-                return new StringLiteral(this.strValue);
-        }
-    }
-
     /**
      * Below function is added by new analyzer
      */
     @Override
-    public <R, C> R accept(ExprVisitor<R, C> visitor, C context) {
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
         return visitor.visitSysVariableDesc(this, context);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        if (!super.equals(o)) {
+            return false;
+        }
+        SysVariableDesc that = (SysVariableDesc) o;
+        return boolValue == that.boolValue && intValue == that.intValue &&
+                Double.compare(that.floatValue, floatValue) == 0 && Objects.equals(name, that.name) &&
+                setType == that.setType && Objects.equals(strValue, that.strValue);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(super.hashCode(), name, setType, boolValue, intValue, floatValue, strValue);
     }
 }

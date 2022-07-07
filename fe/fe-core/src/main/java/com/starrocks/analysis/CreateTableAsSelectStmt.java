@@ -21,12 +21,11 @@
 
 package com.starrocks.analysis;
 
-import com.starrocks.catalog.Table;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
-import com.starrocks.common.ErrorCode;
-import com.starrocks.common.ErrorReport;
-import com.starrocks.common.UserException;
+import com.starrocks.qe.ConnectContext;
+import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.ast.QueryStatement;
 
 import java.util.List;
 
@@ -39,57 +38,48 @@ import java.util.List;
 public class CreateTableAsSelectStmt extends StatementBase {
     private final CreateTableStmt createTableStmt;
     private final List<String> columnNames;
-    private final QueryStmt queryStmt;
+    private final QueryStatement queryStatement;
     private final InsertStmt insertStmt;
 
+    // This constructor is meaningless,
+    // but currently cannot be deleted because CUP generates a code that calls this function.
     public CreateTableAsSelectStmt(CreateTableStmt createTableStmt,
                                    List<String> columnNames,
                                    QueryStmt queryStmt) {
         this.createTableStmt = createTableStmt;
         this.columnNames = columnNames;
-        this.queryStmt = queryStmt;
-        this.insertStmt = new InsertStmt(createTableStmt.getDbTbl(), queryStmt);
+        this.queryStatement = null;
+        this.insertStmt = null;
+    }
+
+    public CreateTableAsSelectStmt(CreateTableStmt createTableStmt,
+                                   List<String> columnNames,
+                                   QueryStatement queryStatement) {
+        this.createTableStmt = createTableStmt;
+        this.columnNames = columnNames;
+        this.queryStatement = queryStatement;
+        this.insertStmt = new InsertStmt(createTableStmt.getDbTbl(), queryStatement);
     }
 
     @Override
-    public void analyze(Analyzer analyzer) throws UserException, AnalysisException {
-        // first: we analyze queryStmt before create table.
-        // To avoid duplicate registrations of table/colRefs,
-        // create a new root analyzer and clone the query statement for this initial pass.
-        Analyzer dummyRootAnalyzer = new Analyzer(analyzer.getCatalog(), analyzer.getContext());
-        QueryStmt tmpStmt = queryStmt.clone();
-        tmpStmt.analyze(dummyRootAnalyzer);
+    public void analyze(Analyzer analyzer) throws AnalysisException {
+        throw new AnalysisException("old planner does not support CTAS statement");
+    }
 
-        // TODO(zc): support char, varchar and decimal
-        for (Expr expr : tmpStmt.getResultExprs()) {
-            if (expr.getType().isDecimalOfAnyVersion() || expr.getType().isStringType()) {
-                ErrorReport.reportAnalysisException(ErrorCode.ERR_UNSUPPORTED_TYPE_IN_CTAS, expr.getType());
-            }
+    public void createTable(ConnectContext session) throws AnalysisException {
+        try {
+            session.getGlobalStateMgr().createTable(createTableStmt);
+        } catch (DdlException e) {
+            throw new AnalysisException(e.getMessage());
         }
+    }
 
-        // Check columnNames
-        if (columnNames != null) {
-            if (columnNames.size() != tmpStmt.getColLabels().size()) {
-                ErrorReport.report(ErrorCode.ERR_COL_NUMBER_NOT_MATCH);
-            }
-            for (int i = 0; i < columnNames.size(); ++i) {
-                createTableStmt.addColumnDef(new ColumnDef(
-                        columnNames.get(i), new TypeDef(tmpStmt.getResultExprs().get(i).getType())));
-            }
-        } else {
-            for (int i = 0; i < tmpStmt.getColLabels().size(); ++i) {
-                createTableStmt.addColumnDef(new ColumnDef(
-                        tmpStmt.getColLabels().get(i), new TypeDef(tmpStmt.getResultExprs().get(i).getType())));
-            }
+    public void dropTable(ConnectContext session) throws AnalysisException {
+        try {
+            session.getGlobalStateMgr().dropTable(new DropTableStmt(true, createTableStmt.getDbTbl(), true));
+        } catch (DdlException e) {
+            throw new AnalysisException(e.getMessage());
         }
-
-        // Analyze create table statement
-        createTableStmt.analyze(analyzer);
-
-        // Analyze insert
-        Table newTable = null;
-        insertStmt.setTargetTable(newTable);
-        insertStmt.analyze(analyzer);
     }
 
     public void createTable(Analyzer analyzer) throws AnalysisException {
@@ -102,6 +92,18 @@ public class CreateTableAsSelectStmt extends StatementBase {
         }
     }
 
+    public List<String> getColumnNames() {
+        return columnNames;
+    }
+
+    public QueryStatement getQueryStatement() {
+        return queryStatement;
+    }
+
+    public CreateTableStmt getCreateTableStmt() {
+        return createTableStmt;
+    }
+
     public InsertStmt getInsertStmt() {
         return insertStmt;
     }
@@ -109,5 +111,15 @@ public class CreateTableAsSelectStmt extends StatementBase {
     @Override
     public RedirectStatus getRedirectStatus() {
         return RedirectStatus.FORWARD_WITH_SYNC;
+    }
+
+    @Override
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
+        return visitor.visitCreateTableAsSelectStatement(this, context);
+    }
+
+    @Override
+    public boolean isSupportNewPlanner() {
+        return true;
     }
 }

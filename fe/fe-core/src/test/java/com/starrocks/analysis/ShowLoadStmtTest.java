@@ -22,10 +22,10 @@
 package com.starrocks.analysis;
 
 import com.starrocks.analysis.BinaryPredicate.Operator;
-import com.starrocks.catalog.Catalog;
-import com.starrocks.catalog.FakeCatalog;
+import com.starrocks.catalog.FakeGlobalStateMgr;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.UserException;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.SystemInfoService;
 import mockit.Expectations;
 import org.junit.Assert;
@@ -34,21 +34,21 @@ import org.junit.Test;
 
 public class ShowLoadStmtTest {
     private Analyzer analyzer;
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
 
     private SystemInfoService systemInfoService;
 
-    FakeCatalog fakeCatalog;
+    FakeGlobalStateMgr fakeGlobalStateMgr;
 
     @Before
     public void setUp() {
-        fakeCatalog = new FakeCatalog();
+        fakeGlobalStateMgr = new FakeGlobalStateMgr();
 
         systemInfoService = AccessTestUtil.fetchSystemInfoService();
-        FakeCatalog.setSystemInfo(systemInfoService);
+        FakeGlobalStateMgr.setSystemInfo(systemInfoService);
 
-        catalog = AccessTestUtil.fetchAdminCatalog();
-        FakeCatalog.setCatalog(catalog);
+        globalStateMgr = AccessTestUtil.fetchAdminCatalog();
+        FakeGlobalStateMgr.setGlobalStateMgr(globalStateMgr);
 
         analyzer = AccessTestUtil.fetchAdminAnalyzer(true);
         new Expectations(analyzer) {
@@ -67,7 +67,7 @@ public class ShowLoadStmtTest {
 
                 analyzer.getCatalog();
                 minTimes = 0;
-                result = catalog;
+                result = globalStateMgr;
             }
         };
     }
@@ -116,5 +116,11 @@ public class ShowLoadStmtTest {
         stmt = new ShowLoadStmt(null, likePredicate, null, new LimitElement(10));
         stmt.analyze(analyzer);
         Assert.assertEquals("SHOW LOAD FROM `testCluster:testDb` WHERE `label` LIKE \'abc\' LIMIT 10", stmt.toString());
+    }
+
+    @Test 
+    public void testGetRedirectStatus() {
+        ShowLoadStmt loadStmt = new ShowLoadStmt(null, null, null, null);
+        Assert.assertTrue(loadStmt.getRedirectStatus().equals(RedirectStatus.FORWARD_WITH_SYNC));
     }
 }

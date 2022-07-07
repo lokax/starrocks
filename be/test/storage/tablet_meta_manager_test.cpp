@@ -1,10 +1,11 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "storage/tablet_meta_manager.h"
 
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <thread>
 
 #include "storage/del_vector.h"
 
@@ -17,6 +18,7 @@ protected:
     void SetUp() override {
         fs::path tmp = fs::temp_directory_path();
         fs::path dir = tmp / "tablet_meta_manager_test";
+        fs::remove_all(dir);
         CHECK(fs::create_directory(dir));
         _data_dir = std::make_unique<DataDir>(dir.string());
         Status st = _data_dir->init();
@@ -46,21 +48,20 @@ TEST_F(TabletMetaManagerTest, test_save_load_tablet_meta) {
     meta_pb.set_tablet_type(TabletTypePB::TABLET_TYPE_DISK);
     meta_pb.set_tablet_state(PB_RUNNING);
     meta_pb.mutable_schema()->set_keys_type(DUP_KEYS);
-    meta_pb.mutable_schema()->set_is_in_memory(false);
     auto c0 = meta_pb.mutable_schema()->add_column();
     c0->set_name("c0");
     c0->set_is_key(true);
     c0->set_type("INT");
     c0->set_index_length(4);
 
-    MemTracker tracker;
-    auto meta = std::make_shared<TabletMeta>(&tracker);
+    auto meta = std::make_shared<TabletMeta>();
     meta->init_from_pb(&meta_pb);
 
-    ASSERT_TRUE(TabletMetaManager::save(_data_dir.get(), meta->tablet_id(), meta->schema_hash(), meta).ok());
-    auto load_meta = std::make_shared<TabletMeta>(&tracker);
-    ASSERT_TRUE(TabletMetaManager::get_tablet_meta(_data_dir.get(), meta->tablet_id(), meta->schema_hash(), load_meta)
-                        .ok());
+    ASSERT_TRUE(TabletMetaManager::save(_data_dir.get(), meta).ok());
+    auto load_meta = std::make_shared<TabletMeta>();
+    ASSERT_TRUE(
+            TabletMetaManager::get_tablet_meta(_data_dir.get(), meta->tablet_id(), meta->schema_hash(), load_meta.get())
+                    .ok());
     ASSERT_EQ(1, load_meta->table_id());
     ASSERT_EQ(2, load_meta->tablet_id());
     ASSERT_EQ(3, load_meta->schema_hash());
@@ -74,12 +75,12 @@ TEST_F(TabletMetaManagerTest, test_save_load_tablet_meta) {
     ASSERT_EQ(true, load_meta->tablet_schema().column(0).is_key());
     ASSERT_EQ(OLAP_FIELD_TYPE_INT, load_meta->tablet_schema().column(0).type());
 
-    load_meta.reset(new TabletMeta(&tracker));
-    auto visit_func = [&](long tablet_id, long schema_hash, const std::string& meta) -> bool {
-        CHECK_EQ(OLAP_SUCCESS, load_meta->deserialize(meta));
+    load_meta.reset(new TabletMeta());
+    auto visit_func = [&](long tablet_id, long schema_hash, std::string_view meta) -> bool {
+        CHECK(load_meta->deserialize(meta).ok());
         return true;
     };
-    ASSERT_TRUE(TabletMetaManager::traverse_headers(_data_dir->get_meta(), visit_func).ok());
+    ASSERT_TRUE(TabletMetaManager::walk(_data_dir->get_meta(), visit_func).ok());
     ASSERT_EQ(1, load_meta->table_id());
     ASSERT_EQ(2, load_meta->tablet_id());
     ASSERT_EQ(3, load_meta->schema_hash());
@@ -325,11 +326,11 @@ protected:
                     rowset_meta_pb.set_num_segments(1);
                     rowset_meta_pb.set_data_disk_size(1024 * 1024);
                     rowset_meta_pb.set_empty(false);
-                    rowset_meta_pb.set_rowset_id(i /*unused*/);
+                    rowset_meta_pb.set_deprecated_rowset_id(0);
                     rowset_meta_pb.set_rowset_seg_id(i);
                     RowsetId id;
                     id.init(2, i, 0, 0);
-                    rowset_meta_pb.set_rowset_id_v2(id.to_string());
+                    rowset_meta_pb.set_rowset_id(id.to_string());
 
                     EditVersionMetaPB edit;
                     auto v = edit.mutable_version();

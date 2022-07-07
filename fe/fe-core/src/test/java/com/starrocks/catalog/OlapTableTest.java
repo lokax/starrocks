@@ -22,13 +22,16 @@
 package com.starrocks.catalog;
 
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 import com.starrocks.analysis.IndexDef;
 import com.starrocks.catalog.Table.TableType;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.io.FastByteArrayOutputStream;
 import com.starrocks.common.util.UnitTestUtil;
+import com.starrocks.server.GlobalStateMgr;
 import mockit.Mock;
 import mockit.MockUp;
+import org.junit.Assert;
 import org.junit.Test;
 
 import java.io.DataInputStream;
@@ -39,16 +42,15 @@ import java.util.List;
 public class OlapTableTest {
 
     @Test
-    public void test() throws IOException {
-
-        new MockUp<Catalog>() {
+    public void testTableWithLocalTablet() throws IOException {
+        new MockUp<GlobalStateMgr>() {
             @Mock
-            int getCurrentCatalogJournalVersion() {
+            int getCurrentStateJournalVersion() {
                 return FeConstants.meta_version;
             }
         };
 
-        Database db = UnitTestUtil.createDb(1, 2, 3, 4, 5, 6, 7, 8);
+        Database db = UnitTestUtil.createDb(1, 2, 3, 4, 5, 6, 7);
         List<Table> tables = db.getTables();
 
         for (Table table : tables) {
@@ -70,8 +72,23 @@ public class OlapTableTest {
             DataInputStream in = new DataInputStream(byteArrayOutputStream.getInputStream());
             Table copiedTbl = OlapTable.read(in);
             System.out.println("copied table id: " + copiedTbl.getId());
+
+            Assert.assertTrue(copiedTbl instanceof OlapTable);
+            Partition partition = ((OlapTable) copiedTbl).getPartition(3L);
+            Assert.assertFalse(partition.isUseStarOS());
+            MaterializedIndex newIndex = partition.getIndex(4L);
+            for (Tablet tablet : newIndex.getTablets()) {
+                Assert.assertTrue(tablet instanceof LocalTablet);
+            }
+            tbl.addRelatedMaterializedView(10l);
+            tbl.addRelatedMaterializedView(20l);
+            tbl.addRelatedMaterializedView(30l);
+            Assert.assertEquals(Sets.newHashSet(10l, 20l, 30l), tbl.getRelatedMaterializedViews());
+            tbl.removeRelatedMaterializedView(10l);
+            tbl.removeRelatedMaterializedView(20l);
+            Assert.assertEquals(Sets.newHashSet(30l), tbl.getRelatedMaterializedViews());
+            tbl.removeRelatedMaterializedView(30l);
+            Assert.assertEquals(Sets.newHashSet(), tbl.getRelatedMaterializedViews());
         }
-
     }
-
 }

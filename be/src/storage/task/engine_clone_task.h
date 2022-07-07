@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_OLAP_TASK_ENGINE_CLONE_TASK_H
-#define STARROCKS_BE_SRC_OLAP_TASK_ENGINE_CLONE_TASK_H
+#pragma once
 
 #include "agent/utils.h"
 #include "gen_cpp/AgentService_types.h"
@@ -35,15 +34,16 @@ namespace starrocks {
 // add "Engine" as task prefix to prevent duplicate name with agent task
 class EngineCloneTask : public EngineTask {
 public:
-    EngineCloneTask(MemTracker* tablet_meta_mem_tracker, const TCloneReq& _clone_req, const TMasterInfo& _master_info,
-                    int64_t _signature, vector<string>* error_msgs, vector<TTabletInfo>* tablet_infos,
-                    AgentStatus* _res_status);
+    EngineCloneTask(MemTracker* mem_tracker, const TCloneReq& _clone_req, int64_t _signature,
+                    vector<string>* error_msgs, vector<TTabletInfo>* tablet_infos, AgentStatus* _res_status);
 
-    ~EngineCloneTask() override {}
+    ~EngineCloneTask() override = default;
 
-    OLAPStatus execute() override;
+    Status execute() override;
 
 private:
+    Status _do_clone_primary_tablet(Tablet* tablet);
+
     Status _do_clone(Tablet* tablet);
 
     Status _finish_clone(Tablet* tablet, const std::string& clone_dir, int64_t committed_version,
@@ -54,7 +54,8 @@ private:
     Status _clone_full_data(Tablet* tablet, TabletMeta* cloned_tablet_meta);
 
     Status _clone_copy(DataDir& data_dir, const string& local_data_path, vector<string>* error_msgs,
-                       const vector<Version>* missing_versions);
+                       const vector<Version>* missing_versions,
+                       const std::vector<int64_t>* missing_version_ranges = nullptr);
 
     void _set_tablet_info(Status status, bool is_new_tablet);
 
@@ -62,23 +63,21 @@ private:
     Status _download_files(DataDir* data_dir, const std::string& remote_url_prefix, const std::string& local_path);
 
     Status _make_snapshot(const std::string& ip, int port, TTableId tablet_id, TSchemaHash schema_hash, int timeout_s,
-                          const std::vector<Version>* missed_versions, std::string* snapshot_path,
+                          const std::vector<Version>* missed_versions,
+                          const std::vector<int64_t>* missing_version_ranges, std::string* snapshot_path,
                           int32_t* snapshot_version);
 
     Status _release_snapshot(const std::string& ip, int port, const std::string& snapshot_path);
 
-    Status _finish_clone_updatable(Tablet* tablet, const std::string& clone_dir, int64_t committed_version,
-                                   bool incremental_clone);
+    Status _finish_clone_primary(Tablet* tablet, const std::string& clone_dir);
 
 private:
-    MemTracker* _tablet_meta_mem_tracker = nullptr;
+    std::unique_ptr<MemTracker> _mem_tracker;
     const TCloneReq& _clone_req;
     vector<string>* _error_msgs;
     vector<TTabletInfo>* _tablet_infos;
     AgentStatus* _res_status;
     int64_t _signature;
-    const TMasterInfo& _master_info;
 }; // EngineTask
 
 } // namespace starrocks
-#endif //STARROCKS_BE_SRC_OLAP_TASK_ENGINE_CLONE_TASK_H

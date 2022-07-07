@@ -26,9 +26,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.Expr;
-import com.starrocks.analysis.SlotDescriptor;
 import com.starrocks.analysis.SlotRef;
-import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.analysis.TupleId;
 import com.starrocks.thrift.TExceptNode;
 import com.starrocks.thrift.TExplainLevel;
@@ -41,10 +39,10 @@ import org.apache.commons.collections.CollectionUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -56,9 +54,6 @@ import java.util.stream.Collectors;
  * the set operation node, instead of materializing the child's result exprs into new
  * tuples.
  */
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public abstract class SetOperationNode extends PlanNode {
     private static final Logger LOG = LoggerFactory.getLogger(SetOperationNode.class);
 
@@ -88,7 +83,7 @@ public abstract class SetOperationNode extends PlanNode {
 
     protected final TupleId tupleId_;
 
-    protected List<Map<Integer, Integer>> passThroughSlotMaps = Lists.newArrayList();
+    protected List<Map<Integer, Integer>> outputSlotIdToChildSlotIdMaps = Lists.newArrayList();
 
     protected SetOperationNode(PlanNodeId id, TupleId tupleId, String planNodeName) {
         super(id, tupleId.asList(), planNodeName);
@@ -111,13 +106,6 @@ public abstract class SetOperationNode extends PlanNode {
     }
 
     /**
-     * Returns true if this UnionNode has only constant exprs.
-     */
-    public boolean isConstantUnion() {
-        return resultExprLists_.isEmpty();
-    }
-
-    /**
      * Add a child tree plus its corresponding unresolved resultExprs.
      */
     public void addChild(PlanNode node, List<Expr> resultExprs) {
@@ -125,16 +113,8 @@ public abstract class SetOperationNode extends PlanNode {
         resultExprLists_.add(resultExprs);
     }
 
-    public List<List<Expr>> getMaterializedResultExprLists_() {
-        return materializedResultExprLists_;
-    }
-
     public void setMaterializedResultExprLists_(List<List<Expr>> materializedResultExprLists_) {
         this.materializedResultExprLists_ = materializedResultExprLists_;
-    }
-
-    public List<List<Expr>> getMaterializedConstExprLists_() {
-        return materializedConstExprLists_;
     }
 
     public void setMaterializedConstExprLists_(List<List<Expr>> materializedConstExprLists_) {
@@ -145,152 +125,12 @@ public abstract class SetOperationNode extends PlanNode {
         this.firstMaterializedChildIdx_ = firstMaterializedChildIdx_;
     }
 
-    public void setPassThroughSlotMaps(List<Map<Integer, Integer>> passThroughSlotMaps) {
-        this.passThroughSlotMaps = passThroughSlotMaps;
+    public void setOutputSlotIdToChildSlotIdMaps(List<Map<Integer, Integer>> outputSlotIdToChildSlotIdMaps) {
+        this.outputSlotIdToChildSlotIdMaps = outputSlotIdToChildSlotIdMaps;
     }
 
     @Override
     public void computeStats(Analyzer analyzer) {
-        super.computeStats(analyzer);
-        cardinality = constExprLists_.size();
-        for (PlanNode child : children) {
-            // ignore missing child cardinality info in the hope it won't matter enough
-            // to change the planning outcome
-            if (child.cardinality > 0) {
-                cardinality = addCardinalities(cardinality, child.cardinality);
-            }
-        }
-        // The number of nodes of a set operation node is -1 (invalid) if all the referenced tables
-        // are inline views (e.g. select 1 FROM (VALUES(1 x, 1 y)) a FULL OUTER JOIN
-        // (VALUES(1 x, 1 y)) b ON (a.x = b.y)). We need to set the correct value.
-        if (numNodes == -1) {
-            numNodes = 1;
-        }
-        cardinality = capAtLimit(cardinality);
-        if (LOG.isTraceEnabled()) {
-            LOG.trace("stats Union: cardinality=" + Long.toString(cardinality));
-        }
-    }
-
-    protected long capAtLimit(long cardinality) {
-        if (hasLimit()) {
-            if (cardinality == -1) {
-                return limit;
-            } else {
-                return Math.min(cardinality, limit);
-            }
-        }
-        return cardinality;
-    }
-
-    /*
-    @Override
-    public void computeResourceProfile(TQueryOptions queryOptions) {
-        // TODO: add an estimate
-        resourceProfile_ = new ResourceProfile(0, 0);
-    }
-    */
-
-    /**
-     * Returns true if rows from the child with 'childTupleIds' and 'childResultExprs' can
-     * be returned directly by the set operation node (without materialization into a new tuple).
-     */
-    private boolean isChildPassthrough(
-            Analyzer analyzer, PlanNode childNode, List<Expr> childExprList) {
-        List<TupleId> childTupleIds = childNode.getTupleIds();
-        // Check that if the child outputs a single tuple, then it's not nullable. Tuple
-        // nullability can be considered to be part of the physical row layout.
-        Preconditions.checkState(childTupleIds.size() != 1 ||
-                !childNode.getNullableTupleIds().contains(childTupleIds.get(0)));
-        // If the Union node is inside a subplan, passthrough should be disabled to avoid
-        // performance issues by forcing tiny batches.
-        // TODO: Remove this as part of IMPALA-4179.
-        if (isInSubplan_) {
-            return false;
-        }
-        // Pass through is only done for the simple case where the row has a single tuple. One
-        // of the motivations for this is that the output of a UnionNode is a row with a
-        // single tuple.
-        if (childTupleIds.size() != 1) {
-            return false;
-        }
-        Preconditions.checkState(!setOpResultExprs_.isEmpty());
-
-        TupleDescriptor setOpTupleDescriptor = analyzer.getDescTbl().getTupleDesc(tupleId_);
-        TupleDescriptor childTupleDescriptor =
-                analyzer.getDescTbl().getTupleDesc(childTupleIds.get(0));
-
-        // Verify that the set operation tuple descriptor has one slot for every expression.
-        Preconditions.checkState(setOpTupleDescriptor.getSlots().size() == setOpResultExprs_.size());
-        // Verify that the set operation node has one slot for every child expression.
-        Preconditions.checkState(
-                setOpTupleDescriptor.getSlots().size() == childExprList.size());
-
-        if (setOpResultExprs_.size() != childTupleDescriptor.getSlots().size()) {
-            return false;
-        }
-        if (setOpTupleDescriptor.getByteSize() != childTupleDescriptor.getByteSize()) {
-            return false;
-        }
-
-        for (int i = 0; i < setOpResultExprs_.size(); ++i) {
-            if (!setOpTupleDescriptor.getSlots().get(i).isMaterialized()) {
-                continue;
-            }
-            SlotRef setOpSlotRef = setOpResultExprs_.get(i).unwrapSlotRef(false);
-            SlotRef childSlotRef = childExprList.get(i).unwrapSlotRef(false);
-            Preconditions.checkNotNull(setOpSlotRef);
-            if (childSlotRef == null) {
-                return false;
-            }
-            if (!childSlotRef.getDesc().LayoutEquals(setOpSlotRef.getDesc())) {
-                return false;
-            }
-        }
-
-        // This child could pass through, fill passThroughSlotMaps;
-        Map<Integer, Integer> slotMaps = new HashMap<>();
-        for (int i = 0; i < setOpResultExprs_.size(); ++i) {
-            if (!setOpTupleDescriptor.getSlots().get(i).isMaterialized()) {
-                continue;
-            }
-            SlotRef setOpSlotRef = setOpResultExprs_.get(i).unwrapSlotRef(false);
-            SlotRef childSlotRef = childExprList.get(i).unwrapSlotRef(false);
-            slotMaps.put(setOpSlotRef.getSlotId().asInt(), childSlotRef.getSlotId().asInt());
-        }
-        passThroughSlotMaps.add(slotMaps);
-
-        return true;
-    }
-
-    /**
-     * Compute which children are passthrough and reorder them such that the passthrough
-     * children come before the children that need to be materialized. Also reorder
-     * 'resultExprLists_'. The children are reordered to simplify the implementation in the
-     * BE.
-     */
-    void computePassthrough(Analyzer analyzer) {
-        List<List<Expr>> newResultExprLists = Lists.newArrayList();
-        ArrayList<PlanNode> newChildren = Lists.newArrayList();
-        for (int i = 0; i < children.size(); i++) {
-            if (isChildPassthrough(analyzer, children.get(i), resultExprLists_.get(i))) {
-                newResultExprLists.add(resultExprLists_.get(i));
-                newChildren.add(children.get(i));
-            }
-        }
-        firstMaterializedChildIdx_ = newChildren.size();
-
-        for (int i = 0; i < children.size(); i++) {
-            if (!isChildPassthrough(analyzer, children.get(i), resultExprLists_.get(i))) {
-                newResultExprLists.add(resultExprLists_.get(i));
-                newChildren.add(children.get(i));
-            }
-        }
-
-        Preconditions.checkState(resultExprLists_.size() == newResultExprLists.size());
-        resultExprLists_ = newResultExprLists;
-        Preconditions.checkState(children.size() == newChildren.size());
-        children = newChildren;
     }
 
     /**
@@ -304,44 +144,6 @@ public abstract class SetOperationNode extends PlanNode {
      */
     @Override
     public void init(Analyzer analyzer) {
-        Preconditions.checkState(conjuncts.isEmpty());
-        computeMemLayout(analyzer);
-        computeStats(analyzer);
-        // except Node must not reorder the child
-        if (!(this instanceof ExceptNode)) {
-            computePassthrough(analyzer);
-        }
-        // drop resultExprs/constExprs that aren't getting materialized (= where the
-        // corresponding output slot isn't being materialized)
-        materializedResultExprLists_.clear();
-        Preconditions.checkState(resultExprLists_.size() == children.size());
-        List<SlotDescriptor> slots = analyzer.getDescTbl().getTupleDesc(tupleId_).getSlots();
-        for (int i = 0; i < resultExprLists_.size(); ++i) {
-            List<Expr> exprList = resultExprLists_.get(i);
-            List<Expr> newExprList = Lists.newArrayList();
-            Preconditions.checkState(exprList.size() == slots.size());
-            for (int j = 0; j < exprList.size(); ++j) {
-                if (slots.get(j).isMaterialized()) {
-                    newExprList.add(exprList.get(j));
-                }
-            }
-            materializedResultExprLists_.add(
-                    Expr.substituteList(newExprList, getChild(i).getOutputSmap(), analyzer, true));
-        }
-        Preconditions.checkState(
-                materializedResultExprLists_.size() == getChildren().size());
-
-        materializedConstExprLists_.clear();
-        for (List<Expr> exprList : constExprLists_) {
-            Preconditions.checkState(exprList.size() == slots.size());
-            List<Expr> newExprList = Lists.newArrayList();
-            for (int i = 0; i < exprList.size(); ++i) {
-                if (slots.get(i).isMaterialized()) {
-                    newExprList.add(exprList.get(i));
-                }
-            }
-            materializedConstExprLists_.add(newExprList);
-        }
     }
 
     protected void toThrift(TPlanNode msg, TPlanNodeType nodeType) {
@@ -359,7 +161,7 @@ public abstract class SetOperationNode extends PlanNode {
             case UNION_NODE:
                 msg.union_node = new TUnionNode(
                         tupleId_.asInt(), texprLists, constTexprLists, firstMaterializedChildIdx_);
-                msg.union_node.setPass_through_slot_maps(passThroughSlotMaps);
+                msg.union_node.setPass_through_slot_maps(outputSlotIdToChildSlotIdMaps);
                 msg.node_type = TPlanNodeType.UNION_NODE;
                 break;
             case INTERSECT_NODE:
@@ -395,7 +197,7 @@ public abstract class SetOperationNode extends PlanNode {
         }
         if (detailLevel == TExplainLevel.VERBOSE) {
             if (CollectionUtils.isNotEmpty(materializedResultExprLists_)) {
-                output.append(prefix).append("child exprs: ").append("\n");
+                output.append(prefix).append("child exprs:").append("\n");
                 for (List<Expr> exprs : materializedResultExprLists_) {
                     output.append(prefix).append("    ").append(exprs.stream().map(Expr::explain)
                             .collect(Collectors.joining(" | "))).append("\n");
@@ -428,88 +230,53 @@ public abstract class SetOperationNode extends PlanNode {
     }
 
     @Override
-    public boolean isVectorized() {
-        for (PlanNode node : getChildren()) {
-            if (!node.isVectorized()) {
-                return false;
-            }
-        }
-
-        for (Expr expr : conjuncts) {
-            if (!expr.isVectorized()) {
-                return false;
-            }
-        }
-
-        for (List<Expr> exprs : resultExprLists_) {
-            for (Expr expr : exprs) {
-                if (!expr.isVectorized()) {
-                    return false;
-                }
-            }
-        }
-
-        for (List<Expr> exprs : constExprLists_) {
-            for (Expr expr : exprs) {
-                if (!expr.isVectorized()) {
-                    return false;
-                }
-            }
-        }
-
-        for (List<Expr> exprs : materializedResultExprLists_) {
-            for (Expr expr : exprs) {
-                if (!expr.isVectorized()) {
-                    return false;
-                }
-            }
-        }
-
-        for (List<Expr> exprs : materializedConstExprLists_) {
-            for (Expr expr : exprs) {
-                if (!expr.isVectorized()) {
-                    return false;
-                }
-            }
-        }
-
-        return true;
+    public boolean canDoReplicatedJoin() {
+        return false;
     }
 
     @Override
-    public void setUseVectorized(boolean flag) {
-        this.useVectorized = flag;
-
-        for (Expr expr : conjuncts) {
-            expr.setUseVectorized(flag);
+    public boolean pushDownRuntimeFilters(RuntimeFilterDescription description, Expr probeExpr) {
+        if (!canPushDownRuntimeFilter()) {
+            return false;
+        }
+        if (!probeExpr.isBoundByTupleIds(getTupleIds())) {
+            return false;
         }
 
-        for (List<Expr> exprs : resultExprLists_) {
-            for (Expr expr : exprs) {
-                expr.setUseVectorized(flag);
+        if (probeExpr instanceof SlotRef) {
+            boolean pushDown = false;
+            int probeSlotId = ((SlotRef) probeExpr).getSlotId().asInt();
+            Set<Integer> mappedProbeSlotIds = new HashSet<>();
+            for (Map<Integer, Integer> map : outputSlotIdToChildSlotIdMaps) {
+                if (map.containsKey(probeSlotId)) {
+                    mappedProbeSlotIds.add(map.get(probeSlotId));
+                }
+            }
+
+            for (int i = 0; i < materializedResultExprLists_.size(); i++) {
+                // try to push all children if any expr of a child can match `probeExpr`
+                for (Expr mexpr : materializedResultExprLists_.get(i)) {
+                    if ((mexpr instanceof SlotRef) &&
+                            mappedProbeSlotIds.contains(((SlotRef) mexpr).getSlotId().asInt())) {
+                        if (children.get(i).pushDownRuntimeFilters(description, mexpr)) {
+                            pushDown = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (pushDown) {
+                return true;
             }
         }
 
-        for (List<Expr> exprs : constExprLists_) {
-            for (Expr expr : exprs) {
-                expr.setUseVectorized(flag);
-            }
+        if (description.canProbeUse(this)) {
+            // can not push down to children.
+            // use runtime filter at this level.
+            description.addProbeExpr(id.asInt(), probeExpr);
+            probeRuntimeFilters.add(description);
+            return true;
         }
-
-        for (List<Expr> exprs : materializedResultExprLists_) {
-            for (Expr expr : exprs) {
-                expr.setUseVectorized(flag);
-            }
-        }
-
-        for (List<Expr> exprs : materializedConstExprLists_) {
-            for (Expr expr : exprs) {
-                expr.setUseVectorized(flag);
-            }
-        }
-
-        for (PlanNode node : getChildren()) {
-            node.setUseVectorized(flag);
-        }
+        return false;
     }
 }

@@ -27,17 +27,22 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.Expr;
+import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.SortInfo;
 import com.starrocks.analysis.TupleId;
 import com.starrocks.common.UserException;
 import com.starrocks.sql.optimizer.base.DistributionSpec;
+import com.starrocks.sql.optimizer.operator.TopNType;
 import com.starrocks.thrift.TExchangeNode;
 import com.starrocks.thrift.TExplainLevel;
+import com.starrocks.thrift.TPartitionType;
 import com.starrocks.thrift.TPlanNode;
 import com.starrocks.thrift.TPlanNodeType;
 import com.starrocks.thrift.TSortInfo;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import org.apache.commons.collections.CollectionUtils;
+
+import java.util.List;
+import java.util.Objects;
 
 /**
  * Receiver side of a 1:n data stream. Logically, an ExchangeNode consumes the data
@@ -51,12 +56,7 @@ import org.apache.logging.log4j.Logger;
  * inputs on the parameters specified in the SortInfo object. It is assumed that the
  * inputs are also sorted individually on the same SortInfo parameter.
  */
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public class ExchangeNode extends PlanNode {
-    private static final Logger LOG = LogManager.getLogger(ExchangeNode.class);
-
     // The parameters based on which sorted input streams are merged by this
     // exchange node. Null if this exchange does not merge sorted streams
     private SortInfo mergeInfo;
@@ -65,20 +65,23 @@ public class ExchangeNode extends PlanNode {
     // only if mergeInfo_ is non-null, i.e. this is a merging exchange node.
     private long offset;
 
+    private TPartitionType partitionType;
+    private DataPartition dataPartition;
     private DistributionSpec.DistributionType distributionType;
+    // Specify the columns which need to send, work on CTE, and keep empty in other sense
+    private List<Integer> receiveColumns;
 
     /**
      * Create ExchangeNode that consumes output of inputNode.
      * An ExchangeNode doesn't have an input node as a child, which is why we
      * need to compute the cardinality here.
      */
-    public ExchangeNode(PlanNodeId id, PlanNode inputNode, boolean copyConjuncts) {
+    public ExchangeNode(PlanNodeId id, PlanNode inputNode, DataPartition dataPartition) {
         super(id, inputNode, "EXCHANGE");
         offset = 0;
         children.add(inputNode);
-        if (!copyConjuncts) {
-            this.conjuncts = Lists.newArrayList();
-        }
+        this.conjuncts = Lists.newArrayList();
+        this.dataPartition = dataPartition;
         if (hasLimit()) {
             cardinality = Math.min(limit, inputNode.cardinality);
         } else {
@@ -86,31 +89,54 @@ public class ExchangeNode extends PlanNode {
         }
         // Only apply the limit at the receiver if there are multiple senders.
         if (inputNode.getFragment().isPartitioned()) {
-            limit = inputNode.limit;
+            if (inputNode instanceof SortNode) {
+                SortNode sortNode = (SortNode) inputNode;
+                if (Objects.equals(TopNType.ROW_NUMBER, sortNode.getTopNType()) &&
+                        CollectionUtils.isEmpty(sortNode.getSortInfo().getPartitionExprs())) {
+                    limit = inputNode.limit;
+                } else {
+                    unsetLimit();
+                }
+            } else {
+                limit = inputNode.limit;
+            }
         }
         computeTupleIds();
     }
 
-    public ExchangeNode(PlanNodeId id, PlanNode inputNode, boolean copyConjuncts,
-                        DistributionSpec.DistributionType type) {
-        this(id, inputNode, copyConjuncts);
+    public ExchangeNode(PlanNodeId id, PlanNode inputNode, DistributionSpec.DistributionType type) {
+        this(id, inputNode, DataPartition.UNPARTITIONED);
         distributionType = type;
     }
 
-    // For Test
-    public ExchangeNode(PlanNodeId id, PlanNode inputNode) {
-        super(id, inputNode, "EXCHANGE");
+    public void setDataPartition(DataPartition dataPartition) {
+        this.dataPartition = dataPartition;
+    }
+
+    public void setPartitionType(TPartitionType type) {
+        partitionType = type;
     }
 
     public DistributionSpec.DistributionType getDistributionType() {
         return distributionType;
     }
 
+    public boolean isMerge() {
+        return mergeInfo != null;
+    }
+
+    public void setReceiveColumns(List<Integer> receiveColumns) {
+        this.receiveColumns = receiveColumns;
+    }
+
+    public List<Integer> getReceiveColumns() {
+        return receiveColumns;
+    }
+
     @Override
     public final void computeTupleIds() {
         clearTupleIds();
         tupleIds.addAll(getChild(0).getTupleIds());
-        tblRefIds.addAll(getChild(0).getTblRefIds());
         nullableTupleIds.addAll(getChild(0).getNullableTupleIds());
     }
 
@@ -144,6 +170,9 @@ public class ExchangeNode extends PlanNode {
             msg.exchange_node.setSort_info(sortInfo);
             msg.exchange_node.setOffset(offset);
         }
+        if (partitionType != null) {
+            msg.exchange_node.setPartition_type(partitionType);
+        }
     }
 
     @Override
@@ -169,48 +198,17 @@ public class ExchangeNode extends PlanNode {
     }
 
     @Override
-    public boolean isVectorized() {
-        for (PlanNode node : getChildren()) {
-            if (!node.isVectorized()) {
-                return false;
-            }
-        }
-
-        for (Expr expr : conjuncts) {
-            if (!expr.isVectorized()) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    @Override
     public boolean canUsePipeLine() {
         return getChildren().stream().allMatch(PlanNode::canUsePipeLine);
     }
 
     @Override
-    public void setUseVectorized(boolean flag) {
-        this.useVectorized = flag;
-        for (Expr expr : conjuncts) {
-            expr.setUseVectorized(flag);
-        }
-    }
-
-    @Override
     public boolean pushDownRuntimeFilters(RuntimeFilterDescription description, Expr probeExpr) {
-        boolean accept = false;
-        if (description.canPushAcrossExchangeNode()) {
-            description.enterExchangeNode();
-            for (PlanNode node : children) {
-                if (node.pushDownRuntimeFilters(description, probeExpr)) {
-                    description.setHasRemoteTargets(true);
-                    accept = true;
-                }
-            }
-            description.exitExchangeNode();
+        if (!canPushDownRuntimeFilter()) {
+            return false;
         }
+
+        boolean accept = pushCrossExchange(description, probeExpr);
 
         // if this rf is generate by broadcast or co-location, and this rf is local
         // we'd better to put a rf at exchange node, because underneath scan node has to wait global rf.
@@ -223,6 +221,46 @@ public class ExchangeNode extends PlanNode {
             }
         }
         return accept;
+    }
+
+    private boolean pushCrossExchange(RuntimeFilterDescription description, Expr probeExpr) {
+        if (!description.canPushAcrossExchangeNode()) {
+            return false;
+        }
+
+        boolean crossExchange = false;
+
+        // broadcast or only one RF, always can be cross exchange
+        if (description.isBroadcastJoin() || description.getEqualCount() == 1) {
+            crossExchange = true;
+        } else if (description.getEqualCount() > 1 && dataPartition.getPartitionExprs().size() == 1) {
+            // RF nums > 1 and only partition by one column, only send the RF which RF's column equals partition column
+            Expr pExpr = dataPartition.getPartitionExprs().get(0);
+            if (probeExpr instanceof SlotRef && pExpr instanceof SlotRef &&
+                    ((SlotRef) probeExpr).getSlotId().asInt() == ((SlotRef) pExpr).getSlotId().asInt()) {
+                crossExchange = true;
+            }
+        }
+
+        if (!crossExchange) {
+            return false;
+        }
+
+        boolean accept = false;
+        description.enterExchangeNode();
+        for (PlanNode node : children) {
+            if (node.pushDownRuntimeFilters(description, probeExpr)) {
+                description.setHasRemoteTargets(true);
+                accept = true;
+            }
+        }
+        description.exitExchangeNode();
+        return accept;
+    }
+
+    @Override
+    public boolean canDoReplicatedJoin() {
+        return false;
     }
 
 }

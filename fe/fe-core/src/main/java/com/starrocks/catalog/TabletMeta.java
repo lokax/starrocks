@@ -82,6 +82,20 @@ public class TabletMeta {
         this.storageMedium = storageMedium;
     }
 
+    // TODO: Remove this after LakeTable is merged.
+    public boolean isUseStarOS() {
+        return false;
+    }
+
+    public int getNewSchemaHash() {
+        lock.readLock().lock();
+        try {
+            return this.newSchemaHash;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
     public void setNewSchemaHash(int newSchemaHash) {
         lock.writeLock().lock();
         try {

@@ -28,8 +28,8 @@
 #include <memory>
 #include <sstream>
 
+#include "agent/master_info.h"
 #include "common/object_pool.h"
-#include "common/resource_tls.h"
 #include "gen_cpp/DataSinks_types.h"
 #include "gen_cpp/FrontendService.h"
 #include "gen_cpp/HeartbeatService.h"
@@ -39,15 +39,19 @@
 #include "gen_cpp/Types_types.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/client_cache.h"
+#include "runtime/current_thread.h"
 #include "runtime/datetime_value.h"
 #include "runtime/descriptors.h"
 #include "runtime/exec_env.h"
 #include "runtime/plan_fragment_executor.h"
+#include "runtime/runtime_filter_cache.h"
 #include "runtime/runtime_filter_worker.h"
 #include "service/backend_options.h"
 #include "util/debug_util.h"
+#include "util/defer_op.h"
 #include "util/starrocks_metrics.h"
 #include "util/stopwatch.hpp"
+#include "util/thread.h"
 #include "util/threadpool.h"
 #include "util/thrift_util.h"
 #include "util/uid_util.h"
@@ -96,18 +100,12 @@ public:
     const DateTimeValue& start_time() const { return _start_time; }
 
     // Update status of this fragment execute
-    Status update_status(Status status) {
+    Status update_status(const Status& status) {
         std::lock_guard<std::mutex> l(_status_lock);
         if (!status.ok() && _exec_status.ok()) {
             _exec_status = status;
         }
         return _exec_status;
-    }
-
-    void set_group(const TResourceInfo& info) {
-        _set_rsc_info = true;
-        _user = info.user;
-        _group = info.group;
     }
 
     bool is_timeout(const DateTimeValue& now) const {
@@ -122,8 +120,12 @@ public:
 
     int get_timeout_second() const { return _timeout_second; }
 
+    std::shared_ptr<RuntimeState> runtime_state() { return _runtime_state; }
+
 private:
     void coordinator_callback(const Status& status, RuntimeProfile* profile, bool done);
+
+    std::shared_ptr<RuntimeState> _runtime_state = nullptr;
 
     // Id of this query
     TUniqueId _query_id;
@@ -140,13 +142,7 @@ private:
     std::mutex _status_lock;
     Status _exec_status;
 
-    bool _set_rsc_info;
-    std::string _user;
-    std::string _group;
-
     int _timeout_second;
-
-    std::unique_ptr<std::thread> _exec_thread;
 };
 
 FragmentExecState::FragmentExecState(const TUniqueId& query_id, const TUniqueId& fragment_instance_id, int backend_num,
@@ -158,20 +154,22 @@ FragmentExecState::FragmentExecState(const TUniqueId& query_id, const TUniqueId&
           _coord_addr(coord_addr),
           _executor(exec_env, std::bind<void>(std::mem_fn(&FragmentExecState::coordinator_callback), this,
                                               std::placeholders::_1, std::placeholders::_2, std::placeholders::_3)),
-          _set_rsc_info(false),
           _timeout_second(-1) {
     _start_time = DateTimeValue::local_time();
 }
 
-FragmentExecState::~FragmentExecState() {}
+FragmentExecState::~FragmentExecState() = default;
 
 Status FragmentExecState::prepare(const TExecPlanFragmentParams& params) {
+    _runtime_state = std::make_shared<RuntimeState>(params.params.query_id, params.params.fragment_instance_id,
+                                                    params.query_options, params.query_globals, _exec_env);
+    int func_version = params.__isset.func_version ? params.func_version : 2;
+    _runtime_state->set_func_version(func_version);
+    _runtime_state->init_mem_trackers(_query_id);
+    _executor.set_runtime_state(_runtime_state.get());
+
     if (params.__isset.query_options) {
         _timeout_second = params.query_options.query_timeout;
-    }
-
-    if (params.__isset.resource_info) {
-        set_group(params.resource_info);
     }
 
     return _executor.prepare(params);
@@ -235,7 +233,7 @@ void FragmentExecState::coordinator_callback(const Status& status, RuntimeProfil
     params.__set_done(done);
 
     RuntimeState* runtime_state = _executor.runtime_state();
-    DCHECK(runtime_state != NULL);
+    DCHECK(runtime_state != nullptr);
     if (runtime_state->query_options().query_type == TQueryType::LOAD && !done && status.ok()) {
         // this is a load plan, and load is not finished, just make a brief report
         params.__set_loaded_rows(runtime_state->num_rows_load_total());
@@ -285,8 +283,9 @@ void FragmentExecState::coordinator_callback(const Status& status, RuntimeProfil
         params.__isset.error_log = (params.error_log.size() > 0);
     }
 
-    if (_exec_env->master_info()->__isset.backend_id) {
-        params.__set_backend_id(_exec_env->master_info()->backend_id);
+    auto backend_id = get_backend_id();
+    if (backend_id.has_value()) {
+        params.__set_backend_id(backend_id.value());
     }
 
     TReportExecStatusResult res;
@@ -325,17 +324,15 @@ void FragmentExecState::coordinator_callback(const Status& status, RuntimeProfil
 }
 
 FragmentMgr::FragmentMgr(ExecEnv* exec_env)
-        : _exec_env(exec_env),
-          _fragment_map(),
-          _stop(false),
-          _cancel_thread(std::bind<void>(&FragmentMgr::cancel_worker, this)) {
+        : _exec_env(exec_env), _stop(false), _cancel_thread([this] { cancel_worker(); }) {
+    Thread::set_thread_name(_cancel_thread, "frag_mgr_cancel");
     REGISTER_GAUGE_STARROCKS_METRIC(plan_fragment_count, [this]() {
         std::lock_guard<std::mutex> lock(_lock);
         return _fragment_map.size();
     });
     // TODO(zc): we need a better thread-pool
     // now one user can use all the thread pool, others have no resource.
-    ThreadPoolBuilder("FragmentMgrThreadPool")
+    ThreadPoolBuilder("fragment_mgr")
             .set_min_threads(config::fragment_pool_thread_num_min)
             .set_max_threads(config::fragment_pool_thread_num_max)
             .set_max_queue_size(config::fragment_pool_queue_size)
@@ -359,8 +356,20 @@ FragmentMgr::~FragmentMgr() {
 
 static void empty_function(PlanFragmentExecutor* exec) {}
 
-void FragmentMgr::exec_actual(std::shared_ptr<FragmentExecState> exec_state, FinishCallback cb) {
+void FragmentMgr::exec_actual(std::shared_ptr<FragmentExecState> exec_state, const FinishCallback& cb) {
+    // This writing is to ensure that MemTracker will not be destructed before the thread ends.
+    // This writing method is a bit tricky, and when there is a better way, replace it
+    auto profile = exec_state->runtime_state()->runtime_profile_ptr();
+    auto q_tracker = exec_state->runtime_state()->query_mem_tracker_ptr();
+    auto s_tracker = exec_state->runtime_state()->instance_mem_tracker_ptr();
+
+    MemTracker* prev_tracker = tls_thread_status.set_mem_tracker(s_tracker.get());
+    DeferOp op([&] { tls_thread_status.set_mem_tracker(prev_tracker); });
+
     exec_state->execute();
+
+    // Callback after remove from this id
+    cb(exec_state->executor());
 
     {
         std::lock_guard<std::mutex> lock(_lock);
@@ -373,16 +382,22 @@ void FragmentMgr::exec_actual(std::shared_ptr<FragmentExecState> exec_state, Fin
                          << exec_state->fragment_instance_id();
         }
     }
-    // Callback after remove from this id
-    cb(exec_state->executor());
-    // NOTE: 'exec_state' is desconstructed here without lock
+    // NOTE: 'exec_state' is deconstructed here without lock
 }
 
 Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params) {
-    return exec_plan_fragment(params, std::bind<void>(&empty_function, std::placeholders::_1));
+    return exec_plan_fragment(params, [](auto&& PH1) { return empty_function(std::forward<decltype(PH1)>(PH1)); });
 }
 
-Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params, FinishCallback cb) {
+Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params, const FinishCallback& cb) {
+    return exec_plan_fragment(
+            params, [](auto&& PH1) { return empty_function(std::forward<decltype(PH1)>(PH1)); }, cb);
+}
+
+Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params, const StartSuccCallback& start_cb,
+                                       const FinishCallback& cb) {
+    RETURN_IF_ERROR(_exec_env->query_pool_mem_tracker()->check_mem_limit("Start execute plan fragment."));
+
     const TUniqueId& fragment_instance_id = params.params.fragment_instance_id;
     std::shared_ptr<FragmentExecState> exec_state;
     {
@@ -408,18 +423,22 @@ Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params, Fi
         _fragment_map.insert(std::make_pair(fragment_instance_id, exec_state));
     }
 
-    auto st = _thread_pool->submit_func(std::bind<void>(&FragmentMgr::exec_actual, this, exec_state, cb));
+    auto st = _thread_pool->submit_func([this, exec_state, cb] { exec_actual(exec_state, cb); });
     if (!st.ok()) {
+        exec_state->cancel(PPlanFragmentCancelReason::INTERNAL_ERROR);
+        std::string error_msg = strings::Substitute("Put planfragment $0 to thread pool failed. err = $1",
+                                                    print_id(fragment_instance_id), st.get_error_msg());
+        LOG(WARNING) << error_msg;
         {
             // Remove the exec state added
             std::lock_guard<std::mutex> lock(_lock);
             _fragment_map.erase(fragment_instance_id);
         }
-        exec_state->cancel(PPlanFragmentCancelReason::INTERNAL_ERROR);
-        std::string error_msg = strings::Substitute("Put planfragment $0 to thread pool failed. err = $1",
-                                                    print_id(fragment_instance_id), st.get_error_msg());
-        LOG(WARNING) << error_msg;
         return Status::InternalError(error_msg);
+    } else {
+        // It is necessary to ensure that ExecState is not destructed,
+        // so do not reset ExecState before calling start_cb, otherwise "heap use after free" may appear
+        start_cb(exec_state->executor());
     }
 
     return Status::OK();
@@ -436,7 +455,11 @@ Status FragmentMgr::cancel(const TUniqueId& id, const PPlanFragmentCancelReason&
         }
         exec_state = iter->second;
     }
+    auto profile = exec_state->runtime_state()->runtime_profile_ptr();
+    auto q_tracker = exec_state->runtime_state()->query_mem_tracker_ptr();
+    auto s_tracker = exec_state->runtime_state()->instance_mem_tracker_ptr();
     exec_state->cancel(reason);
+    exec_state.reset();
 
     return Status::OK();
 }
@@ -444,6 +467,8 @@ Status FragmentMgr::cancel(const TUniqueId& id, const PPlanFragmentCancelReason&
 void FragmentMgr::receive_runtime_filter(const PTransmitRuntimeFilterParams& params,
                                          const std::shared_ptr<const vectorized::JoinRuntimeFilter>& shared_rf) {
     std::shared_ptr<FragmentExecState> exec_state;
+    _exec_env->add_rf_event(
+            {params.query_id(), params.filter_id(), BackendOptions::get_localhost(), "RECV_TOTAL_RF_RPC"});
     size_t size = params.probe_finst_ids_size();
     for (size_t i = 0; i < size; i++) {
         TUniqueId frag_inst_id;
@@ -463,8 +488,12 @@ void FragmentMgr::receive_runtime_filter(const PTransmitRuntimeFilterParams& par
         if (!found) {
             VLOG_FILE << "FragmentMgr::receive_runtime_filter: finst not found. finst_id = " << frag_inst_id;
         } else {
+            auto profile = exec_state->runtime_state()->runtime_profile_ptr();
+            auto q_tracker = exec_state->runtime_state()->query_mem_tracker_ptr();
+            auto s_tracker = exec_state->runtime_state()->instance_mem_tracker_ptr();
             exec_state->executor()->runtime_state()->runtime_filter_port()->receive_shared_runtime_filter(
                     params.filter_id(), shared_rf);
+            exec_state.reset();
         }
     }
 }
@@ -484,7 +513,7 @@ void FragmentMgr::cancel_worker() {
         }
         for (auto& id : to_delete) {
             cancel(id, PPlanFragmentCancelReason::TIMEOUT);
-            LOG(INFO) << "FragmentMgr cancel worker going to cancel timouet fragment " << print_id(id);
+            LOG(INFO) << "FragmentMgr cancel worker going to cancel timeout fragment " << print_id(id);
         }
 
         // check every 1 seconds
@@ -494,6 +523,7 @@ void FragmentMgr::cancel_worker() {
 }
 
 Status FragmentMgr::trigger_profile_report(const PTriggerProfileReportRequest* request) {
+    std::vector<std::shared_ptr<FragmentExecState>> need_report_exec_states;
     if (request->instance_ids_size() > 0) {
         for (int i = 0; i < request->instance_ids_size(); i++) {
             const PUniqueId& p_fragment_id = request->instance_ids(i);
@@ -504,7 +534,7 @@ Status FragmentMgr::trigger_profile_report(const PTriggerProfileReportRequest* r
                 std::lock_guard<std::mutex> lock(_lock);
                 auto iter = _fragment_map.find(id);
                 if (iter != _fragment_map.end()) {
-                    iter->second->executor()->report_profile_once();
+                    need_report_exec_states.emplace_back(iter->second);
                 }
             }
         }
@@ -512,9 +542,14 @@ Status FragmentMgr::trigger_profile_report(const PTriggerProfileReportRequest* r
         std::lock_guard<std::mutex> lock(_lock);
         auto iter = _fragment_map.begin();
         for (; iter != _fragment_map.end(); iter++) {
-            iter->second->executor()->report_profile_once();
+            need_report_exec_states.emplace_back(iter->second);
         }
     }
+
+    for (auto& exec_state : need_report_exec_states) {
+        exec_state->executor()->report_profile_once();
+    }
+
     return Status::OK();
 }
 
@@ -551,7 +586,7 @@ Status FragmentMgr::exec_external_plan_fragment(const TScanOpenParams& params, c
     const uint8_t* buf = (const uint8_t*)query_plan_info.data();
     uint32_t len = query_plan_info.size();
     // deserialize TQueryPlanInfo
-    auto st = deserialize_thrift_msg(buf, &len, false, &t_query_plan_info);
+    auto st = deserialize_thrift_msg(buf, &len, TProtocolType::BINARY, &t_query_plan_info);
     if (!st.ok()) {
         LOG(WARNING) << "open context error: deserialize TQueryPlanInfo failure";
         std::stringstream msg;
@@ -561,9 +596,9 @@ Status FragmentMgr::exec_external_plan_fragment(const TScanOpenParams& params, c
     }
 
     // set up desc tbl
-    DescriptorTbl* desc_tbl = NULL;
+    DescriptorTbl* desc_tbl = nullptr;
     ObjectPool obj_pool;
-    st = DescriptorTbl::create(&obj_pool, t_query_plan_info.desc_tbl, &desc_tbl);
+    st = DescriptorTbl::create(&obj_pool, t_query_plan_info.desc_tbl, &desc_tbl, params.batch_size);
     if (!st.ok()) {
         LOG(WARNING) << "open context error: extract DescriptorTbl failure";
         std::stringstream msg;
@@ -617,7 +652,6 @@ Status FragmentMgr::exec_external_plan_fragment(const TScanOpenParams& params, c
             TTabletVersionInfo info = iter->second;
             scan_range.tablet_id = tablet_id;
             scan_range.version = std::to_string(info.version);
-            scan_range.version_hash = std::to_string(info.version_hash);
             scan_range.schema_hash = std::to_string(info.schema_hash);
             scan_range.hosts.push_back(address);
         } else {

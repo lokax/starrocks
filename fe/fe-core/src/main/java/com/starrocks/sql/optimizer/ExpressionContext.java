@@ -1,10 +1,12 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.base.LogicalProperty;
+import com.starrocks.sql.optimizer.base.PhysicalPropertySet;
 import com.starrocks.sql.optimizer.operator.Operator;
 import com.starrocks.sql.optimizer.statistics.Statistics;
 
@@ -52,8 +54,8 @@ public class ExpressionContext {
         // Add child property and statistics
         for (Group group : groupExpression.getInputs()) {
             childrenProperty.add(group.getLogicalProperty());
-            if (group.getConfidenceStatistics() != null) {
-                childrenStatistics.add(group.getConfidenceStatistics());
+            if (group.hasConfidenceStatistic(PhysicalPropertySet.EMPTY)) {
+                childrenStatistics.add(group.getConfidenceStatistic(PhysicalPropertySet.EMPTY));
             } else {
                 childrenStatistics.add(group.getStatistics());
             }
@@ -98,8 +100,8 @@ public class ExpressionContext {
         return childrenProperty.get(index).getLeftMostScanTabletsNum();
     }
 
-    public boolean isExecuteInOneInstance(int index) {
-        return childrenProperty.get(index).isExecuteInOneInstance();
+    public boolean isExecuteInOneTablet(int index) {
+        return childrenProperty.get(index).isExecuteInOneTablet();
     }
 
     public Operator getChildOperator(int index) {
@@ -110,12 +112,9 @@ public class ExpressionContext {
         }
     }
 
-    public ExpressionContext getChildContext(int index) {
-        if (expression != null) {
-            return new ExpressionContext(expression.getInputs().get(index));
-        } else {
-            return new ExpressionContext(groupExpression.getInputs().get(index).getFirstLogicalExpression());
-        }
+    public GroupExpression getChildGroupExpression(int index) {
+        Preconditions.checkNotNull(groupExpression);
+        return groupExpression.getInputs().get(index).getFirstLogicalExpression();
     }
 
     public Statistics getStatistics() {

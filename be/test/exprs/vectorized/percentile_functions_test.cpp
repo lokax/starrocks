@@ -1,9 +1,11 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/percentile_functions.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+
+#include "util/percentile_value.h"
 
 namespace starrocks {
 namespace vectorized {
@@ -45,6 +47,24 @@ TEST_F(PercentileFunctionsTest, percentileHashTest) {
     ASSERT_EQ(1, percentile->get_object(0)->quantile(1));
     ASSERT_EQ(2, percentile->get_object(1)->quantile(1));
     ASSERT_EQ(3, percentile->get_object(2)->quantile(1));
+}
+
+TEST_F(PercentileFunctionsTest, percentileNullTest) {
+    Columns columns;
+    auto c1 = PercentileColumn::create();
+    auto c1_null = NullableColumn::create(c1, NullColumn::create());
+    c1_null->append_nulls(1);
+    columns.push_back(c1_null);
+
+    auto c2 = DoubleColumn::create();
+    auto c2_null = NullableColumn::create(c2, NullColumn::create());
+    c2_null->append_nulls(1);
+    columns.push_back(c2_null);
+
+    ColumnPtr column = PercentileFunctions::percentile_approx_raw(ctx, columns);
+    ASSERT_TRUE(column->is_nullable());
+    auto result = ColumnHelper::as_column<NullableColumn>(column);
+    ASSERT_TRUE(result->is_null(0));
 }
 
 } // namespace vectorized

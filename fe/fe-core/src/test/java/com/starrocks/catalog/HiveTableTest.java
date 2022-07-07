@@ -25,6 +25,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.common.DdlException;
 import com.starrocks.external.hive.HiveRepository;
+import com.starrocks.server.GlobalStateMgr;
 import mockit.Expectations;
 import mockit.Mocked;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
@@ -40,6 +41,7 @@ import java.util.Map;
 public class HiveTableTest {
     private String hiveDb;
     private String hiveTable;
+    String resourceName;
     private List<Column> columns;
     private Map<String, String> properties;
 
@@ -47,30 +49,22 @@ public class HiveTableTest {
     public void setUp() {
         hiveDb = "db0";
         hiveTable = "table0";
+        resourceName = "hive0";
 
         columns = Lists.newArrayList();
-        Column column = new Column("col1", Type.BIGINT);
+        Column column = new Column("col1", Type.BIGINT, true);
         columns.add(column);
 
         properties = Maps.newHashMap();
         properties.put("database", hiveDb);
         properties.put("table", hiveTable);
-        properties.put("hive.metastore.uris", "thrift://127.0.0.1:9083");
+        properties.put("resource", resourceName);
     }
 
     @Test
-    public void testNormal() throws DdlException {
-        HiveTable table = new HiveTable(1000, "hive_table", columns, properties);
-        Assert.assertEquals(String.format("%s.%s", hiveDb, hiveTable), table.getHiveDbTable());
-        Assert.assertEquals(1, table.getHiveProperties().size());
-    }
-
-    @Test
-    public void testWithResourceName(@Mocked Catalog catalog,
+    public void testWithResourceName(@Mocked GlobalStateMgr globalStateMgr,
                                      @Mocked ResourceMgr resourceMgr,
                                      @Mocked HiveRepository hiveRepository) throws DdlException {
-        String resourceName = "hive0";
-
         Resource hiveResource = new HiveResource(resourceName);
         Map<String, String> resourceProperties = Maps.newHashMap();
         resourceProperties.put("hive.metastore.uris", "thrift://127.0.0.1:9083");
@@ -85,20 +79,21 @@ public class HiveTableTest {
         Table msTable = new Table();
         msTable.setPartitionKeys(partKeys);
         msTable.setSd(sd);
+        msTable.setTableType("MANAGED_TABLE");
 
         new Expectations() {
             {
-                Catalog.getCurrentCatalog();
-                result = catalog;
+                GlobalStateMgr.getCurrentState();
+                result = globalStateMgr;
                 minTimes = 0;
 
-                catalog.getResourceMgr();
+                globalStateMgr.getResourceMgr();
                 result = resourceMgr;
 
                 resourceMgr.getResource("hive0");
                 result = hiveResource;
 
-                catalog.getHiveRepository();
+                globalStateMgr.getHiveRepository();
                 result = hiveRepository;
 
                 hiveRepository.getTable(resourceName, hiveDb, hiveTable);
@@ -106,14 +101,14 @@ public class HiveTableTest {
             }
         };
 
-        columns.add(new Column("col2", Type.INT));
+        columns.add(new Column("col2", Type.INT, true));
         properties.put("resource", resourceName);
         HiveTable table = new HiveTable(1000, "hive_table", columns, properties);
-        Assert.assertEquals(hiveTable, table.getHiveTable());
+        Assert.assertEquals(hiveTable, table.getTableName());
         Assert.assertEquals(hiveDb, table.getHiveDb());
         Assert.assertEquals(String.format("%s.%s", hiveDb, hiveTable), table.getHiveDbTable());
         Assert.assertEquals(hdfsPath, table.getHdfsPath());
-        Assert.assertEquals(Lists.newArrayList(new Column("col1", Type.BIGINT)), table.getPartitionColumns());
+        Assert.assertEquals(Lists.newArrayList(new Column("col1", Type.BIGINT, true)), table.getPartitionColumns());
     }
 
     @Test(expected = DdlException.class)

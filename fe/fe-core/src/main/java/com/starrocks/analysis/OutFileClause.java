@@ -38,7 +38,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 // For syntax select * from tbl INTO OUTFILE xxxx
-public class OutFileClause {
+public class OutFileClause implements ParseNode {
     private static final Logger LOG = LogManager.getLogger(OutFileClause.class);
 
     private static final String BROKER_PROP_PREFIX = "broker.";
@@ -47,7 +47,7 @@ public class OutFileClause {
     private static final String PROP_LINE_DELIMITER = "line_delimiter";
     private static final String PROP_MAX_FILE_SIZE = "max_file_size";
 
-    private static final long DEFAULT_MAX_FILE_SIZE_BYTES = 1 * 1024 * 1024 * 1024; // 1GB
+    private static final long DEFAULT_MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1024L; // 1GB
     private static final long MIN_FILE_SIZE_BYTES = 5 * 1024 * 1024L; // 5MB
     private static final long MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024L; // 2GB
 
@@ -94,7 +94,7 @@ public class OutFileClause {
         return brokerDesc;
     }
 
-    public void analyze(Analyzer analyzer) throws AnalysisException {
+    public void analyze() throws AnalysisException {
         if (Strings.isNullOrEmpty(filePath)) {
             throw new AnalysisException("Must specify file in OUTFILE clause");
         }

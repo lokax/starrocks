@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.operator.logical;
 
 import com.starrocks.sql.optimizer.ExpressionContext;
@@ -10,8 +10,8 @@ import com.starrocks.sql.optimizer.operator.OperatorVisitor;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Objects;
 
 public class LogicalValuesOperator extends LogicalOperator {
     private final List<ColumnRefOperator> columnRefSet;
@@ -21,6 +21,12 @@ public class LogicalValuesOperator extends LogicalOperator {
         super(OperatorType.LOGICAL_VALUES);
         this.columnRefSet = columnRefSet;
         this.rows = rows;
+    }
+
+    private LogicalValuesOperator(Builder builder) {
+        super(OperatorType.LOGICAL_VALUES, builder.getLimit(), builder.getPredicate(), builder.getProjection());
+        this.columnRefSet = builder.columnRefSet;
+        this.rows = builder.rows;
     }
 
     public List<ColumnRefOperator> getColumnRefSet() {
@@ -33,7 +39,11 @@ public class LogicalValuesOperator extends LogicalOperator {
 
     @Override
     public ColumnRefSet getOutputColumns(ExpressionContext expressionContext) {
-        return new ColumnRefSet(columnRefSet);
+        if (projection != null) {
+            return new ColumnRefSet(new ArrayList<>(projection.getColumnRefMap().keySet()));
+        } else {
+            return new ColumnRefSet(columnRefSet);
+        }
     }
 
     @Override
@@ -47,22 +57,30 @@ public class LogicalValuesOperator extends LogicalOperator {
 
     @Override
     public boolean equals(Object o) {
-        if (this == o) {
-            return true;
-        }
-        if (o == null || getClass() != o.getClass()) {
-            return false;
-        }
-        if (!super.equals(o)) {
-            return false;
-        }
-        LogicalValuesOperator that = (LogicalValuesOperator) o;
-        return Objects.equals(columnRefSet, that.columnRefSet) &&
-                Objects.equals(rows, that.rows);
+        return this == o;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode(), columnRefSet, rows);
+        return System.identityHashCode(this);
+    }
+
+    public static class Builder extends LogicalOperator.Builder<LogicalValuesOperator, LogicalValuesOperator.Builder> {
+        private List<ColumnRefOperator> columnRefSet;
+        private List<List<ScalarOperator>> rows;
+
+        @Override
+        public LogicalValuesOperator build() {
+            return new LogicalValuesOperator(this);
+        }
+
+        @Override
+        public Builder withOperator(LogicalValuesOperator valuesOperator) {
+            super.withOperator(valuesOperator);
+
+            this.columnRefSet = valuesOperator.columnRefSet;
+            this.rows = valuesOperator.rows;
+            return this;
+        }
     }
 }

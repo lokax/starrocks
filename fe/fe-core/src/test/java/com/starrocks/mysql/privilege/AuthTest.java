@@ -35,26 +35,42 @@ import com.starrocks.analysis.TablePattern;
 import com.starrocks.analysis.UserDesc;
 import com.starrocks.analysis.UserIdentity;
 import com.starrocks.catalog.AccessPrivilege;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.DomainResolver;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.UserException;
+import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.mysql.MysqlPassword;
 import com.starrocks.mysql.security.LdapSecurity;
 import com.starrocks.persist.EditLog;
+import com.starrocks.persist.ImpersonatePrivInfo;
 import com.starrocks.persist.PrivInfo;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.QueryState;
+import com.starrocks.sql.ast.GrantImpersonateStmt;
+import com.starrocks.sql.ast.GrantRoleStmt;
+import com.starrocks.sql.ast.RevokeImpersonateStmt;
+import com.starrocks.sql.ast.RevokeRoleStmt;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.SystemInfoService;
+import mockit.Delegate;
 import mockit.Expectations;
 import mockit.Mocked;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.InvocationTargetException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 
@@ -62,7 +78,7 @@ public class AuthTest {
 
     private Auth auth;
     @Mocked
-    public Catalog catalog;
+    public GlobalStateMgr globalStateMgr;
     @Mocked
     private Analyzer analyzer;
     @Mocked
@@ -108,15 +124,15 @@ public class AuthTest {
                 minTimes = 0;
                 result = SystemInfoService.DEFAULT_CLUSTER;
 
-                Catalog.getCurrentCatalog();
+                GlobalStateMgr.getCurrentState();
                 minTimes = 0;
-                result = catalog;
+                result = globalStateMgr;
 
-                catalog.getAuth();
+                globalStateMgr.getAuth();
                 minTimes = 0;
                 result = auth;
 
-                catalog.getEditLog();
+                globalStateMgr.getEditLog();
                 minTimes = 0;
                 result = editLog;
 
@@ -126,6 +142,10 @@ public class AuthTest {
                 ConnectContext.get();
                 minTimes = 0;
                 result = ctx;
+
+                ctx.getClusterName();
+                minTimes = 0;
+                result = SystemInfoService.DEFAULT_CLUSTER;
 
                 ctx.getQualifiedUser();
                 minTimes = 0;
@@ -146,6 +166,11 @@ public class AuthTest {
         };
 
         resolver = new MockDomianResolver(auth);
+    }
+
+    @After
+    public void tearDown() throws Exception {
+        Config.enable_validate_password = false;  // skip password validation
     }
 
     @Test
@@ -1079,7 +1104,202 @@ public class AuthTest {
         Assert.assertFalse(
                 auth.checkPlainPassword(SystemInfoService.DEFAULT_CLUSTER + ":zhangsan", "10.1.1.1", "abcde", null));
 
+        // 38.1 grant node_priv to user
+        privileges = Lists.newArrayList(AccessPrivilege.NODE_PRIV);
+        userIdentity = new UserIdentity("zhaoliu", "%");
+        userDesc = new UserDesc(userIdentity, "12345", true);
+        tablePattern = new TablePattern("*", "*");
+
+        createUserStmt = new CreateUserStmt(false, userDesc, null);
+        try {
+            createUserStmt.analyze(analyzer);
+        } catch (UserException e) {
+            e.printStackTrace();
+            Assert.fail();
+        }
+
+        try {
+            auth.createUser(createUserStmt);
+        } catch (DdlException e) {
+            Assert.fail();
+        }
+
+        grantStmt = new GrantStmt(userIdentity, null, tablePattern, privileges);
+        try {
+            grantStmt.analyze(analyzer);
+        } catch (UserException e1) {
+            e1.printStackTrace();
+            Assert.fail();
+        }
+
+        try {
+            auth.grant(grantStmt);
+        } catch (DdlException e1) {
+            e1.printStackTrace();
+            Assert.fail();
+        }
+
+        // 38.2 revoke node_priv from user
+        revokeStmt = new RevokeStmt(userIdentity, null, tablePattern, privileges);
+        try {
+            revokeStmt.analyze(analyzer);
+        } catch (AnalysisException e) {
+            e.printStackTrace();
+            Assert.fail();
+        }
+
+        currentUser2.clear();
+        auth.checkPlainPassword(SystemInfoService.DEFAULT_CLUSTER + ":zhaoliu", "", "12345", currentUser2);
+        Assert.assertEquals(1, currentUser2.size());
+        Assert.assertTrue(auth.checkGlobalPriv(currentUser2.get(0), PrivPredicate.OPERATOR));
+
+        try {
+            auth.revoke(revokeStmt);
+        } catch (DdlException e) {
+            e.printStackTrace();
+            Assert.fail();
+        }
+        Assert.assertFalse(auth.checkGlobalPriv(currentUser2.get(0), PrivPredicate.OPERATOR));
+
+        // 38.3 grant node_priv to role
+        grantStmt = new GrantStmt(null, "role3", tablePattern, privileges);
+        try {
+            grantStmt.analyze(analyzer);
+        } catch (UserException e1) {
+            e1.printStackTrace();
+            Assert.fail();
+        }
+
+        try {
+            auth.grant(grantStmt);
+        } catch (DdlException e1) {
+            e1.printStackTrace();
+            Assert.fail();
+        }
+
+        // 38.4 revoke node_priv from role
+        userDesc = new UserDesc(new UserIdentity("sunqi", "%"), "12345", true);
+        createUserStmt = new CreateUserStmt(false, userDesc, "role3");
+        try {
+            createUserStmt.analyze(analyzer);
+        } catch (UserException e) {
+            e.printStackTrace();
+            Assert.fail();
+        }
+
+        try {
+            auth.createUser(createUserStmt);
+        } catch (DdlException e) {
+            e.printStackTrace();
+            Assert.fail();
+        }
+
+        currentUser2.clear();
+        auth.checkPlainPassword(SystemInfoService.DEFAULT_CLUSTER + ":sunqi", "", "12345", currentUser2);
+        Assert.assertEquals(1, currentUser2.size());
+        Assert.assertTrue(auth.checkGlobalPriv(currentUser2.get(0), PrivPredicate.OPERATOR));
+
+        revokeStmt = new RevokeStmt(null, "role3", tablePattern, privileges);
+        try {
+            revokeStmt.analyze(analyzer);
+        } catch (AnalysisException e) {
+            e.printStackTrace();
+            Assert.fail();
+        }
+
+        try {
+            auth.revoke(revokeStmt);
+        } catch (DdlException e) {
+            e.printStackTrace();
+            Assert.fail();
+        }
+        Assert.assertFalse(auth.checkGlobalPriv(currentUser2.get(0), PrivPredicate.OPERATOR));
     }
+
+    @Test
+    public void testGrantRevokeRole() throws Exception {
+        // 1. create user with no role specified
+        UserIdentity userIdentity = new UserIdentity("test_user", "%");
+        UserDesc userDesc = new UserDesc(userIdentity, "12345", true);
+        CreateUserStmt createUserStmt = new CreateUserStmt(false, userDesc, null);
+        createUserStmt.analyze(analyzer);
+        auth.createUser(createUserStmt);
+
+        // check if select & load & spark resource usage privilege all not granted
+        String dbName = "default_cluster:db1";
+        String resouceName = "test_spark";
+        Assert.assertEquals(false, auth.checkDbPriv(userIdentity, dbName, PrivPredicate.SELECT));
+        Assert.assertEquals(false, auth.checkDbPriv(userIdentity, dbName, PrivPredicate.LOAD));
+        Assert.assertEquals(false, auth.checkResourcePriv(userIdentity, resouceName, PrivPredicate.USAGE));
+        Assert.assertEquals(0, auth.getRoleNamesByUser(userIdentity).size());
+
+        // 2. add a role with select privilege
+        String selectRoleName = new String("select_role");
+        CreateRoleStmt createRoleStmt = new CreateRoleStmt(selectRoleName);
+        createRoleStmt.analyze(analyzer);
+        Assert.assertEquals(false, auth.doesRoleExist(createRoleStmt.getQualifiedRole()));
+        auth.createRole(createRoleStmt);
+        Assert.assertEquals(true, auth.doesRoleExist(createRoleStmt.getQualifiedRole()));
+
+        // 3. grant select privilege to role
+        TablePattern tablePattern = new TablePattern("db1", "*");
+        List<AccessPrivilege> privileges = Lists.newArrayList(AccessPrivilege.SELECT_PRIV);
+        GrantStmt grantStmt = new GrantStmt(null, selectRoleName, tablePattern, privileges);
+        grantStmt.analyze(analyzer);
+        auth.grant(grantStmt);
+
+        // 4. grant role to user
+        GrantRoleStmt grantRoleStmt = new GrantRoleStmt(selectRoleName, userIdentity);
+        com.starrocks.sql.analyzer.Analyzer.analyze(grantRoleStmt, ctx);
+        auth.grantRole(grantRoleStmt);
+
+        // check if select privilege granted, load privilege not granted
+        Assert.assertEquals(true, auth.checkDbPriv(userIdentity, dbName, PrivPredicate.SELECT));
+        Assert.assertEquals(false, auth.checkDbPriv(userIdentity, dbName, PrivPredicate.LOAD));
+        Assert.assertEquals(false, auth.checkResourcePriv(userIdentity, resouceName, PrivPredicate.USAGE));
+        Assert.assertEquals(1, auth.getRoleNamesByUser(userIdentity).size());
+
+        // 5. add a new role with load privilege & spark resource usage
+        String loadRoleName = "load_role";
+        createRoleStmt = new CreateRoleStmt(loadRoleName);
+        createRoleStmt.analyze(analyzer);
+        auth.createRole(createRoleStmt);
+
+        // 6. grant load privilege to role
+        privileges = Lists.newArrayList(AccessPrivilege.LOAD_PRIV);
+        grantStmt = new GrantStmt(null, loadRoleName, tablePattern, privileges);
+        grantStmt.analyze(analyzer);
+        auth.grant(grantStmt);
+
+        // 8. grant resource to role
+        privileges = Lists.newArrayList(AccessPrivilege.USAGE_PRIV);
+        ResourcePattern resourcePattern = new ResourcePattern(resouceName);
+        grantStmt = new GrantStmt(null, loadRoleName, resourcePattern, privileges);
+        grantStmt.analyze(analyzer);
+        auth.grant(grantStmt);
+
+        // 7. grant role to user
+        grantRoleStmt = new GrantRoleStmt(loadRoleName, userIdentity);
+        com.starrocks.sql.analyzer.Analyzer.analyze(grantRoleStmt, ctx);
+        auth.grantRole(grantRoleStmt);
+
+        // check if select & load privilege & spark resource usage all granted
+        Assert.assertEquals(true, auth.checkDbPriv(userIdentity, dbName, PrivPredicate.SELECT));
+        Assert.assertEquals(true, auth.checkDbPriv(userIdentity, dbName, PrivPredicate.LOAD));
+        Assert.assertEquals(true, auth.checkResourcePriv(userIdentity, resouceName, PrivPredicate.USAGE));
+        Assert.assertEquals(2, auth.getRoleNamesByUser(userIdentity).size());
+
+        // 8. revoke load & spark resource usage from user
+        RevokeRoleStmt revokeRoleStmt = new RevokeRoleStmt(loadRoleName, userIdentity);
+        com.starrocks.sql.analyzer.Analyzer.analyze(revokeRoleStmt, ctx);
+        auth.revokeRole(revokeRoleStmt);
+
+        // check if select privilege granted, load privilege not granted
+        Assert.assertEquals(true, auth.checkDbPriv(userIdentity, dbName, PrivPredicate.SELECT));
+        Assert.assertEquals(false, auth.checkDbPriv(userIdentity, dbName, PrivPredicate.LOAD));
+        Assert.assertEquals(false, auth.checkResourcePriv(userIdentity, resouceName, PrivPredicate.USAGE));
+        Assert.assertEquals(1, auth.getRoleNamesByUser(userIdentity).size());
+     }
 
     @Test
     public void testResource() {
@@ -1112,6 +1332,7 @@ public class AuthTest {
             e.printStackTrace();
             Assert.fail();
         }
+        Assert.assertEquals(1, auth.getAuthInfo(userIdentity).size());
         Assert.assertTrue(auth.checkResourcePriv(userIdentity, resourceName, PrivPredicate.USAGE));
         Assert.assertFalse(auth.checkGlobalPriv(userIdentity, PrivPredicate.USAGE));
 
@@ -1344,6 +1565,62 @@ public class AuthTest {
             hasException = true;
         }
         Assert.assertTrue(hasException);
+
+        dropUserStmt = new DropUserStmt(userIdentity);
+        try {
+            dropUserStmt.analyze(analyzer);
+            auth.dropUser(dropUserStmt);
+        } catch (UserException e) {
+            e.printStackTrace();
+            Assert.fail();
+        }
+
+        // ------ grant|revoke node_priv to|from role ------
+        // 1. grant node_priv on resource '*' to role 'role0'
+        List<AccessPrivilege> nodePrivileges = Lists.newArrayList(AccessPrivilege.NODE_PRIV);
+        grantStmt = new GrantStmt(null, role, anyResourcePattern, nodePrivileges);
+        try {
+            grantStmt.analyze(analyzer);
+            auth.grant(grantStmt);
+        } catch (UserException e1) {
+            e1.printStackTrace();
+            Assert.fail();
+        }
+
+        createUserStmt = new CreateUserStmt(false, userDesc, role);
+        try {
+            createUserStmt.analyze(analyzer);
+            auth.createUser(createUserStmt);
+        } catch (UserException e) {
+            e.printStackTrace();
+            Assert.fail();
+        }
+        Assert.assertTrue(auth.checkResourcePriv(userIdentity, anyResource, PrivPredicate.OPERATOR));
+        Assert.assertTrue(auth.checkGlobalPriv(userIdentity, PrivPredicate.OPERATOR));
+
+        // 2. revoke node_priv on resource '*' from role 'role0'
+        revokeStmt = new RevokeStmt(null, role, anyResourcePattern, nodePrivileges);
+        try {
+            revokeStmt.analyze(analyzer);
+            auth.revoke(revokeStmt);
+        } catch (UserException e) {
+            e.printStackTrace();
+            Assert.fail();
+        }
+        Assert.assertFalse(auth.checkResourcePriv(userIdentity, anyResource, PrivPredicate.OPERATOR));
+        Assert.assertFalse(auth.checkGlobalPriv(userIdentity, PrivPredicate.OPERATOR));
+
+        // ------ error case ------
+        hasException = false;
+        grantStmt = new GrantStmt(null, role, resourcePattern, nodePrivileges);
+        try {
+            grantStmt.analyze(analyzer);
+            auth.grant(grantStmt);
+        } catch (UserException e1) {
+            e1.printStackTrace();
+            hasException = true;
+        }
+        Assert.assertTrue(hasException);
     }
 
     @Test
@@ -1530,4 +1807,519 @@ public class AuthTest {
                 auth.checkPassword(SystemInfoService.DEFAULT_CLUSTER + ":lisi", "192.168.8.8", new byte[0], seed,
                         currentUser));
     }
-}
+
+    @Test
+    public void testPasswordReuseNormal() throws Exception {
+        String password = "123456AAbb";
+        UserIdentity user = new UserIdentity("test_user", "%");
+        user.analyze("default_cluster");
+        UserDesc userDesc = new UserDesc(user, password, true);
+        // 1. create user with no role
+        CreateUserStmt createUserStmt = new CreateUserStmt(false, userDesc, null);
+        createUserStmt.analyze(analyzer);
+        auth.createUser(createUserStmt);
+
+        // enable_password_reuse is false allow same password
+        Config.enable_password_reuse = true;
+        auth.checkPasswordReuse(user, password);
+
+        // enable_password_reuse is false, check different password
+        Config.enable_password_reuse = false;
+        auth.checkPasswordReuse(user, password + "ss");
+    }
+
+    @Test
+    public void testPasswordValidationNormal() throws Exception {
+        String badPassword = "123456";
+        String goodPassword = "1234Star";
+
+        Config.enable_validate_password = false;
+        // enable_auth_check is false, allow bad password
+        auth.validatePassword(badPassword);
+
+       // enable_password_reuse is true for a good password
+        Config.enable_validate_password = true;
+        auth.validatePassword(goodPassword);
+    }
+
+    @Test(expected = DdlException.class)
+    public void testPasswordValidationShortPasssword() throws Exception {
+        // length 5 < 8
+        String badPassword = "Aa123";
+        Config.enable_validate_password = true;
+        auth.validatePassword(badPassword);
+    }
+
+    @Test(expected = DdlException.class)
+    public void testPasswordValidationAllNumberPasssword() throws Exception {
+        // no lowercase letter or uppercase letter
+        String badPassword = "123456789";
+        Config.enable_validate_password = true;
+        auth.validatePassword(badPassword);
+    }
+
+    @Test(expected = DdlException.class)
+    public void testPasswordValidationPasswordReuse() throws Exception {
+        String password = "123456AAbb";
+        UserIdentity user = new UserIdentity("test_user", "%");
+        user.analyze("default_cluster");
+        UserDesc userDesc = new UserDesc(user, password, true);
+        // 1. create user with no role
+        CreateUserStmt createUserStmt = new CreateUserStmt(false, userDesc, null);
+        createUserStmt.analyze(analyzer);
+        auth.createUser(createUserStmt);
+
+        // 2. check reuse
+        Config.enable_password_reuse = false;
+        auth.checkPasswordReuse(user, password);
+    }
+
+    private static final Logger LOG = LogManager.getLogger(AuthTest.class);
+    @Test
+    public void testManyUsersAndTables() throws Exception {
+        int BIG_NUMBER = 500;
+        int BIG_NUMBER2 = BIG_NUMBER / 2;
+        int LOG_INTERVAL = BIG_NUMBER / 50;
+        String DB = SystemInfoService.DEFAULT_CLUSTER  + ":db1";
+        LOG.info("before add privilege: table {} entries, user {} entries",
+                auth.getTablePrivTable().size(), auth.getUserPrivTable().size());
+        Assert.assertEquals(1, auth.getAuthInfo(null).size());
+
+        // 1. create N user with select privilege to N/2 table
+        // 1.1 create user
+        for (int i = 0; i != BIG_NUMBER; i++) {
+            String userName = String.format("user_%d_of_%d", i, BIG_NUMBER);
+            UserIdentity userIdentity = new UserIdentity(userName, "%");
+            userIdentity.analyze(SystemInfoService.DEFAULT_CLUSTER);
+            UserDesc userDesc = new UserDesc(userIdentity, "12345", true);
+            CreateUserStmt createUserStmt = new CreateUserStmt(false, userDesc, null);
+            createUserStmt.analyze(analyzer);
+            auth.createUser(createUserStmt);
+        }
+        Assert.assertEquals(1 + BIG_NUMBER, auth.getAuthInfo(null).size());
+
+        // check the last user
+        String lastUserName = String.format("user_%d_of_%d", BIG_NUMBER - 1, BIG_NUMBER);
+        UserIdentity lastUserIdentity = new UserIdentity(lastUserName, "%");
+        lastUserIdentity.analyze(SystemInfoService.DEFAULT_CLUSTER);
+        // information_schema
+        Assert.assertEquals(1, auth.getDBPrivEntries(lastUserIdentity).size());
+        int infomationSchemaTableCnt = auth.getTablePrivEntries(lastUserIdentity).size();
+        Assert.assertEquals(1, auth.getAuthInfo(lastUserIdentity).size());
+
+        // 1.2 grant N/2 table privilege
+        long start = System.currentTimeMillis();
+        for (int i = 0; i != BIG_NUMBER; i++) {
+            if (i % LOG_INTERVAL == 0) {
+                LOG.info("added {} user..", i);
+            }
+            String userName = String.format("user_%d_of_%d", i, BIG_NUMBER);
+            UserIdentity userIdentity = new UserIdentity(userName, "%");
+            userIdentity.analyze(SystemInfoService.DEFAULT_CLUSTER);
+            for (int j = 0; j != BIG_NUMBER2; j++) {
+                String tableName = String.format("table_%d_of_%d", j, BIG_NUMBER2);
+                TablePattern tablePattern = new TablePattern("db1", tableName);
+                tablePattern.analyze(SystemInfoService.DEFAULT_CLUSTER);
+                PrivBitSet privileges = AccessPrivilege.SELECT_PRIV.toPrivilege();
+                auth.grantPrivs(userIdentity, tablePattern, privileges, false);
+            }
+        }
+        long end = System.currentTimeMillis();
+        LOG.info("add privilege: {} entries, total {} ms",  auth.getTablePrivTable().size(), end - start);
+
+        start = System.currentTimeMillis();
+        for (int i = 0; i != BIG_NUMBER; i++) {
+            // 1.1 create user
+            String userName = String.format("user_%d_of_%d", i, BIG_NUMBER);
+            UserIdentity userIdentity = new UserIdentity(userName, "%");
+            userIdentity.analyze(SystemInfoService.DEFAULT_CLUSTER);
+            for (int j = 0; j != BIG_NUMBER2; j++) {
+                String tableName = String.format("table_%d_of_%d", j, BIG_NUMBER2);
+                Assert.assertTrue(auth.checkTblPriv(
+                        userIdentity, DB, tableName, PrivPredicate.SELECT));
+            }
+        }
+        end = System.currentTimeMillis();
+        LOG.info("check privilege: total {} ms", end - start);
+
+        // check the last user
+        // infomation_schema
+        Assert.assertEquals(1, auth.getDBPrivEntries(lastUserIdentity).size());
+        Assert.assertEquals(BIG_NUMBER / 2 + infomationSchemaTableCnt, auth.getTablePrivEntries(lastUserIdentity).size());
+        Assert.assertEquals(1, auth.getAuthInfo(lastUserIdentity).size());
+    }
+
+    @Test
+    public void checkDefaultRootPrivilege() throws Exception {
+        Assert.assertTrue(auth.checkHasPriv(ctx, PrivPredicate.ADMIN, Auth.PrivLevel.GLOBAL));
+        Assert.assertTrue(auth.checkHasPriv(ctx, PrivPredicate.GRANT, Auth.PrivLevel.GLOBAL));
+        Assert.assertFalse(auth.checkHasPriv(ctx, PrivPredicate.ADMIN, Auth.PrivLevel.DATABASE));
+        Assert.assertFalse(auth.checkHasPriv(ctx, PrivPredicate.ADMIN, Auth.PrivLevel.TABLE));
+    }
+
+    @Test
+    public void testGetPasswordByApproximate() throws Exception {
+        UserIdentity userIdentity = new UserIdentity("test_user", "%");
+        userIdentity.analyze(SystemInfoService.DEFAULT_CLUSTER);
+        UserDesc userDesc = new UserDesc(userIdentity, "12345", true);
+        CreateUserStmt createUserStmt = new CreateUserStmt(false, userDesc, null);
+        createUserStmt.analyze(analyzer);
+        auth.createUser(createUserStmt);
+
+        Assert.assertNull(auth.getUserPrivTable().getPasswordByApproximate(
+                SystemInfoService.DEFAULT_CLUSTER + ":unknown_user", "10.1.1.1"));
+        Assert.assertNotNull(auth.getUserPrivTable().getPasswordByApproximate(
+                SystemInfoService.DEFAULT_CLUSTER + ":test_user", "10.1.1.1"));
+        Assert.assertNotNull(auth.getUserPrivTable().getPasswordByApproximate(
+                SystemInfoService.DEFAULT_CLUSTER + ":test_user", "localhost"));
+    }
+
+    /**
+     * TODO I think this case should in UserPrivTableTest instead of AuthTest
+     *    Unfortunately the two classes are highly coupled.
+     */
+    @Test
+    public void testMultiUserMatch() throws Exception {
+        Assert.assertEquals(1, auth.getUserPrivTable().size());
+        String PASSWORD_STR = "12345";
+
+        // create four entries
+        String userHostPatterns[][] = {
+                {"user_1", "10.1.1.1"},
+                {"user_1", "%"},
+                {"user_zzz", "%"},
+                {"user_zzz", "10.1.1.1"},
+        };
+        for (String[] userHost: userHostPatterns) {
+            UserIdentity userIdentity = new UserIdentity(userHost[0], userHost[1]);
+            userIdentity.analyze(SystemInfoService.DEFAULT_CLUSTER);
+            UserDesc userDesc = new UserDesc(userIdentity, PASSWORD_STR, true);
+            CreateUserStmt createUserStmt = new CreateUserStmt(false, userDesc, null);
+            createUserStmt.analyze(analyzer);
+            auth.createUser(createUserStmt);
+        }
+        Assert.assertEquals(5, auth.getUserPrivTable().size());
+
+        // check if login match
+        // remote_user, remote_ip, expect_user_identity
+        String userHostAndMatchedUserHosts[][] = {
+                // login as user_1 from 10.1.1.1, expected identified as user_1@10.1.1.1
+                {"user_1", "10.1.1.1", "user_1", "10.1.1.1"},
+                // login as user_1 from 10.1.1.2, expected identified as user_1@%, fuzzy matching
+                {"user_1", "10.1.1.2", "user_1", "%"},
+                {"user_zzz", "10.1.1.1", "user_zzz", "10.1.1.1"},
+                {"user_zzz", "10.1.1.2", "user_zzz", "%"},
+
+        };
+        for (String[] userHostAndMatchedUserHost : userHostAndMatchedUserHosts) {
+            List<UserIdentity> identities = new ArrayList<>();
+            String remoteUser = SystemInfoService.DEFAULT_CLUSTER + ":" + userHostAndMatchedUserHost[0];
+            String remoteIp = userHostAndMatchedUserHost[1];
+            String expectQualifiedUser = SystemInfoService.DEFAULT_CLUSTER + ":" + userHostAndMatchedUserHost[2];
+            String expectHost = userHostAndMatchedUserHost[3];
+
+            auth.checkPlainPassword(remoteUser, remoteIp, PASSWORD_STR, identities);
+            Assert.assertEquals(1, identities.size());
+            Assert.assertEquals(expectQualifiedUser, identities.get(0).getQualifiedUser());
+            Assert.assertEquals(expectHost, identities.get(0).getHost());
+
+            identities.clear();
+            byte[] seed = "dJSH\\]mcwKJlLH[bYunm".getBytes("utf-8");
+            byte[] scramble = MysqlPassword.scramble(seed, PASSWORD_STR);
+            auth.checkPassword(remoteUser, remoteIp, scramble, seed, identities);
+            Assert.assertEquals(1, identities.size());
+            Assert.assertEquals(expectQualifiedUser, identities.get(0).getQualifiedUser());
+            Assert.assertEquals(expectHost, identities.get(0).getHost());
+        }
+
+        // test iterator
+        // full iterator
+        Iterator<PrivEntry> iter = auth.getUserPrivTable().getFullReadOnlyIterator();
+        List<String> userHostResult = new ArrayList<>();
+        while(iter.hasNext()) {
+            PrivEntry entry = iter.next();
+            if (entry.getOrigUser() != "root") {
+                userHostResult.add(String.format("%s@%s", entry.getOrigUser(), entry.getOrigHost()));
+            }
+        }
+        Assert.assertEquals(4, userHostResult.size());
+        List<String> expect = new ArrayList<>();
+        for (String[] userHost : userHostPatterns) {
+            expect.add(String.format("default_cluster:%s@%s", userHost[0], userHost[1]));
+        }
+        Collections.sort(expect);
+        Collections.sort(userHostResult);
+        Assert.assertEquals(expect, userHostResult);
+
+        UserIdentity user = new UserIdentity("user_1", "10.1.1.1");
+        user.analyze(SystemInfoService.DEFAULT_CLUSTER);
+        iter = auth.getUserPrivTable().getReadOnlyIteratorByUser(user);
+        userHostResult.clear();
+        while(iter.hasNext()) {
+            PrivEntry entry = iter.next();
+            userHostResult.add(String.format("%s@%s", entry.getOrigUser(), entry.getOrigHost()));
+        }
+        // expect match 2: user_1@10.1.1.1 & user_1@%
+        Assert.assertEquals(2, userHostResult.size());
+        Assert.assertTrue(userHostResult.contains("default_cluster:user_1@10.1.1.1"));
+        Assert.assertTrue(userHostResult.contains("default_cluster:user_1@%"));
+
+
+        // test grant
+        // GRANT select_priv on db1.table1 to user_1@%
+        // GRANT select_priv on db1.table2 to user_1@10.1.1.2
+        // see if user_1@10.1.1.1 can see two table
+        // and user_1@10.1.1.2 can see one table
+
+        // GRANT select_priv on db1.table1 to user_1@%
+        TablePattern tablePattern = new TablePattern("db1", "table1");
+        tablePattern.analyze(SystemInfoService.DEFAULT_CLUSTER);
+        PrivBitSet privileges = AccessPrivilege.SELECT_PRIV.toPrivilege();
+        user = new UserIdentity("user_1", "%");
+        user.analyze(SystemInfoService.DEFAULT_CLUSTER);
+        auth.grantPrivs(user, tablePattern, privileges, false);
+
+        // GRANT select_priv on db1.table2 to user_1@10.1.1.1
+        tablePattern = new TablePattern("db1", "table2");
+        tablePattern.analyze(SystemInfoService.DEFAULT_CLUSTER);
+        privileges = AccessPrivilege.SELECT_PRIV.toPrivilege();
+        user = new UserIdentity("user_1", "10.1.1.1");
+        user.analyze(SystemInfoService.DEFAULT_CLUSTER);
+        auth.grantPrivs(user, tablePattern, privileges, false);
+
+        // check if user_1@10.1.1.1 can see two table
+        List<UserIdentity> identities = new ArrayList<>();
+        auth.checkPlainPassword(
+                SystemInfoService.DEFAULT_CLUSTER + ":user_1", "10.1.1.1", PASSWORD_STR, identities);
+        Assert.assertEquals(1, identities.size());
+        user = identities.get(0);
+        Assert.assertEquals("10.1.1.1", user.getHost());
+        String db = SystemInfoService.DEFAULT_CLUSTER + ":db1";
+        // TODO: this is a legacy bug, I will fix it in another PR
+        // Assert.assertTrue(auth.checkTblPriv(user, db, "table1", PrivPredicate.SELECT));
+        Assert.assertTrue(auth.checkTblPriv(user, db, "table2", PrivPredicate.SELECT));
+
+        // check if user_1@10.1.1.2 can see one table
+        identities.clear();
+        auth.checkPlainPassword(
+                SystemInfoService.DEFAULT_CLUSTER + ":user_1", "10.1.1.2", PASSWORD_STR, identities);
+        Assert.assertEquals(1, identities.size());
+        user = identities.get(0);
+        Assert.assertEquals("%", user.getHost());
+        Assert.assertTrue(auth.checkTblPriv(user, db, "table1", PrivPredicate.SELECT));
+        Assert.assertFalse(auth.checkTblPriv(user, db, "table2", PrivPredicate.SELECT));
+     }
+
+     @Test
+     public void testGrantRevokeImpersonate() throws Exception {
+         // 1. prepare
+         // 1.1create harry, gregory, albert
+         UserIdentity harry = new UserIdentity("Harry", "%");
+         harry.analyze(SystemInfoService.DEFAULT_CLUSTER);
+         UserIdentity gregory = new UserIdentity("Gregory", "%");
+         gregory.analyze(SystemInfoService.DEFAULT_CLUSTER);
+         UserIdentity albert = new UserIdentity("Albert", "%");
+         gregory.analyze(SystemInfoService.DEFAULT_CLUSTER);
+         List<UserIdentity> userToBeCreated = new ArrayList<>();
+         userToBeCreated.add(harry);
+         userToBeCreated.add(gregory);
+         userToBeCreated.add(albert);
+         for (UserIdentity userIdentity : userToBeCreated) {
+             UserDesc userDesc = new UserDesc(userIdentity, "12345", true);
+             CreateUserStmt createUserStmt = new CreateUserStmt(false, userDesc, null);
+             createUserStmt.analyze(analyzer);
+             auth.createUser(createUserStmt);
+         }
+
+
+         // 1.2 before test
+         Assert.assertFalse(auth.canImpersonate(harry, gregory));
+         Assert.assertFalse(auth.canImpersonate(harry, albert));
+
+         // 2. grant impersonate to gregory on harry
+         // 2.1 grant
+         GrantImpersonateStmt grantStmt = new GrantImpersonateStmt(harry, gregory);
+         com.starrocks.sql.analyzer.Analyzer.analyze(grantStmt, ctx);
+         auth.grantImpersonate(grantStmt);
+         // 2.2 assert
+         Assert.assertTrue(auth.canImpersonate(harry, gregory));
+         Assert.assertFalse(auth.canImpersonate(harry, albert));
+
+         // 3. grant impersonate to albert on harry
+         // 3.1 grant
+         grantStmt = new GrantImpersonateStmt(harry, albert);
+         com.starrocks.sql.analyzer.Analyzer.analyze(grantStmt, ctx);
+         auth.grantImpersonate(grantStmt);
+         // 3.2 assert
+         Assert.assertTrue(auth.canImpersonate(harry, gregory));
+         Assert.assertTrue(auth.canImpersonate(harry, albert));
+
+         // 4. revoke impersonate from albert on harry
+         // 4.1 revoke
+         RevokeImpersonateStmt revokeStmt = new RevokeImpersonateStmt(harry, gregory);
+         com.starrocks.sql.analyzer.Analyzer.analyze(grantStmt, ctx);
+         auth.revokeImpersonate(revokeStmt);
+         // 4.2 assert
+         Assert.assertFalse(auth.canImpersonate(harry, gregory));
+         Assert.assertTrue(auth.canImpersonate(harry, albert));
+     }
+
+    @Test
+    public void testShowGrants() throws Exception {
+        // 1. create 3 users
+        List<String> names = Arrays.asList("user1", "user2", "user3");
+        List<UserIdentity> userToBeCreated = new ArrayList<>();
+        for (String name : names) {
+            UserIdentity userIdentity = new UserIdentity(name, "%");
+            userIdentity.analyze("default_cluster");
+            UserDesc userDesc = new UserDesc(userIdentity, "12345", true);
+            CreateUserStmt createUserStmt = new CreateUserStmt(false, userDesc, null);
+            createUserStmt.analyze(analyzer);
+            auth.createUser(createUserStmt);
+            userToBeCreated.add(userIdentity);
+        }
+        UserIdentity emptyPrivilegeUser = userToBeCreated.get(0);
+        UserIdentity onePrivilegeUser = userToBeCreated.get(1);
+        UserIdentity manyPrivilegeUser = userToBeCreated.get(2);
+
+        // 1. emptyPrivilegeUser has one privilege
+        List<List<String>> infos = auth.getGrantsSQLs(emptyPrivilegeUser);
+        Assert.assertEquals(1, infos.size());
+        Assert.assertEquals(2, infos.get(0).size());
+        Assert.assertEquals(emptyPrivilegeUser.toString(), infos.get(0).get(0));
+        Assert.assertEquals("GRANT Select_priv ON default_cluster:information_schema.* TO 'default_cluster:user1'@'%'", infos.get(0).get(1));
+
+        // 2. grant table privilege to onePrivilegeUser
+        TablePattern table = new TablePattern("testdb", "table1");
+        table.analyze("default_cluster");
+        auth.grantPrivs(onePrivilegeUser, table, PrivBitSet.of(Privilege.SELECT_PRIV), false);
+        infos = auth.getGrantsSQLs(onePrivilegeUser);
+        Assert.assertEquals(1, infos.size());
+        Assert.assertEquals(2, infos.get(0).size());
+        Assert.assertEquals(onePrivilegeUser.toString(), infos.get(0).get(0));
+        String expectSQL = "GRANT Select_priv ON default_cluster:testdb.table1 TO 'default_cluster:user2'@'%'";
+        Assert.assertTrue(infos.get(0).get(1).contains(expectSQL));
+
+        // 3. grant resource & table & global & impersonate to manyPrivilegeUser
+        List<String> expectSQLs = new ArrayList<>();
+        TablePattern db = new TablePattern("testdb", "*");
+        db.analyze("default_cluster");
+        auth.grantPrivs(manyPrivilegeUser, db, PrivBitSet.of(Privilege.LOAD_PRIV, Privilege.SELECT_PRIV), false);
+        expectSQLs.add("GRANT Select_priv, Load_priv ON default_cluster:testdb.* TO 'default_cluster:user3'@'%'");
+        TablePattern global = new TablePattern("*", "*");
+        global.analyze("default_cluster");
+        auth.grantPrivs(manyPrivilegeUser, global, PrivBitSet.of(Privilege.GRANT_PRIV), false);
+        expectSQLs.add("GRANT Grant_priv ON *.* TO 'default_cluster:user3'@'%'");
+        ResourcePattern resourcePattern = new ResourcePattern("test_resource");
+        resourcePattern.analyze();
+        auth.grantPrivs(manyPrivilegeUser, resourcePattern, PrivBitSet.of(Privilege.USAGE_PRIV), false);
+        expectSQLs.add("GRANT Usage_priv ON RESOURCE 'test_resource' TO 'default_cluster:user3'@'%'");
+        auth.grantImpersonate(new GrantImpersonateStmt(manyPrivilegeUser, emptyPrivilegeUser));
+        expectSQLs.add("GRANT IMPERSONATE ON 'default_cluster:user1'@'%' TO 'default_cluster:user3'@'%'");
+        infos = auth.getGrantsSQLs(manyPrivilegeUser);
+        Assert.assertEquals(1, infos.size());
+        Assert.assertEquals(2, infos.get(0).size());
+        Assert.assertEquals(manyPrivilegeUser.toString(), infos.get(0).get(0));
+        for (String expect : expectSQLs) {
+            Assert.assertTrue(infos.get(0).get(1).contains(expect));
+        }
+
+        // 4. check all grants
+        infos = auth.getGrantsSQLs(null);
+        Assert.assertEquals(4, infos.size()); // the other is root
+        Set<String> nameSet = new HashSet<>();
+        for (List<String> line: infos) {
+            nameSet.add(line.get(0));
+        }
+        Assert.assertTrue(nameSet.contains(emptyPrivilegeUser.toString()));
+        Assert.assertTrue(nameSet.contains(onePrivilegeUser.toString()));
+        Assert.assertTrue(nameSet.contains(manyPrivilegeUser.toString()));
+    }
+
+    @Test
+    public void testImpersonateReplay(@Mocked EditLog editLog) throws Exception {
+        new Expectations(globalStateMgr) {
+            {
+                globalStateMgr.getEditLog();
+                minTimes = 0;
+                result = editLog;
+            }
+        };
+
+        List<ImpersonatePrivInfo> infos = new ArrayList<>();
+        new Expectations(editLog) {
+            {
+                editLog.logGrantImpersonate((ImpersonatePrivInfo)any);
+                minTimes = 0;
+                result = new Delegate() {
+                    void recordInfo(ImpersonatePrivInfo info) {
+                        infos.add(info);
+                    }
+                };
+            }
+            {
+                editLog.logRevokeImpersonate((ImpersonatePrivInfo)any);
+                minTimes = 0;
+                result = new Delegate() {
+                    void recordInfo(ImpersonatePrivInfo info) {
+                        infos.add(info);
+                    }
+                };
+            }
+            {
+                editLog.logCreateUser((PrivInfo)any);
+                minTimes = 0;
+            }
+        };
+
+        // 1. prepare
+        // 1.1create harry, gregory
+        UserIdentity harry = new UserIdentity("Harry", "%");
+        harry.analyze(SystemInfoService.DEFAULT_CLUSTER);
+        UserIdentity gregory = new UserIdentity("Gregory", "%");
+        gregory.analyze(SystemInfoService.DEFAULT_CLUSTER);
+        List<UserIdentity> userToBeCreated = new ArrayList<>();
+        userToBeCreated.add(harry);
+        userToBeCreated.add(gregory);
+        for (UserIdentity userIdentity : userToBeCreated) {
+            UserDesc userDesc = new UserDesc(userIdentity, "12345", true);
+            CreateUserStmt createUserStmt = new CreateUserStmt(false, userDesc, null);
+            createUserStmt.analyze(analyzer);
+            auth.createUser(createUserStmt);
+        }
+
+
+        // 2. grant impersonate to gregory on harry
+        // 2.1 grant
+        Assert.assertFalse(auth.canImpersonate(harry, gregory));
+        GrantImpersonateStmt grantStmt = new GrantImpersonateStmt(harry, gregory);
+        com.starrocks.sql.analyzer.Analyzer.analyze(grantStmt, ctx);
+        auth.grantImpersonate(grantStmt);
+        // 2.2 check
+        Assert.assertTrue(auth.canImpersonate(harry, gregory));
+
+        // 3. check log grant
+        Assert.assertEquals(1, infos.size());
+
+        // 4. replay grant
+        Auth newAuth = new Auth();
+        Assert.assertFalse(newAuth.canImpersonate(harry, gregory));
+        newAuth.replayGrantImpersonate(infos.get(0));
+        Assert.assertTrue(newAuth.canImpersonate(harry, gregory));
+        infos.clear();
+        Assert.assertEquals(0, infos.size());
+
+        // 5. revoke impersonate to greogory from harry
+        RevokeImpersonateStmt revokeStmt = new RevokeImpersonateStmt(harry, gregory);
+        com.starrocks.sql.analyzer.Analyzer.analyze(grantStmt, ctx);
+        auth.revokeImpersonate(revokeStmt);
+        Assert.assertFalse(auth.canImpersonate(harry, gregory));
+
+        // 6. check log revoke
+        Assert.assertEquals(1, infos.size());
+
+        // 7. replay revoke
+        newAuth.replayRevokeImpersonate(infos.get(0));
+        Assert.assertFalse(newAuth.canImpersonate(harry, gregory));
+    }
+ }

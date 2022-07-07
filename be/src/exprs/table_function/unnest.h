@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -7,15 +7,21 @@
 #include "column/nullable_column.h"
 #include "exprs/expr.h"
 #include "exprs/expr_context.h"
+#include "exprs/table_function/table_function.h"
 #include "exprs/vectorized/function_helper.h"
+#include "runtime/runtime_state.h"
 
 namespace starrocks::vectorized {
 /**
  * UNNEST can be used to expand an ARRAY into a relation, arrays are expanded into a single column.
  */
 class Unnest final : public TableFunction {
+public:
     std::pair<Columns, ColumnPtr> process(TableFunctionState* state, bool* eos) const override {
         *eos = true;
+        if (state->get_columns().empty()) {
+            return {};
+        }
         Column* arg0 = state->get_columns()[0].get();
         auto* col_array = down_cast<ArrayColumn*>(ColumnHelper::get_data_column(arg0));
         Columns result;
@@ -60,14 +66,16 @@ class Unnest final : public TableFunction {
          */
     };
 
-    Status init(TableFunctionState** state) const override {
+    Status init(const TFunction& fn, TableFunctionState** state) const override {
         *state = new UnnestState();
         return Status::OK();
     }
 
     Status prepare(TableFunctionState* state) const override { return Status::OK(); }
 
-    Status close(TableFunctionState* state) const override {
+    Status open(RuntimeState* runtime_state, TableFunctionState* state) const override { return Status::OK(); };
+
+    Status close(RuntimeState* runtime_state, TableFunctionState* state) const override {
         delete state;
         return Status::OK();
     }

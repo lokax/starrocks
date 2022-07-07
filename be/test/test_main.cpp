@@ -1,49 +1,33 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "butil/file_util.h"
 #include "column/column_helper.h"
 #include "column/column_pool.h"
 #include "common/config.h"
-#include "exprs/bitmap_function.h"
-#include "exprs/cast_functions.h"
-#include "exprs/compound_predicate.h"
-#include "exprs/decimal_operators.h"
-#include "exprs/decimalv2_operators.h"
-#include "exprs/encryption_functions.h"
-#include "exprs/es_functions.h"
-#include "exprs/grouping_sets_functions.h"
-#include "exprs/hash_functions.h"
-#include "exprs/hll_function.h"
-#include "exprs/hll_hash_function.h"
-#include "exprs/is_null_predicate.h"
-#include "exprs/json_functions.h"
-#include "exprs/like_predicate.h"
-#include "exprs/math_functions.h"
-#include "exprs/new_in_predicate.h"
-#include "exprs/operators.h"
-#include "exprs/percentile_function.h"
-#include "exprs/string_functions.h"
-#include "exprs/time_operators.h"
-#include "exprs/timestamp_functions.h"
-#include "exprs/utility_functions.h"
-#include "geo/geo_functions.h"
+#include "exec/pipeline/query_context.h"
 #include "gtest/gtest.h"
-#include "runtime/bufferpool/buffer_pool.h"
+#include "runtime/current_thread.h"
 #include "runtime/exec_env.h"
 #include "runtime/mem_tracker.h"
 #include "runtime/memory/chunk_allocator.h"
+#include "runtime/time_types.h"
 #include "runtime/user_function_cache.h"
-#include "runtime/vectorized/time_types.h"
 #include "storage/options.h"
 #include "storage/storage_engine.h"
+#include "storage/tablet_manager.h"
 #include "storage/update_manager.h"
 #include "util/cpu_info.h"
 #include "util/disk_info.h"
 #include "util/logging.h"
 #include "util/mem_info.h"
+#include "util/timezone_utils.h"
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
+    if (getenv("STARROCKS_HOME") == nullptr) {
+        fprintf(stderr, "you need set STARROCKS_HOME environment variable.\n");
+        exit(-1);
+    }
     std::string conffile = std::string(getenv("STARROCKS_HOME")) + "/conf/be.conf";
     if (!starrocks::config::init(conffile.c_str(), false)) {
         fprintf(stderr, "error read config file. \n");
@@ -59,37 +43,12 @@ int main(int argc, char** argv) {
     starrocks::DiskInfo::init();
     starrocks::MemInfo::init();
     starrocks::UserFunctionCache::instance()->init(starrocks::config::user_function_dir);
-    starrocks::Operators::init();
-    starrocks::IsNullPredicate::init();
-    starrocks::LikePredicate::init();
-    starrocks::StringFunctions::init();
-    starrocks::CastFunctions::init();
-    starrocks::InPredicate::init();
-    starrocks::MathFunctions::init();
-    starrocks::EncryptionFunctions::init();
-    starrocks::TimestampFunctions::init();
-    starrocks::DecimalOperators::init();
-    starrocks::DecimalV2Operators::init();
-    starrocks::TimeOperators::init();
-    starrocks::UtilityFunctions::init();
-    starrocks::CompoundPredicate::init();
-    starrocks::JsonFunctions::init();
-    starrocks::HllHashFunctions::init();
-    starrocks::ESFunctions::init();
-    starrocks::GeoFunctions::init();
-    starrocks::GroupingSetsFunctions::init();
-    starrocks::BitmapFunctions::init();
-    starrocks::HllFunctions::init();
-    starrocks::HashFunctions::init();
-    starrocks::PercentileFunctions::init();
 
-    starrocks::vectorized::ColumnHelper::init_static_variable();
     starrocks::vectorized::date::init_date_cache();
-
-    starrocks::ChunkAllocator::init_instance(starrocks::config::chunk_reserved_bytes_limit);
+    starrocks::TimezoneUtils::init_time_zones();
 
     std::vector<starrocks::StorePath> paths;
-    paths.emplace_back(starrocks::config::storage_root_path, -1);
+    paths.emplace_back(starrocks::config::storage_root_path);
 
     std::unique_ptr<starrocks::MemTracker> table_meta_mem_tracker = std::make_unique<starrocks::MemTracker>();
     std::unique_ptr<starrocks::MemTracker> schema_change_mem_tracker = std::make_unique<starrocks::MemTracker>();
@@ -109,13 +68,23 @@ int main(int argc, char** argv) {
                 s.to_string().c_str());
         return -1;
     }
+    auto* exec_env = starrocks::ExecEnv::GetInstance();
+    exec_env->init_mem_tracker();
+    starrocks::ExecEnv::init(exec_env, paths);
+
     int r = RUN_ALL_TESTS();
+
     // clear some trash objects kept in tablet_manager so mem_tracker checks will not fail
     starrocks::StorageEngine::instance()->tablet_manager()->start_trash_sweep();
-    // clear caches in update manager so mem_tracker checks will not fail
-    starrocks::StorageEngine::instance()->update_manager()->clear_cache();
     (void)butil::DeleteFile(storage_root, true);
     starrocks::vectorized::TEST_clear_all_columns_this_thread();
+    // delete engine
+    engine->stop();
+    delete engine;
+    exec_env->set_storage_engine(nullptr);
+    // destroy exec env
+    starrocks::tls_thread_status.set_mem_tracker(nullptr);
+    starrocks::ExecEnv::destroy(exec_env);
 
     return r;
 }

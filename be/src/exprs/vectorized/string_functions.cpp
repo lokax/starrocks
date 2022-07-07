@@ -1,24 +1,43 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/string_functions.h"
 
+#include <re2/re2.h>
+
 #include <algorithm>
+#include <memory>
+#include <stdexcept>
 
 #include "column/binary_column.h"
 #include "column/column_builder.h"
 #include "column/column_helper.h"
 #include "column/column_viewer.h"
+#include "column/nullable_column.h"
+#include "common/compiler_util.h"
 #include "common/status.h"
 #include "exprs/vectorized/binary_function.h"
 #include "exprs/vectorized/math_functions.h"
 #include "exprs/vectorized/unary_function.h"
 #include "gutil/strings/fastmem.h"
 #include "gutil/strings/substitute.h"
+#include "runtime/large_int_value.h"
+#include "storage/olap_define.h"
 #include "util/raw_container.h"
+#include "util/sm3.h"
 #include "util/utf8.h"
 
-namespace starrocks {
-namespace vectorized {
+namespace starrocks::vectorized {
+
+#define THROW_RUNTIME_ERROR_IF_EXCEED_LIMIT(col, func_name)                          \
+    if (UNLIKELY(col->capacity_limit_reached())) {                                   \
+        col->reset_column();                                                         \
+        throw std::runtime_error("binary column exceed 4G in function " #func_name); \
+    }
+
+#define RETURN_COLUMN(stmt, func_name)                                    \
+    auto VARNAME_LINENUM(res) = stmt;                                     \
+    THROW_RUNTIME_ERROR_IF_EXCEED_LIMIT(VARNAME_LINENUM(res), func_name); \
+    return VARNAME_LINENUM(res);
 
 constexpr size_t CONCAT_SMALL_OPTIMIZE_THRESHOLD = 16 << 20;
 
@@ -235,24 +254,14 @@ Status StringFunctions::sub_str_prepare(starrocks_udf::FunctionContext* context,
         return Status::OK();
     }
 
-    if (!context->is_constant_column(1)) {
+    // TODO(kks): improve this case if necessary
+    if (!context->is_notnull_constant_column(1)) {
         return Status::OK();
-    } else {
-        // TODO(kks): improve this case if necessary
-        if (context->get_constant_column(1)->only_null()) {
-            return Status::OK();
-        }
     }
 
-    if (context->get_num_args() == 3) {
-        if (!context->is_constant_column(2)) {
-            return Status::OK();
-        } else {
-            // TODO(kks): improve this case if necessary
-            if (context->get_constant_column(2)->only_null()) {
-                return Status::OK();
-            }
-        }
+    // TODO(kks): improve this case if necessary
+    if (context->get_num_args() == 3 && !context->is_notnull_constant_column(2)) {
+        return Status::OK();
     }
 
     state->is_const = true;
@@ -288,12 +297,7 @@ Status StringFunctions::left_or_right_prepare(starrocks_udf::FunctionContext* co
         return Status::OK();
     }
     // const null case is handled by non_const implementation.
-    if (!context->is_constant_column(0) || context->get_constant_column(0)->only_null()) {
-        return Status::OK();
-    }
-
-    // const null case is handled by non_const implementation.
-    if (!context->is_constant_column(1) || context->get_constant_column(1)->only_null()) {
+    if (!context->is_notnull_constant_column(0) || !context->is_notnull_constant_column(1)) {
         return Status::OK();
     }
 
@@ -323,10 +327,9 @@ Status StringFunctions::concat_prepare(starrocks_udf::FunctionContext* context,
     state->is_oversize = false;
     const auto num_args = context->get_num_args();
     for (auto i = 1; i < num_args; ++i) {
-        if (!context->is_constant_column(i) ||
-            // For code simpleness, we only handle const varchar args in the following code.
-            // For only null column, we let concat_not_const function handle
-            context->get_constant_column(i)->only_null()) {
+        // For code simpleness, we only handle const varchar args in the following code.
+        // For only null column, we let concat_not_const function handle
+        if (!context->is_notnull_constant_column(i)) {
             state->is_const = false;
         }
     }
@@ -515,8 +518,8 @@ ColumnPtr right_const_not_null(const Columns& columns, BinaryColumn* src, Substr
     raw_offsets.resize(size + 1);
     raw_offsets[0] = 0;
     offsets.swap(reinterpret_cast<Offsets&>(raw_offsets));
-
-    if (validate_ascii_fast((const char*)src_bytes.data(), src_bytes_size)) {
+    auto is_ascii = validate_ascii_fast((const char*)src_bytes.data(), src_bytes_size);
+    if (is_ascii) {
         // off_is_negative=true, off=-len
         // allow_out_of_left_bound=true
         ascii_substr<true, true>(src, &bytes, &offsets, -len, len);
@@ -536,11 +539,17 @@ ColumnPtr string_func_const(StringConstFuncType func, const Columns& columns, Ar
             ColumnPtr binary = func(columns, src_binary, std::forward<Args>(args)...);
             NullColumnPtr src_null = NullColumn::create(*(src_nullable->null_column()));
 
-            // if binary is ConstColumn, just return it.
-            // if binary is NullableColumn, then the null column inside of the binary should
-            // be merged with the null column inside of columns[0].
-            if (binary->is_constant()) {
+            // - if binary is null ConstColumn, just return it.
+            // - if binary is non-null ConstColumn, unfold it and wrap with src_null.
+            // - if binary is NullableColumn, then the null column inside the binary should
+            //   be merged with the null column inside of columns[0].
+            if (binary->only_null()) {
                 return binary;
+            }
+            if (binary->is_constant()) {
+                ConstColumn* dst_const = down_cast<ConstColumn*>(binary.get());
+                dst_const->data_column()->assign(dst_const->size(), 0);
+                return NullableColumn::create(dst_const->data_column(), src_null);
             }
             if (binary->is_nullable()) {
                 NullableColumn* binary_nullable = down_cast<NullableColumn*>(binary.get());
@@ -700,7 +709,7 @@ static inline ColumnPtr substr_not_const(FunctionContext* context, const starroc
     result.resize(rows_num, src->byte_size());
 
     Bytes& src_bytes = src->get_bytes();
-    bool is_ascii = validate_ascii_fast((const char*)src_bytes.data(), src_bytes.size());
+    auto is_ascii = validate_ascii_fast((const char*)src_bytes.data(), src_bytes.size());
     if (is_ascii) {
         ascii_substr_not_const(rows_num, &str_viewer, &off_viewer, &len_viewer, &result);
     } else {
@@ -720,7 +729,7 @@ static inline ColumnPtr right_not_const(FunctionContext* context, const starrock
     NullableBinaryColumnBuilder result;
 
     Bytes& src_bytes = src->get_bytes();
-    bool is_ascii = validate_ascii_fast((const char*)src_bytes.data(), src_bytes.size());
+    auto is_ascii = validate_ascii_fast((const char*)src_bytes.data(), src_bytes.size());
     result.resize(rows_num, src->byte_size());
 
     if (is_ascii) {
@@ -824,7 +833,8 @@ public:
         }
         dst_bytes.resize(dst_off, ' ');
         builder.set_has_null(has_null);
-        return builder.build(v1->is_constant());
+
+        RETURN_COLUMN(builder.build(v1->is_constant()), "space");
     }
 };
 
@@ -888,31 +898,37 @@ void fast_repeat(uint8_t* dst, const uint8_t* src, size_t src_size, int32_t repe
 
 static inline ColumnPtr repeat_const_not_null(const Columns& columns, const BinaryColumn* src) {
     auto times = ColumnHelper::get_const_value<TYPE_INT>(columns[1]);
-    auto& src_bytes = src->get_bytes();
+
     auto& src_offsets = src->get_offset();
     const auto num_rows = src->size();
-    const auto bytes_size = src_bytes.size();
 
-    auto result = BinaryColumn::create();
-    auto& dst_bytes = result->get_bytes();
-    auto& dst_offsets = result->get_offset();
+    NullableBinaryColumnBuilder builder;
+    auto& dst_nulls = builder.get_null_data();
+    auto& dst_offsets = builder.data_column()->get_offset();
+    auto& dst_bytes = builder.data_column()->get_bytes();
+
+    dst_nulls.resize(num_rows);
+    bool has_null = false;
+
     if (times <= 0) {
         dst_offsets.resize(num_rows + 1);
-        return result;
-    } else if (times == 1) {
-        dst_offsets = src_offsets;
-        dst_bytes = src_bytes;
-        return result;
+        return builder.build(ColumnHelper::is_all_const(columns));
     } else {
         raw::make_room(&dst_offsets, num_rows + 1);
         dst_offsets[0] = 0;
-        constexpr auto LIMIT = std::numeric_limits<size_t>::max();
-        auto reserved = num_rows * OLAP_STRING_MAX_LENGTH;
-        if (LIMIT / times > bytes_size) {
-            reserved = std::min(reserved, times * bytes_size);
+        size_t reserved = static_cast<size_t>(times) * src_offsets.back();
+        if (reserved > OLAP_STRING_MAX_LENGTH * num_rows) {
+            reserved = 0;
+            for (int i = 0; i < num_rows; ++i) {
+                size_t slice_sz = src_offsets[i + 1] - src_offsets[i];
+                if (slice_sz * times < OLAP_STRING_MAX_LENGTH) {
+                    reserved += slice_sz * times;
+                }
+            }
         }
         dst_bytes.resize(reserved);
     }
+
     uint8_t* dst_curr = dst_bytes.data();
     size_t dst_off = 0;
     for (auto i = 0; i < num_rows; ++i) {
@@ -921,16 +937,24 @@ static inline ColumnPtr repeat_const_not_null(const Columns& columns, const Bina
             dst_offsets[i + 1] = dst_off;
             continue;
         }
-        auto real_times = std::min(times, (int32_t)(OLAP_STRING_MAX_LENGTH / s.size));
-        real_times = std::max(real_times, 1);
-        fast_repeat(dst_curr, (uint8_t*)s.data, s.size, real_times);
-        const size_t dst_slice_size = s.size * real_times;
+        // if result exceed STRING_MAX_LENGTH
+        // return null
+        if (s.size * times > OLAP_STRING_MAX_LENGTH) {
+            dst_nulls[i] = 1;
+            has_null = true;
+            dst_offsets[i + 1] = dst_off;
+            continue;
+        }
+        fast_repeat(dst_curr, (uint8_t*)s.data, s.size, times);
+        const size_t dst_slice_size = s.size * times;
         dst_curr += dst_slice_size;
         dst_off += dst_slice_size;
         dst_offsets[i + 1] = dst_off;
     }
+
     dst_bytes.resize(dst_off);
-    return result;
+    builder.set_has_null(has_null);
+    RETURN_COLUMN(builder.build(ColumnHelper::is_all_const(columns)), "repeat");
 }
 
 static inline ColumnPtr repeat_const(const Columns& columns) {
@@ -952,6 +976,7 @@ static inline ColumnPtr repeat_not_const(const Columns& columns) {
 
     bool has_null = false;
     size_t dst_off = 0;
+
     for (int i = 0; i < num_rows; ++i) {
         if (str_viewer.is_null(i) || times_viewer.is_null(i)) {
             dst_nulls[i] = 1;
@@ -967,8 +992,14 @@ static inline ColumnPtr repeat_not_const(const Columns& columns) {
 
         auto s = str_viewer.value(i);
         int32_t n = times_viewer.value(i);
-        n = std::min(n, (int32_t)(OLAP_STRING_MAX_LENGTH / s.size));
-        n = std::max(n, 1);
+
+        if (s.size * n > OLAP_STRING_MAX_LENGTH) {
+            dst_nulls[i] = 1;
+            has_null = true;
+            dst_offsets[i + 1] = dst_off;
+            continue;
+        }
+
         dst_off += n * s.size;
         dst_offsets[i + 1] = dst_off;
     }
@@ -984,7 +1015,7 @@ static inline ColumnPtr repeat_not_const(const Columns& columns) {
         fast_repeat(dst_begin + dst_offsets[i], (uint8_t*)s.data, s.size, dst_slice_size / s.size);
     }
     builder.set_has_null(has_null);
-    return builder.build(ColumnHelper::is_all_const(columns));
+    RETURN_COLUMN(builder.build(ColumnHelper::is_all_const(columns)), "repeat");
 }
 
 // repeat
@@ -1008,7 +1039,7 @@ Status StringFunctions::pad_prepare(starrocks_udf::FunctionContext* context,
     context->set_function_state(FunctionContext::FRAGMENT_LOCAL, state);
 
     // const null case is handled by non_const implementation.
-    if (!context->is_constant_column(2) || context->get_constant_column(2)->only_null()) {
+    if (!context->is_notnull_constant_column(2)) {
         return Status::OK();
     }
 
@@ -1019,7 +1050,7 @@ Status StringFunctions::pad_prepare(starrocks_udf::FunctionContext* context,
     state->fill_is_utf8 = state->fill.size > get_utf8_index(state->fill, &state->fill_utf8_index);
 
     // const null case is handled by non_const implementation.
-    if (!context->is_constant_column(1) || context->get_constant_column(1)->only_null()) {
+    if (!context->is_notnull_constant_column(1)) {
         return Status::OK();
     }
 
@@ -1094,7 +1125,7 @@ template <bool src_is_utf8, bool fill_is_utf8, PadType pad_type>
 static inline ColumnPtr pad_utf8_const(Columns const& columns, BinaryColumn* src, const uint8_t* fill,
                                        const size_t fill_size, const size_t len,
                                        std::vector<size_t> const& fill_utf8_index) {
-    BOOST_STATIC_ASSERT(src_is_utf8 || fill_is_utf8);
+    static_assert(src_is_utf8 || fill_is_utf8);
 
     const auto num_rows = src->size();
     NullableBinaryColumnBuilder builder;
@@ -1359,7 +1390,7 @@ template <bool pad_is_const, PadType pad_type>
 ColumnPtr pad_not_const_check_ascii(const Columns& columns, [[maybe_unused]] const PadState* state) {
     auto src = ColumnHelper::get_binary_column(columns[0].get());
     auto& bytes = src->get_bytes();
-    bool is_ascii = validate_ascii_fast((const char*)bytes.data(), bytes.size());
+    auto is_ascii = validate_ascii_fast((const char*)bytes.data(), bytes.size());
     if (is_ascii) {
         return pad_not_const<true, pad_is_const, pad_type>(columns, state);
     } else {
@@ -1368,7 +1399,7 @@ ColumnPtr pad_not_const_check_ascii(const Columns& columns, [[maybe_unused]] con
 }
 // pad
 template <PadType pad_type>
-static inline ColumnPtr pad(FunctionContext* context, const Columns& columns) {
+static ColumnPtr pad(FunctionContext* context, const Columns& columns) {
     RETURN_IF_COLUMNS_ONLY_NULL(columns);
     auto state = (PadState*)context->get_function_state(FunctionContext::FRAGMENT_LOCAL);
     if (state != nullptr) {
@@ -1386,12 +1417,12 @@ static inline ColumnPtr pad(FunctionContext* context, const Columns& columns) {
 
 // lpad
 ColumnPtr StringFunctions::lpad(FunctionContext* context, const Columns& columns) {
-    return pad<PAD_TYPE_LEFT>(context, columns);
+    RETURN_COLUMN(pad<PAD_TYPE_LEFT>(context, columns), "lpad");
 }
 
 // rpad
 ColumnPtr StringFunctions::rpad(FunctionContext* context, const Columns& columns) {
-    return pad<PAD_TYPE_RIGHT>(context, columns);
+    RETURN_COLUMN(pad<PAD_TYPE_RIGHT>(context, columns), "rpad");
 }
 
 // append_trailing_char_if_absent
@@ -1475,13 +1506,16 @@ ColumnPtr StringFunctions::append_trailing_char_if_absent(FunctionContext* conte
 
             dst_offsets[row + 1] = dst_offset;
         }
-        dst_data.shrink_to_fit();
-        return dst;
+        if (!dst_data.empty()) {
+            dst_data.resize(dst_offsets.back());
+        }
+
+        RETURN_COLUMN(dst, "append_trailing_char_if_absent");
     } else {
         ColumnViewer<TYPE_VARCHAR> src_viewer(columns[0]);
         ColumnViewer<TYPE_VARCHAR> tailing_viewer(columns[1]);
 
-        ColumnBuilder<TYPE_VARCHAR> dst_builder;
+        ColumnBuilder<TYPE_VARCHAR> dst_builder(row_num);
 
         for (int row = 0; row < row_num; ++row) {
             if (src_viewer.is_null(row) || tailing_viewer.is_null(row) || tailing_viewer.value(row).size != 1) {
@@ -1507,7 +1541,7 @@ ColumnPtr StringFunctions::append_trailing_char_if_absent(FunctionContext* conte
             dst_builder.append(Slice(s));
         }
 
-        return dst_builder.build(ColumnHelper::is_all_const(columns));
+        RETURN_COLUMN(dst_builder.build(ColumnHelper::is_all_const(columns)), "append_trailing_char_if_absent");
     }
 }
 
@@ -1634,6 +1668,10 @@ static inline void utf8_reverse_per_slice(const char* src_begin, const char* src
     auto src_curr = src_begin;
     for (auto char_size = 0; src_curr < src_end; src_curr += char_size) {
         char_size = UTF8_BYTE_LENGTH_TABLE[(uint8_t)*src_curr];
+        // utf8 chars are copied from src_curr to  dst_curr one by one reversely, an illegal utf8 char
+        // would give a larger char_size than expected, which would cause dst_curr advance to exceed its lower,
+        // so protect char_size to not exceeds src_end-src_curr.
+        char_size = std::min<size_t>(src_end - src_curr, char_size);
         dst_curr -= char_size;
         strings::memcpy_inlined(dst_curr, src_curr, char_size);
     }
@@ -2052,6 +2090,40 @@ ColumnPtr StringFunctions::unhex(FunctionContext* context, const starrocks::vect
     return VectorizedStringStrictUnaryFunction<unhexImpl>::evaluate<TYPE_VARCHAR, TYPE_VARCHAR>(columns[0]);
 }
 
+DEFINE_STRING_UNARY_FN_WITH_IMPL(sm3Impl, str) {
+    const Slice& input_str = str;
+    std::stringstream result;
+
+    const unsigned char* message = (unsigned char*)input_str.data;
+    unsigned long message_len = input_str.size;
+    if (message_len > 0) {
+        unsigned char output[32];
+
+        // output as 256 bits(32 bytes) result.
+        Sm3::sm3_compute(message, message_len, output);
+        result << std::hex << std::setfill('0');
+
+        // first 4 bytes;
+        for (int i = 0; i < 4; ++i) {
+            result << std::setw(2) << (output[i] & 0xFF);
+        }
+
+        // remaining 4 bytes start with " ";
+        for (int i = 4; i < 32; ++i) {
+            if ((i % 4) == 0) {
+                result << " ";
+            }
+            result << std::setw(2) << (output[i] & 0xFF);
+        }
+    }
+
+    return result.str();
+}
+
+ColumnPtr StringFunctions::sm3(FunctionContext* context, const starrocks::vectorized::Columns& columns) {
+    return VectorizedStringStrictUnaryFunction<sm3Impl>::evaluate<TYPE_VARCHAR, TYPE_VARCHAR>(columns[0]);
+}
+
 // ascii
 DEFINE_UNARY_FN_WITH_IMPL(asciiImpl, str) {
     return str.size == 0 ? 0 : static_cast<uint8_t>(str.data[0]);
@@ -2181,7 +2253,7 @@ static inline ColumnPtr concat_not_const_small(std::vector<ColumnViewer<TYPE_VAR
 static inline ColumnPtr concat_not_const(Columns const& columns) {
     std::vector<ColumnViewer<TYPE_VARCHAR>> list;
     list.reserve(columns.size());
-    for (ColumnPtr col : columns) {
+    for (const ColumnPtr& col : columns) {
         list.emplace_back(ColumnViewer<TYPE_VARCHAR>(col));
     }
     const auto num_rows = columns[0]->size();
@@ -2392,8 +2464,8 @@ ColumnPtr StringFunctions::null_or_empty(FunctionContext* context, const starroc
     DCHECK_EQ(columns.size(), 1);
     auto str_viewer = ColumnViewer<TYPE_VARCHAR>(columns[0]);
 
-    ColumnBuilder<TYPE_BOOLEAN> result;
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_BOOLEAN> result(size);
     for (int row = 0; row < size; row++) {
         if (str_viewer.is_null(row)) {
             result.append(true);
@@ -2444,38 +2516,42 @@ int StringFunctions::index_of(const char* source, int source_count, const char* 
     return -1;
 }
 
+struct StringFunctionsState {
+    std::unique_ptr<re2::RE2> regex;
+    std::unique_ptr<re2::RE2::Options> options;
+    bool const_pattern{false};
+
+    StringFunctionsState() : regex(), options() {}
+};
+
 Status StringFunctions::regexp_prepare(starrocks_udf::FunctionContext* context,
                                        starrocks_udf::FunctionContext::FunctionStateScope scope) {
     if (scope != FunctionContext::FRAGMENT_LOCAL) {
         return Status::OK();
     }
 
-    StringFunctionsState* state = new StringFunctionsState();
+    auto* state = new StringFunctionsState();
     context->set_function_state(scope, state);
 
-    state->options.reset(new re2::RE2::Options());
+    state->options = std::make_unique<re2::RE2::Options>();
     state->options->set_log_errors(false);
     state->options->set_longest_match(true);
     state->options->set_dot_nl(true);
 
     // go row regex
-    if (!context->is_constant_column(1)) {
-        return Status::OK();
-    }
-
-    auto column = context->get_constant_column(1);
-    if (column->only_null() || column->is_null(0)) {
+    if (!context->is_notnull_constant_column(1)) {
         return Status::OK();
     }
 
     state->const_pattern = true;
+    auto column = context->get_constant_column(1);
     auto pattern = ColumnHelper::get_const_value<TYPE_VARCHAR>(column);
     std::string pattern_str = pattern.to_string();
-    state->regex.reset(new re2::RE2(pattern_str, *(state->options)));
+    state->regex = std::make_unique<re2::RE2>(pattern_str, *(state->options));
 
     if (!state->regex->ok()) {
         std::stringstream error;
-        error << "Invalid regex expression: " << pattern.data;
+        error << "Invalid regex expression: " << pattern.to_string();
         context->set_error(error.str().c_str());
         return Status::InvalidArgument(error.str());
     }
@@ -2485,21 +2561,20 @@ Status StringFunctions::regexp_prepare(starrocks_udf::FunctionContext* context,
 
 Status StringFunctions::regexp_close(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
     if (scope == FunctionContext::FRAGMENT_LOCAL) {
-        StringFunctionsState* state =
+        auto* state =
                 reinterpret_cast<StringFunctionsState*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
         delete state;
     }
     return Status::OK();
 }
 
-ColumnPtr StringFunctions::regexp_extract_general(FunctionContext* context, re2::RE2::Options* options,
-                                                  const Columns& columns) {
+static ColumnPtr regexp_extract_general(FunctionContext* context, re2::RE2::Options* options, const Columns& columns) {
     auto content_viewer = ColumnViewer<TYPE_VARCHAR>(columns[0]);
     auto ptn_viewer = ColumnViewer<TYPE_VARCHAR>(columns[1]);
     auto field_viewer = ColumnViewer<TYPE_BIGINT>(columns[2]);
 
-    ColumnBuilder<TYPE_VARCHAR> result;
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
     for (int row = 0; row < size; ++row) {
         if (content_viewer.is_null(row) || ptn_viewer.is_null(row) || field_viewer.is_null(row)) {
             result.append_null();
@@ -2542,12 +2617,12 @@ ColumnPtr StringFunctions::regexp_extract_general(FunctionContext* context, re2:
     return result.build(ColumnHelper::is_all_const(columns));
 }
 
-ColumnPtr StringFunctions::regexp_extract_const(re2::RE2* const_re, const Columns& columns) {
+static ColumnPtr regexp_extract_const(re2::RE2* const_re, const Columns& columns) {
     auto content_viewer = ColumnViewer<TYPE_VARCHAR>(columns[0]);
     auto field_viewer = ColumnViewer<TYPE_BIGINT>(columns[2]);
 
-    ColumnBuilder<TYPE_VARCHAR> result;
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
     for (int row = 0; row < size; ++row) {
         if (content_viewer.is_null(row) || field_viewer.is_null(row)) {
             result.append_null();
@@ -2594,14 +2669,13 @@ ColumnPtr StringFunctions::regexp_extract(FunctionContext* context, const Column
     return regexp_extract_general(context, options, columns);
 }
 
-ColumnPtr StringFunctions::regexp_replace_general(FunctionContext* context, re2::RE2::Options* options,
-                                                  const Columns& columns) {
+static ColumnPtr regexp_replace_general(FunctionContext* context, re2::RE2::Options* options, const Columns& columns) {
     auto str_viewer = ColumnViewer<TYPE_VARCHAR>(columns[0]);
     auto ptn_viewer = ColumnViewer<TYPE_VARCHAR>(columns[1]);
     auto rpl_viewer = ColumnViewer<TYPE_VARCHAR>(columns[2]);
 
-    ColumnBuilder<TYPE_VARCHAR> result;
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
     for (int row = 0; row < size; ++row) {
         if (str_viewer.is_null(row) || ptn_viewer.is_null(row) || rpl_viewer.is_null(row)) {
             result.append_null();
@@ -2627,12 +2701,12 @@ ColumnPtr StringFunctions::regexp_replace_general(FunctionContext* context, re2:
     return result.build(ColumnHelper::is_all_const(columns));
 }
 
-ColumnPtr StringFunctions::regexp_replace_const(re2::RE2* const_re, const Columns& columns) {
+static ColumnPtr regexp_replace_const(re2::RE2* const_re, const Columns& columns) {
     auto str_viewer = ColumnViewer<TYPE_VARCHAR>(columns[0]);
     auto rpl_viewer = ColumnViewer<TYPE_VARCHAR>(columns[2]);
 
-    ColumnBuilder<TYPE_VARCHAR> result;
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
     for (int row = 0; row < size; ++row) {
         if (str_viewer.is_null(row) || rpl_viewer.is_null(row)) {
             result.append_null();
@@ -2666,8 +2740,8 @@ ColumnPtr StringFunctions::money_format_double(FunctionContext* context,
                                                const starrocks::vectorized::Columns& columns) {
     auto money_viewer = ColumnViewer<TYPE_DOUBLE>(columns[0]);
 
-    ColumnBuilder<TYPE_VARCHAR> result;
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
     for (int row = 0; row < size; ++row) {
         if (money_viewer.is_null(row)) {
             result.append_null();
@@ -2686,8 +2760,8 @@ ColumnPtr StringFunctions::money_format_bigint(FunctionContext* context,
                                                const starrocks::vectorized::Columns& columns) {
     auto money_viewer = ColumnViewer<TYPE_BIGINT>(columns[0]);
 
-    ColumnBuilder<TYPE_VARCHAR> result;
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
     for (int row = 0; row < size; ++row) {
         if (money_viewer.is_null(row)) {
             result.append_null();
@@ -2706,8 +2780,8 @@ ColumnPtr StringFunctions::money_format_largeint(FunctionContext* context,
                                                  const starrocks::vectorized::Columns& columns) {
     auto money_viewer = ColumnViewer<TYPE_LARGEINT>(columns[0]);
 
-    ColumnBuilder<TYPE_VARCHAR> result;
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
     for (int row = 0; row < size; ++row) {
         if (money_viewer.is_null(row)) {
             result.append_null();
@@ -2728,8 +2802,8 @@ ColumnPtr StringFunctions::money_format_decimalv2val(FunctionContext* context,
                                                      const starrocks::vectorized::Columns& columns) {
     auto money_viewer = ColumnViewer<TYPE_DECIMALV2>(columns[0]);
 
-    ColumnBuilder<TYPE_VARCHAR> result;
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
     for (int row = 0; row < size; ++row) {
         if (money_viewer.is_null(row)) {
             result.append_null();
@@ -2759,15 +2833,12 @@ Status StringFunctions::parse_url_prepare(starrocks_udf::FunctionContext* contex
     ParseUrlState* state = new ParseUrlState();
     context->set_function_state(scope, state);
 
-    if (!context->is_constant_column(1)) {
+    if (!context->is_notnull_constant_column(1)) {
         return Status::OK();
     }
 
-    auto column = context->get_constant_column(1);
-    if (column->only_null() || column->is_null(0)) {
-        return Status::OK();
-    }
     state->const_pattern = true;
+    auto column = context->get_constant_column(1);
     auto part = ColumnHelper::get_const_value<TYPE_VARCHAR>(column);
     state->url_part.reset(new UrlParser::UrlPart);
     *(state->url_part) = UrlParser::get_url_part(StringValue::from_slice(part));
@@ -2797,8 +2868,8 @@ ColumnPtr StringFunctions::parse_url_general(FunctionContext* context, const sta
     auto str_viewer = ColumnViewer<TYPE_VARCHAR>(columns[0]);
     auto part_viewer = ColumnViewer<TYPE_VARCHAR>(columns[1]);
 
-    ColumnBuilder<TYPE_VARCHAR> result;
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
     for (int row = 0; row < size; ++row) {
         if (str_viewer.is_null(row) || part_viewer.is_null(row)) {
             result.append_null();
@@ -2834,8 +2905,8 @@ ColumnPtr StringFunctions::parse_url_const(UrlParser::UrlPart* url_part, Functio
                                            const starrocks::vectorized::Columns& columns) {
     auto str_viewer = ColumnViewer<TYPE_VARCHAR>(columns[0]);
 
-    ColumnBuilder<TYPE_VARCHAR> result;
     auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
     for (int row = 0; row < size; ++row) {
         if (str_viewer.is_null(row)) {
             result.append_null();
@@ -2871,5 +2942,4 @@ ColumnPtr StringFunctions::parse_url(FunctionContext* context, const starrocks::
     return parse_url_general(context, columns);
 }
 
-} // namespace vectorized
-} // namespace starrocks
+} // namespace starrocks::vectorized

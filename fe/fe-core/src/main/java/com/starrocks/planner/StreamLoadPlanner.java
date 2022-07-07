@@ -29,7 +29,6 @@ import com.starrocks.analysis.PartitionNames;
 import com.starrocks.analysis.SlotDescriptor;
 import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.catalog.AggregateType;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.KeysType;
@@ -40,13 +39,15 @@ import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
+import com.starrocks.common.Pair;
 import com.starrocks.common.UserException;
 import com.starrocks.load.Load;
-import com.starrocks.load.LoadErrorHub;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.optimizer.statistics.ColumnDict;
+import com.starrocks.sql.optimizer.statistics.IDictManager;
 import com.starrocks.task.StreamLoadTask;
 import com.starrocks.thrift.InternalServiceVersion;
 import com.starrocks.thrift.TExecPlanFragmentParams;
-import com.starrocks.thrift.TLoadErrorHubInfo;
 import com.starrocks.thrift.TPlanFragmentExecParams;
 import com.starrocks.thrift.TQueryGlobals;
 import com.starrocks.thrift.TQueryOptions;
@@ -62,13 +63,14 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 // Used to generate a plan fragment for a streaming load.
 // we only support OlapTable now.
 // TODO(zc): support other type table
 public class StreamLoadPlanner {
     private static final Logger LOG = LogManager.getLogger(StreamLoadPlanner.class);
-    private static final DateFormat DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+    private final DateFormat DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
 
     // destination Db and table get from request
     // Data will load to this table
@@ -86,7 +88,7 @@ public class StreamLoadPlanner {
     }
 
     private void resetAnalyzer() {
-        analyzer = new Analyzer(Catalog.getCurrentCatalog(), null);
+        analyzer = new Analyzer(GlobalStateMgr.getCurrentState(), null);
         // TODO(cmy): currently we do not support UDF in stream load command.
         // Because there is no way to check the privilege of accessing UDF..
         analyzer.setUDFAllowed(false);
@@ -100,12 +102,28 @@ public class StreamLoadPlanner {
 
     // create the plan. the plan's query id and load id are same, using the parameter 'loadId'
     public TExecPlanFragmentParams plan(TUniqueId loadId) throws UserException {
+        boolean isPrimaryKey = destTable.getKeysType() == KeysType.PRIMARY_KEYS;
         resetAnalyzer();
         // construct tuple descriptor, used for scanNode and dataSink
         TupleDescriptor tupleDesc = descTable.createTupleDescriptor("DstTableTuple");
         boolean negative = streamLoadTask.getNegative();
-        // here we should be full schema to fill the descriptor table
-        for (Column col : destTable.getFullSchema()) {
+        if (isPrimaryKey) {
+            if (negative) {
+                throw new DdlException("Primary key table does not support negative load");
+            }
+        } else {
+            if (streamLoadTask.isPartialUpdate()) {
+                throw new DdlException("Only primary key table support partial update");
+            }
+        }
+        List<Pair<Integer, ColumnDict>> globalDicts = Lists.newArrayList();
+        List<Column> destColumns;
+        if (streamLoadTask.isPartialUpdate()) {
+            destColumns = Load.getPartialUpateColumns(destTable, streamLoadTask.getColumnExprDescs());
+        } else {
+            destColumns = destTable.getFullSchema();
+        }
+        for (Column col : destColumns) {
             SlotDescriptor slotDesc = descTable.addSlotDescriptor(tupleDesc);
             slotDesc.setIsMaterialized(true);
             slotDesc.setColumn(col);
@@ -113,8 +131,17 @@ public class StreamLoadPlanner {
             if (negative && !col.isKey() && col.getAggregationType() != AggregateType.SUM) {
                 throw new DdlException("Column is not SUM AggreateType. column:" + col.getName());
             }
+
+            if (col.getType().isVarchar() && Config.enable_dict_optimize_stream_load &&
+                    IDictManager.getInstance().hasGlobalDict(destTable.getId(),
+                            col.getName())) {
+                Optional<ColumnDict> dict = IDictManager.getInstance().getGlobalDict(destTable.getId(), col.getName());
+                if (dict != null && dict.isPresent()) {
+                    globalDicts.add(new Pair<>(slotDesc.getId().asInt(), dict.get()));
+                }
+            }
         }
-        if (destTable.getKeysType() == KeysType.PRIMARY_KEYS) {
+        if (isPrimaryKey) {
             // add op type column
             SlotDescriptor slotDesc = descTable.addSlotDescriptor(tupleDesc);
             slotDesc.setIsMaterialized(true);
@@ -125,22 +152,10 @@ public class StreamLoadPlanner {
         // create scan node
         StreamLoadScanNode scanNode =
                 new StreamLoadScanNode(loadId, new PlanNodeId(0), tupleDesc, destTable, streamLoadTask);
-        boolean useVectorizedLoad = Config.vectorized_load_enable;
-        if (useVectorizedLoad) {
-            scanNode.setUseVectorizedLoad(true);
-            scanNode.init(analyzer);
-            scanNode.finalize(analyzer);
-        }
-        if (useVectorizedLoad && scanNode.isVectorized()) {
-            scanNode.setUseVectorized(true);
-        } else {
-            scanNode.setUseVectorizedLoad(false);
-            scanNode.init(analyzer);
-            scanNode.finalize(analyzer);
-            scanNode.setUseVectorized(false);
-        }
+        scanNode.setUseVectorizedLoad(true);
+        scanNode.init(analyzer);
+        scanNode.finalizeStats(analyzer);
 
-        LOG.info("use vectorized load: {}, load job id: {}", scanNode.isUseVectorized(), loadId);
         descTable.computeMemLayout();
 
         // create dest sink
@@ -153,6 +168,14 @@ public class StreamLoadPlanner {
         // OlapTableSink can dispatch data to corresponding node.
         PlanFragment fragment = new PlanFragment(new PlanFragmentId(0), scanNode, DataPartition.UNPARTITIONED);
         fragment.setSink(olapTableSink);
+        // At present, we only support dop=1 for olap table sink.
+        // because tablet writing needs to know the number of senders in advance
+        // and guaranteed order of data writing
+        // It can be parallel only in some scenes, for easy use 1 dop now.
+        fragment.setPipelineDop(1);
+        // After data loading, we need to check the global dict for low cardinality string column
+        // whether update.
+        fragment.setLoadGlobalDicts(globalDicts);
 
         fragment.finalize(null, false);
 
@@ -178,12 +201,23 @@ public class StreamLoadPlanner {
         execParams.setNum_senders(1);
         perNodeScanRange.put(scanNode.getId().asInt(), scanRangeParams);
         execParams.setPer_node_scan_ranges(perNodeScanRange);
-        execParams.setUse_vectorized(fragment.getPlanRoot().isUseVectorized());
         params.setParams(execParams);
         TQueryOptions queryOptions = new TQueryOptions();
         queryOptions.setQuery_type(TQueryType.LOAD);
         queryOptions.setQuery_timeout(streamLoadTask.getTimeout());
+        queryOptions.setTransmission_compression_type(streamLoadTask.getTransmisionCompressionType());
+        // Disable load_dop for LakeTable temporary, because BE's `LakeTabletsChannel` does not support
+        // parallel send from a single sender.
+        if (streamLoadTask.getLoadParallelRequestNum() != 0 && !destTable.isLakeTable()) {
+            // only dup_keys can use parallel write since other table's the order of write is important
+            if (destTable.getKeysType() == KeysType.DUP_KEYS) {
+                queryOptions.setLoad_dop(streamLoadTask.getLoadParallelRequestNum());
+            } else {
+                queryOptions.setLoad_dop(1);
+            }
+        }
         // for stream load, we use exec_mem_limit to limit the memory usage of load channel.
+        queryOptions.setMem_limit(streamLoadTask.getExecMemLimit());
         queryOptions.setLoad_mem_limit(streamLoadTask.getLoadMemLimit());
         params.setQuery_options(queryOptions);
         TQueryGlobals queryGlobals = new TQueryGlobals();
@@ -192,16 +226,9 @@ public class StreamLoadPlanner {
         queryGlobals.setTime_zone(streamLoadTask.getTimezone());
         params.setQuery_globals(queryGlobals);
 
-        // set load error hub if exist
-        LoadErrorHub.Param param = Catalog.getCurrentCatalog().getLoadInstance().getLoadErrorHubInfo();
-        if (param != null) {
-            TLoadErrorHubInfo info = param.toThrift();
-            if (info != null) {
-                params.setLoad_error_hub_info(info);
-            }
-        }
-
-        // LOG.debug("stream load txn id: {}, plan: {}", streamLoadTask.getTxnId(), params);
+        LOG.info("load job id: {} tx id {} parallel {} compress {}", loadId, streamLoadTask.getTxnId(),
+                queryOptions.getLoad_dop(),
+                queryOptions.getTransmission_compression_type());
         return params;
     }
 

@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/compound_predicate.h"
 
@@ -7,8 +7,7 @@
 #include "exprs/vectorized/binary_function.h"
 #include "exprs/vectorized/unary_function.h"
 
-namespace starrocks {
-namespace vectorized {
+namespace starrocks::vectorized {
 
 #define DEFINE_COMPOUND_CONSTRUCT(CLASS)              \
     CLASS(const TExprNode& node) : Predicate(node) {} \
@@ -109,5 +108,4 @@ Expr* VectorizedCompoundPredicateFactory::from_thrift(const TExprNode& node) {
     }
 }
 
-} // namespace vectorized
-} // namespace starrocks
+} // namespace starrocks::vectorized

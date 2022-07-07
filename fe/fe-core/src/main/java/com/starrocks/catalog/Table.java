@@ -25,11 +25,14 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.analysis.CreateTableStmt;
 import com.starrocks.analysis.DescriptorTable.ReferencedPartitionInfo;
+import com.starrocks.catalog.lake.LakeTable;
 import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TTableDescriptor;
 import org.apache.commons.lang.NotImplementedException;
 import org.apache.logging.log4j.LogManager;
@@ -39,6 +42,7 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -48,21 +52,37 @@ import java.util.Map;
 public class Table extends MetaObject implements Writable {
     private static final Logger LOG = LogManager.getLogger(Table.class);
 
+    // 1. Native table:
+    //   1.1 Local: OLAP, MATERIALIZED_VIEW
+    //   1.2 Lake: LAKE
+    // 2. System table: SCHEMA
+    // 3. View: INLINE_VIEW, VIEW
+    // 4. External table: MYSQL, OLAP_EXTERNAL, BROKER, ELASTICSEARCH, HIVE, ICEBERG, HUDI, ODBC, JDBC
     public enum TableType {
         MYSQL,
         OLAP,
+        OLAP_EXTERNAL,
         SCHEMA,
         INLINE_VIEW,
         VIEW,
         BROKER,
         ELASTICSEARCH,
         HIVE,
-        ODBC
+        ICEBERG,
+        HUDI,
+        ODBC,
+        JDBC,
+        MATERIALIZED_VIEW,
+        LAKE
     }
 
+    @SerializedName(value = "id")
     protected long id;
+    @SerializedName(value = "name")
     protected String name;
+    @SerializedName(value = "type")
     protected TableType type;
+    @SerializedName(value = "createTime")
     protected long createTime;
     /*
      *  fullSchema and nameToColumn should contains all columns, both visible and shadow.
@@ -84,6 +104,7 @@ public class Table extends MetaObject implements Writable {
      * <p>
      * If you want to get the mv columns, you should call getIndexToSchema in Subclass OlapTable.
      */
+    @SerializedName(value = "fullSchema")
     protected List<Column> fullSchema;
     // tree map for case-insensitive lookup.
     /**
@@ -94,6 +115,7 @@ public class Table extends MetaObject implements Writable {
     // DO NOT persist this variable.
     protected boolean isTypeRead = false;
     // table(view)'s comment
+    @SerializedName(value = "comment")
     protected String comment = "";
 
     public Table(TableType type) {
@@ -106,7 +128,7 @@ public class Table extends MetaObject implements Writable {
         this.id = id;
         this.name = tableName;
         this.type = type;
-        // must copy the list, it should not be the same object as in indexIdToSchmea
+        // must copy the list, it should not be the same object as in indexIdToSchema
         if (fullSchema != null) {
             this.fullSchema = Lists.newArrayList(fullSchema);
         }
@@ -138,8 +160,37 @@ public class Table extends MetaObject implements Writable {
         return name;
     }
 
+    public void setType(TableType type) {
+        this.type = type;
+    }
+
     public TableType getType() {
         return type;
+    }
+
+    public boolean isOlapTable() {
+        return type == TableType.OLAP;
+    }
+
+    public boolean isMaterializedView() {
+        return type == TableType.MATERIALIZED_VIEW;
+    }
+
+    public boolean isLakeTable() {
+        return type == TableType.LAKE;
+    }
+
+    public boolean isLocalTable() {
+        return isOlapTable() || isMaterializedView();
+    }
+
+    public boolean isNativeTable() {
+        return isLocalTable() || isLakeTable();
+    }
+
+    // for create table
+    public boolean isOlapOrLakeTable() {
+        return isOlapTable() || isLakeTable();
     }
 
     public List<Column> getFullSchema() {
@@ -161,6 +212,10 @@ public class Table extends MetaObject implements Writable {
 
     public Column getColumn(String name) {
         return nameToColumn.get(name);
+    }
+
+    public List<Column> getColumns() {
+        return new ArrayList<>(nameToColumn.values());
     }
 
     public long getCreateTime() {
@@ -186,8 +241,24 @@ public class Table extends MetaObject implements Writable {
             table = new EsTable();
         } else if (type == TableType.HIVE) {
             table = new HiveTable();
+        } else if (type == TableType.HUDI) {
+            table = new HudiTable();
         } else if (type == TableType.ODBC) {
             table = new OdbcTable();
+        } else if (type == TableType.OLAP_EXTERNAL) {
+            table = new ExternalOlapTable();
+        } else if (type == TableType.ICEBERG) {
+            table = new IcebergTable();
+        } else if (type == TableType.JDBC) {
+            table = new JDBCTable();
+        } else if (type == TableType.MATERIALIZED_VIEW) {
+            table = MaterializedView.read(in);
+            table.setTypeRead(true);
+            return table;
+        } else if (type == TableType.LAKE) {
+            table = LakeTable.read(in);
+            table.setTypeRead(true);
+            return table;
         } else {
             throw new IOException("Unknown table type: " + type.name());
         }
@@ -240,22 +311,27 @@ public class Table extends MetaObject implements Writable {
             this.nameToColumn.put(column.getName(), column);
         }
 
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_63) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_63) {
             comment = Text.readString(in);
         } else {
             comment = "";
         }
 
         // read create time
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_64) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_64) {
             this.createTime = in.readLong();
         } else {
             this.createTime = -1L;
         }
     }
 
-    public boolean equals(Table table) {
-        return true;
+    @Override
+    public boolean equals(Object other) {
+        if (!(other instanceof Table)) {
+            return false;
+        }
+        Table otherTable = (Table) other;
+        return id == otherTable.id;
     }
 
     // return if this table is partitioned.
@@ -283,6 +359,9 @@ public class Table extends MetaObject implements Writable {
     public String getMysqlType() {
         if (this instanceof View) {
             return "VIEW";
+        }
+        if (this instanceof MaterializedView) {
+            return "MATERIALIZED VIEW";
         }
         return "BASE TABLE";
     }
@@ -314,21 +393,33 @@ public class Table extends MetaObject implements Writable {
 
     /*
      * 1. Only schedule OLAP table.
-     * 2. If table is colocate with other table, not schedule it.
+     * 2. If table is colocate with other table,
+     *   2.1 If is clone between bes or group is not stable, table can not be scheduled.
+     *   2.2 If is local balance and group is stable, table can be scheduled.
      * 3. (deprecated). if table's state is ROLLUP or SCHEMA_CHANGE, but alter job's state is FINISHING, we should also
      *      schedule the tablet to repair it(only for VERSION_IMCOMPLETE case, this will be checked in
      *      TabletScheduler).
      * 4. Even if table's state is ROLLUP or SCHEMA_CHANGE, check it. Because we can repair the tablet of base index.
+     * 5. PRIMARY_KEYS table does not support local balance.
      */
-    public boolean needSchedule() {
+    public boolean needSchedule(boolean isLocalBalance) {
         if (type != TableType.OLAP) {
             return false;
         }
 
-        OlapTable olapTable = (OlapTable) this;
+        ColocateTableIndex colocateIndex = GlobalStateMgr.getCurrentColocateIndex();
+        if (colocateIndex.isColocateTable(getId())) {
+            boolean isGroupUnstable = colocateIndex.isGroupUnstable(colocateIndex.getGroup(getId()));
+            if (!isLocalBalance || isGroupUnstable) {
+                LOG.debug(
+                        "table {} is a colocate table, skip tablet checker. is local migration: {}, is group unstable: {}",
+                        name, isLocalBalance, isGroupUnstable);
+                return false;
+            }
+        }
 
-        if (Catalog.getCurrentColocateIndex().isColocateTable(olapTable.getId())) {
-            LOG.debug("table {} is a colocate table, skip tablet checker.", name);
+        OlapTable olapTable = (OlapTable) this;
+        if (isLocalBalance && olapTable.getKeysType() == KeysType.PRIMARY_KEYS) {
             return false;
         }
 
@@ -341,5 +432,9 @@ public class Table extends MetaObject implements Writable {
 
     // onDrop is called when this table is dropped
     public void onDrop() {
+    }
+
+    public boolean isSupported() {
+        return false;
     }
 }

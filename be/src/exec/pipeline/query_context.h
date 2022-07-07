@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -11,12 +11,11 @@
 #include "exec/pipeline/pipeline_fwd.h"
 #include "gen_cpp/InternalService_types.h" // for TQueryOptions
 #include "gen_cpp/Types_types.h"           // for TUniqueId
-#include "runtime/mem_tracker.h"
 #include "runtime/runtime_state.h"
 #include "util/hash_util.hpp"
+#include "util/time.h"
 
 namespace starrocks {
-class MemTracker;
 namespace pipeline {
 
 using std::chrono::seconds;
@@ -27,7 +26,10 @@ using std::chrono::duration_cast;
 class QueryContext {
 public:
     QueryContext();
-    RuntimeState* get_runtime_state() { return _runtime_state.get(); }
+    ~QueryContext();
+    void set_exec_env(ExecEnv* exec_env) { _exec_env = exec_env; }
+    void set_query_id(const TUniqueId& query_id) { _query_id = query_id; }
+    TUniqueId query_id() { return _query_id; }
     void set_total_fragments(size_t total_fragments) { _total_fragments = total_fragments; }
 
     void increment_num_fragments() {
@@ -35,52 +37,145 @@ public:
         _num_active_fragments.fetch_add(1);
     }
 
-    bool count_down_fragment() { return _num_active_fragments.fetch_sub(1) == 1; }
+    bool count_down_fragments() {
+        size_t old = _num_active_fragments.fetch_sub(1);
+        DCHECK_GE(old, 1);
+        return old == 1;
+    }
+    int num_active_fragments() const { return _num_active_fragments.load(); }
+    bool has_no_active_instances() { return _num_active_fragments.load() == 0; }
 
-    void set_expire_seconds(int expire_seconds) { _expire_seconds = seconds(expire_seconds); }
-
+    void set_delivery_expire_seconds(int expire_seconds) { _delivery_expire_seconds = seconds(expire_seconds); }
+    void set_query_expire_seconds(int expire_seconds) { _query_expire_seconds = seconds(expire_seconds); }
+    inline int get_query_expire_seconds() const { return _query_expire_seconds.count(); }
     // now time point pass by deadline point.
-    bool is_expired() {
+    bool is_delivery_expired() const {
         auto now = duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
-        return now > _deadline;
+        return now > _delivery_deadline;
+    }
+    bool is_query_expired() const {
+        auto now = duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+        return now > _query_deadline;
     }
 
+    bool is_dead() { return _num_active_fragments == 0 && _num_fragments == _total_fragments; }
     // add expired seconds to deadline
-    void extend_lifetime() {
-        _deadline = duration_cast<milliseconds>(steady_clock::now().time_since_epoch() + _expire_seconds).count();
+    void extend_delivery_lifetime() {
+        _delivery_deadline =
+                duration_cast<milliseconds>(steady_clock::now().time_since_epoch() + _delivery_expire_seconds).count();
+    }
+    void extend_query_lifetime() {
+        _query_deadline =
+                duration_cast<milliseconds>(steady_clock::now().time_since_epoch() + _query_expire_seconds).count();
     }
 
     FragmentContextManager* fragment_mgr();
 
     void cancel(const Status& status);
 
+    void set_is_runtime_filter_coordinator(bool flag) { _is_runtime_filter_coordinator = flag; }
+
+    ObjectPool* object_pool() { return &_object_pool; }
+    void set_desc_tbl(DescriptorTbl* desc_tbl) {
+        DCHECK(_desc_tbl == nullptr);
+        _desc_tbl = desc_tbl;
+    }
+
+    DescriptorTbl* desc_tbl() {
+        DCHECK(_desc_tbl != nullptr);
+        return _desc_tbl;
+    }
+    // If option_query_mem_limit > 0, use it directly.
+    // Otherwise, use per_instance_mem_limit * num_fragments * pipeline_dop.
+    int64_t compute_query_mem_limit(int64_t parent_mem_limit, int64_t per_instance_mem_limit, size_t pipeline_dop,
+                                    int64_t option_query_mem_limit);
+    size_t total_fragments() { return _total_fragments; }
+    void init_mem_tracker(int64_t bytes_limit, MemTracker* parent);
+    std::shared_ptr<MemTracker> mem_tracker() { return _mem_tracker; }
+
+    Status init_query(workgroup::WorkGroup* wg);
+
+    // Some statistic about the query, including cpu, scan_rows, scan_bytes
+    void incr_cpu_cost(int64_t cost) { _cur_cpu_cost_ns += cost; }
+    int64_t cpu_cost() const { return _cur_cpu_cost_ns; }
+    int64_t mem_cost_bytes() const { return _mem_tracker->peak_consumption(); }
+    void incr_cur_scan_rows_num(int64_t rows_num) { _cur_scan_rows_num += rows_num; }
+    int64_t cur_scan_rows_num() const { return _cur_scan_rows_num; }
+    void incr_cur_scan_bytes(int64_t scan_bytes) { _cur_scan_bytes += scan_bytes; }
+    int64_t get_scan_bytes() const { return _cur_scan_bytes; }
+
+    // Record the cpu time of the query run, for big query checking
+    int64_t init_wg_cpu_cost() const { return _init_wg_cpu_cost; }
+    void set_init_wg_cpu_cost(int64_t wg_cpu_cost) { _init_wg_cpu_cost = wg_cpu_cost; }
+
+    // Query start time, used to check how long the query has been running
+    // To ensure that the minimum run time of the query will not be killed by the big query checking mechanism
+    int64_t query_begin_time() const { return _query_begin_time; }
+    void init_query_begin_time() { _query_begin_time = MonotonicNanos(); }
+
+public:
+    static constexpr int DEFAULT_EXPIRE_SECONDS = 300;
+
 private:
-    std::unique_ptr<RuntimeState> _runtime_state;
-    std::shared_ptr<RuntimeProfile> _runtime_profile;
-    std::unique_ptr<MemTracker> _mem_tracker;
-    TQueryOptions _query_options;
+    ExecEnv* _exec_env = nullptr;
     TUniqueId _query_id;
     std::unique_ptr<FragmentContextManager> _fragment_mgr;
     size_t _total_fragments;
     std::atomic<size_t> _num_fragments;
     std::atomic<size_t> _num_active_fragments;
-    int64_t _deadline;
-    seconds _expire_seconds;
+    int64_t _delivery_deadline = 0;
+    int64_t _query_deadline = 0;
+    seconds _delivery_expire_seconds = seconds(DEFAULT_EXPIRE_SECONDS);
+    seconds _query_expire_seconds = seconds(DEFAULT_EXPIRE_SECONDS);
+    bool _is_runtime_filter_coordinator = false;
+    std::once_flag _init_mem_tracker_once;
+    std::shared_ptr<RuntimeProfile> _profile;
+    std::shared_ptr<MemTracker> _mem_tracker;
+    ObjectPool _object_pool;
+    DescriptorTbl* _desc_tbl = nullptr;
+
+    std::once_flag _init_query_once;
+    int64_t _query_begin_time = 0;
+    std::atomic<int64_t> _cur_cpu_cost_ns = 0;
+    std::atomic<int64_t> _cur_scan_rows_num = 0;
+    std::atomic<int64_t> _cur_scan_bytes = 0;
+
+    int64_t _init_wg_cpu_cost = 0;
 };
 
 class QueryContextManager {
-    DECLARE_SINGLETON(QueryContextManager);
-
 public:
+    QueryContextManager(size_t log2_num_slots);
+    ~QueryContextManager();
+    Status init();
     QueryContext* get_or_register(const TUniqueId& query_id);
     QueryContextPtr get(const TUniqueId& query_id);
-    void unregister(const TUniqueId& query_id);
+    size_t size();
+    bool remove(const TUniqueId& query_id);
+    // used for graceful exit
+    void clear();
 
 private:
-    //TODO(by satanson)
-    // A multi-shard map may be more efficient
-    std::mutex _lock;
-    std::unordered_map<TUniqueId, QueryContextPtr> _contexts;
+    static void _clean_func(QueryContextManager* manager);
+    void _clean_query_contexts();
+    void _stop_clean_func() { _stop.store(true); }
+    bool _is_stopped() { return _stop; }
+    size_t _slot_idx(const TUniqueId& query_id);
+    void _clean_slot_unlocked(size_t i);
+
+private:
+    const size_t _num_slots;
+    const size_t _slot_mask;
+    std::vector<std::shared_mutex> _mutexes;
+    std::vector<std::unordered_map<TUniqueId, QueryContextPtr>> _context_maps;
+    std::vector<std::unordered_map<TUniqueId, QueryContextPtr>> _second_chance_maps;
+
+    std::atomic<bool> _stop{false};
+    std::shared_ptr<std::thread> _clean_thread;
+
+    inline static const char* _metric_name = "pip_query_ctx_cnt";
+    std::unique_ptr<UIntGauge> _query_ctx_cnt;
 };
+
 } // namespace pipeline
 } // namespace starrocks

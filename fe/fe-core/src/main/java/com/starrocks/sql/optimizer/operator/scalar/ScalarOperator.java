@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.operator.scalar;
 
 import com.starrocks.catalog.Type;
@@ -14,10 +14,17 @@ public abstract class ScalarOperator implements Cloneable {
     protected Type type;
     // this operator will not eval in predicate estimate
     protected boolean notEvalEstimate = false;
+    // Used to determine if it is derive from predicate range extractor
+    protected boolean fromPredicateRangeDerive = false;
 
     public ScalarOperator(OperatorType opType, Type type) {
         this.opType = requireNonNull(opType, "opType is null");
         this.type = requireNonNull(type, "type is null");
+    }
+
+    @SuppressWarnings("unchecked")
+    public <T extends ScalarOperator> T cast() {
+        return (T) this;
     }
 
     public boolean isConstant() {
@@ -62,6 +69,14 @@ public abstract class ScalarOperator implements Cloneable {
         this.notEvalEstimate = notEvalInPredicateEstimate;
     }
 
+    public boolean isFromPredicateRangeDerive() {
+        return fromPredicateRangeDerive;
+    }
+
+    public void setFromPredicateRangeDerive(boolean fromPredicateRangeDerive) {
+        this.fromPredicateRangeDerive = fromPredicateRangeDerive;
+    }
+
     public abstract List<ScalarOperator> getChildren();
 
     public abstract ScalarOperator getChild(int index);
@@ -94,41 +109,16 @@ public abstract class ScalarOperator implements Cloneable {
      * Return the columns that this scalar operator used.
      * For a + b, the used columns are a and b.
      */
-    public ColumnRefSet getUsedColumns() {
-        return new ColumnRefSet();
-    }
+    public abstract ColumnRefSet getUsedColumns();
 
-    /**
-     * debug string is used to print scalar operator tree
-     */
     public String debugString() {
         return toString();
-    }
-
-    /**
-     * For a predicate, if input is Null, output is Null or false, we call it is strict.
-     */
-    public boolean isStrictPredicate() {
-        return false;
-    }
-
-    // If 'this' is a ColumnRef or a Cast that wraps a ColumnRef, returns true.
-    public boolean isColumnRefOrCast() {
-        if (this instanceof ColumnRefOperator) {
-            return true;
-        }
-        return this instanceof CastOperator && getChild(0) instanceof ColumnRefOperator;
     }
 
     public boolean isColumnRef() {
         return this instanceof ColumnRefOperator;
     }
 
-    /**
-     * is ConstantOperator?
-     *
-     * @return True/False
-     */
     public boolean isConstantRef() {
         return this instanceof ConstantOperator;
     }

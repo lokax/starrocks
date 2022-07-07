@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/common/configbase.cpp
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -35,8 +31,7 @@
 #include "common/status.h"
 #include "gutil/strings/substitute.h"
 
-namespace starrocks {
-namespace config {
+namespace starrocks::config {
 
 std::map<std::string, Register::Field>* Register::_s_field_map = nullptr;
 std::map<std::string, std::string>* full_conf_map = nullptr;
@@ -52,7 +47,7 @@ std::string& trim(std::string& s) {
     return s;
 }
 
-// split string by '='
+// Split string by '='.
 void splitkv(const std::string& s, std::string& k, std::string& v) {
     const char sep = '=';
     size_t start = 0;
@@ -66,12 +61,12 @@ void splitkv(const std::string& s, std::string& k, std::string& v) {
     }
 }
 
-// replace env variables
+// Replace env variables.
 bool replaceenv(std::string& s) {
     std::size_t pos = 0;
     std::size_t start = 0;
     while ((start = s.find("${", pos)) != std::string::npos) {
-        std::size_t end = s.find("}", start + 2);
+        std::size_t end = s.find('}', start + 2);
         if (end == std::string::npos) {
             return false;
         }
@@ -171,14 +166,14 @@ bool strtox(const std::string& valstr, std::string& retval) {
     return true;
 }
 
-// load conf file
+// Load conf file.
 bool Properties::load(const char* filename) {
-    // if filename is null, use the empty props
+    // If 'filename' is null, use the empty props.
     if (filename == nullptr) {
         return true;
     }
 
-    // open the conf file
+    // Open the conf file
     std::ifstream input(filename);
     if (!input.is_open()) {
         std::cerr << "config::load() failed to open the file:" << filename << std::endl;
@@ -191,27 +186,27 @@ bool Properties::load(const char* filename) {
     std::string value;
     line.reserve(512);
     while (input) {
-        // read one line at a time
+        // Read one line at a time.
         std::getline(input, line);
 
-        // remove left and right spaces
+        // Remove left and right spaces.
         trim(line);
 
-        // ignore comments
+        // Ignore comments.
         if (line.empty() || line[0] == '#') {
             continue;
         }
 
-        // read key and value
+        // Read key and value.
         splitkv(line, key, value);
         trim(key);
         trim(value);
 
-        // insert into file_conf_map
+        // Insert into 'file_conf_map'.
         file_conf_map[key] = value;
     }
 
-    // close the conf file
+    // Close the conf file.
     input.close();
 
     return true;
@@ -264,18 +259,18 @@ std::ostream& operator<<(std::ostream& out, const std::vector<T>& v) {
         continue;                                                                                  \
     }
 
-// init conf fields
+// Init conf fields.
 bool init(const char* filename, bool fillconfmap) {
-    // load properties file
+    // Load properties file.
     if (!props.load(filename)) {
         return false;
     }
-    // fill full_conf_map ?
+    // Fill 'full_conf_map'.
     if (fillconfmap && full_conf_map == nullptr) {
         full_conf_map = new std::map<std::string, std::string>();
     }
 
-    // set conf fields
+    // Set conf fields.
     for (const auto& it : *Register::_s_field_map) {
         SET_FIELD(it.second, bool, fillconfmap);
         SET_FIELD(it.second, int16_t, fillconfmap);
@@ -328,5 +323,4 @@ Status set_config(const std::string& field, const std::string& value) {
             strings::Substitute("'$0' is type of '$1' which is not support to modify", field, it->second.type));
 }
 
-} // namespace config
-} // namespace starrocks
+} // namespace starrocks::config

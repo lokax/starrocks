@@ -1,12 +1,12 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
 #include <orc/OrcFile.hh>
 
-#include "env/env.h"
 #include "exec/vectorized/file_scanner.h"
-#include "exec/vectorized/orc_scanner_adapter.h"
+#include "formats/orc/orc_chunk_reader.h"
+#include "fs/fs.h"
 
 namespace starrocks::vectorized {
 
@@ -46,7 +46,7 @@ private:
     int _error_counter;
     bool _status_eof;
 
-    std::unique_ptr<OrcScannerAdapter> _orc_adapter;
+    std::unique_ptr<OrcChunkReader> _orc_reader;
     std::vector<SlotDescriptor*> _orc_slot_descriptors;
 };
 

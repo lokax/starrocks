@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer;
 
@@ -86,7 +86,7 @@ public class MemoTest {
         Memo memo = new Memo();
         memo.init(expr);
 
-        Operator projectOperator = new LogicalLimitOperator(1, 1);
+        Operator projectOperator = LogicalLimitOperator.init(1, 1);
         GroupExpression newGroupExpression = new GroupExpression(projectOperator, Lists.newArrayList());
 
         memo.insertGroupExpression(newGroupExpression, memo.getGroups().get(3));

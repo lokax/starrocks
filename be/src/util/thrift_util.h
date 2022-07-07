@@ -19,12 +19,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_COMMON_UTIL_THRIFT_UTIL_H
-#define STARROCKS_BE_SRC_COMMON_UTIL_THRIFT_UTIL_H
+#pragma once
 
 #include <thrift/TApplicationException.h>
 #include <thrift/protocol/TBinaryProtocol.h>
 #include <thrift/protocol/TDebugProtocol.h>
+#include <thrift/protocol/TJSONProtocol.h>
 #include <thrift/transport/TBufferTransports.h>
 
 #include <memory>
@@ -53,7 +53,7 @@ public:
     template <class T>
     Status serialize(T* obj, std::vector<uint8_t>* result) {
         uint32_t len = 0;
-        uint8_t* buffer = NULL;
+        uint8_t* buffer = nullptr;
         RETURN_IF_ERROR(serialize<T>(obj, &len, &buffer));
         result->resize(len);
         memcpy(&((*result)[0]), buffer, len);
@@ -114,30 +114,30 @@ private:
     std::shared_ptr<apache::thrift::protocol::TProtocol> _protocol;
 };
 
-class ThriftDeserializer {
-public:
-    ThriftDeserializer(bool compact);
-
-private:
-    std::shared_ptr<apache::thrift::protocol::TProtocolFactory> _factory;
-    std::shared_ptr<apache::thrift::protocol::TProtocol> _tproto;
+enum TProtocolType {
+    // Use TCompactProtocol to deserialize msg
+    COMPACT, // 0
+    // Use TBinaryProtocol to deserialize msg
+    BINARY, // 1
+    // Use TJSONProtocol to deserialize msg
+    JSON // 2
 };
 
 // Utility to create a protocol (deserialization) object for 'mem'.
 std::shared_ptr<apache::thrift::protocol::TProtocol> create_deserialize_protocol(
-        std::shared_ptr<apache::thrift::transport::TMemoryBuffer> mem, bool compact);
+        const std::shared_ptr<apache::thrift::transport::TMemoryBuffer>& mem, TProtocolType type);
 
 // Deserialize a thrift message from buf/len.  buf/len must at least contain
 // all the bytes needed to store the thrift message.  On return, len will be
 // set to the actual length of the header.
 template <class T>
-Status deserialize_thrift_msg(const uint8_t* buf, uint32_t* len, bool compact, T* deserialized_msg) {
+Status deserialize_thrift_msg(const uint8_t* buf, uint32_t* len, TProtocolType type, T* deserialized_msg) {
     // Deserialize msg bytes into c++ thrift msg using memory
     // transport. TMemoryBuffer is not const-safe, although we use it in
     // a const-safe way, so we have to explicitly cast away the const.
     std::shared_ptr<apache::thrift::transport::TMemoryBuffer> tmem_transport(
             new apache::thrift::transport::TMemoryBuffer(const_cast<uint8_t*>(buf), *len));
-    std::shared_ptr<apache::thrift::protocol::TProtocol> tproto = create_deserialize_protocol(tmem_transport, compact);
+    std::shared_ptr<apache::thrift::protocol::TProtocol> tproto = create_deserialize_protocol(tmem_transport, type);
 
     try {
         deserialized_msg->read(tproto.get());
@@ -172,6 +172,16 @@ void t_network_address_to_string(const TNetworkAddress& address, std::string* ou
 // string representation
 bool t_network_address_comparator(const TNetworkAddress& a, const TNetworkAddress& b);
 
-} // namespace starrocks
+template <typename ThriftStruct>
+ThriftStruct from_json_string(const std::string& json_val) {
+    using namespace apache::thrift::transport;
+    using namespace apache::thrift::protocol;
+    ThriftStruct ts;
+    TMemoryBuffer* buffer = new TMemoryBuffer((uint8_t*)json_val.c_str(), (uint32_t)json_val.size());
+    std::shared_ptr<TTransport> trans(buffer);
+    TJSONProtocol protocol(trans);
+    ts.read(&protocol);
+    return ts;
+}
 
-#endif
+} // namespace starrocks

@@ -21,8 +21,8 @@
 
 package com.starrocks.plugin;
 
-import com.starrocks.catalog.Catalog;
 import com.starrocks.common.UserException;
+import com.starrocks.server.GlobalStateMgr;
 import org.apache.commons.io.FileUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -157,7 +157,7 @@ public class DynamicPluginLoader extends PluginLoader {
      * @throws PluginException
      */
     public void reload() throws IOException, UserException {
-        if (Catalog.isCheckpointThread()) {
+        if (GlobalStateMgr.isCheckpointThread()) {
             /*
              * No need to reload the plugin when this is a checkpoint thread.
              * Because this reload() method will create a new instance of plugin and try to start it.
@@ -208,8 +208,8 @@ public class DynamicPluginLoader extends PluginLoader {
         Class<? extends Plugin> pluginClass;
         try {
             pluginClass = loader.loadClass(pluginInfo.getClassName()).asSubclass(Plugin.class);
-        } catch (ClassNotFoundException e) {
-            throw new UserException("Could not find plugin class [" + pluginInfo.getClassName() + "]", e);
+        } catch (ClassNotFoundException | NoClassDefFoundError t) {
+            throw new UserException("Could not find plugin class [" + pluginInfo.getClassName() + "]", t);
         }
 
         return loadPluginClass(pluginClass);

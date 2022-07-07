@@ -73,26 +73,7 @@ public class WithClause implements ParseNode {
      * TableRefs to simplify the analysis of view references.
      */
     @Override
-    public void analyze(Analyzer analyzer) throws AnalysisException, UserException {
-        // Create a new analyzer for the WITH clause with a new global state (IMPALA-1357)
-        // but a child of 'analyzer' so that the global state for 'analyzer' is not polluted
-        // during analysis of the WITH clause. withClauseAnalyzer is a child of 'analyzer' so
-        // that local views registered in parent blocks are visible here.
-        Analyzer withClauseAnalyzer = Analyzer.createWithNewGlobalState(analyzer);
-        withClauseAnalyzer.setIsWithClause();
-        if (analyzer.isExplain()) {
-            withClauseAnalyzer.setIsExplain();
-        }
-        for (View view : views_) {
-            Analyzer viewAnalyzer = new Analyzer(withClauseAnalyzer);
-            view.getQueryStmt().analyze(viewAnalyzer);
-            // Register this view so that the next view can reference it.
-            withClauseAnalyzer.registerLocalView(view);
-        }
-        // Register all local views with the analyzer.
-        for (View localView : withClauseAnalyzer.getLocalViews().values()) {
-            analyzer.registerLocalView(localView);
-        }
+    public void analyze(Analyzer analyzer) throws UserException {
     }
 
     /**
@@ -139,6 +120,21 @@ public class WithClause implements ParseNode {
             viewStrings.add(aliasSql + " AS (" + view.getQueryStmt().toSql() + ")");
         }
         return "WITH " + Joiner.on(",").join(viewStrings);
+    }
+
+    public String toDigest() {
+        List<String> viewStrings = Lists.newArrayList();
+        for (View view : views_) {
+            // Enclose the view alias and explicit labels in quotes if Hive cannot parse it
+            // without quotes. This is needed for view compatibility between Impala and Hive.
+            String aliasSql = ToSqlUtils.getIdentSql(view.getName());
+            if (view.hasColLabels()) {
+                aliasSql += "(" + Joiner.on(", ").join(
+                        ToSqlUtils.getIdentSqlList(view.getOriginalColLabels())) + ")";
+            }
+            viewStrings.add(aliasSql + " as (" + view.getQueryStmt().toDigest() + ")");
+        }
+        return "with " + Joiner.on(",").join(viewStrings);
     }
 
     public List<View> getViews() {

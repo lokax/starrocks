@@ -56,6 +56,16 @@ enum THdfsFileFormat {
   ORC,
 }
 
+
+// Text file desc
+struct TTextFileDesc {
+    // property 'field.delim'
+    1: optional string  field_delim
+
+    // property 'line.delim'
+    2: optional string line_delim
+}
+
 enum TSchemaTableType {
     SCH_AUTHORS= 0,
     SCH_CHARSETS,
@@ -70,6 +80,7 @@ enum TSchemaTableType {
     SCH_GLOBAL_STATUS,
     SCH_GLOBAL_VARIABLES,
     SCH_KEY_COLUMN_USAGE,
+    SCH_MATERIALIZED_VIEWS,
     SCH_OPEN_TABLES,
     SCH_PARTITIONS,
     SCH_PLUGINS,
@@ -91,6 +102,8 @@ enum TSchemaTableType {
     SCH_USER_PRIVILEGES,
     SCH_VARIABLES,
     SCH_VIEWS,
+    SCH_TASKS,
+    SCH_TASK_RUNS,
     SCH_INVALID
 }
 
@@ -175,6 +188,7 @@ struct TOlapTablePartitionParam {
     6: required list<TOlapTablePartition> partitions
 
     7: optional list<string> partition_columns
+    8: optional list<Exprs.TExpr> partition_exprs
 }
 
 struct TOlapTableIndexSchema {
@@ -287,6 +301,42 @@ struct THdfsTable {
     5: optional list<string> partition_prefixes
 }
 
+struct TIcebergTable {
+    // table location
+    1: optional string location
+
+    // Schema columns, except partition columns
+    2: optional list<TColumn> columns
+}
+
+struct THudiTable {
+    // table location
+    1: optional string location
+
+    // Schema columns, except partition columns
+    2: optional list<TColumn> columns
+
+    // Partition columns
+    3: optional list<TColumn> partition_columns
+
+    // Map from partition id to partition metadata.
+    4: optional map<i64, THdfsPartition> partitions
+
+    // The prefixes of locations of partitions in this table
+    5: optional list<string> partition_prefixes
+}
+
+struct TJDBCTable {
+    1: optional string jdbc_driver_name
+    2: optional string jdbc_driver_url
+    3: optional string jdbc_driver_checksum
+    4: optional string jdbc_driver_class
+    5: optional string jdbc_url
+    6: optional string jdbc_table
+    7: optional string jdbc_user
+    8: optional string jdbc_passwd
+}
+
 // "Union" of all table types.
 struct TTableDescriptor {
   1: required Types.TTableId id
@@ -304,9 +354,16 @@ struct TTableDescriptor {
   12: optional TSchemaTable schemaTable
   14: optional TBrokerTable BrokerTable
   15: optional TEsTable esTable
+  16: optional TJDBCTable jdbcTable
 
   // Hdfs Table schema
   30: optional THdfsTable hdfsTable
+
+  // Iceberg Table schema
+  31: optional TIcebergTable icebergTable
+
+  // Hudi Table schema
+  32: optional THudiTable hudiTable
 }
 
 struct TDescriptorTable {
@@ -315,4 +372,5 @@ struct TDescriptorTable {
 
   // all table descriptors referenced by tupleDescriptors
   3: optional list<TTableDescriptor> tableDescriptors;
+  4: optional bool is_cached;
 }

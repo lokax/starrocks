@@ -40,6 +40,7 @@ import com.starrocks.meta.MetaContext;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.ShowExecutor;
 import com.starrocks.qe.ShowResultSet;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
 import org.junit.AfterClass;
@@ -57,20 +58,18 @@ import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 public class TempPartitionTest {
 
     private static String tempPartitionFile = "./TempPartitionTest";
     private static String tblFile = "./tblFile";
-    private static String runningDir = "fe/mocked/TempPartitionTest/" + UUID.randomUUID().toString() + "/";
 
     private static ConnectContext ctx;
     private static StarRocksAssert starRocksAssert;
 
     @BeforeClass
     public static void setup() throws Exception {
-        UtFrameUtils.createMinStarRocksCluster(runningDir);
+        UtFrameUtils.createMinStarRocksCluster();
         ctx = UtFrameUtils.createDefaultCtx();
         FeConstants.default_scheduler_interval_millisecond = 100;
         starRocksAssert = new StarRocksAssert(ctx);
@@ -78,8 +77,6 @@ public class TempPartitionTest {
 
     @AfterClass
     public static void tearDown() {
-        File file = new File(runningDir);
-        file.delete();
         File file2 = new File(tempPartitionFile);
         file2.delete();
         File file3 = new File(tblFile);
@@ -104,7 +101,7 @@ public class TempPartitionTest {
     private void alterTable(String sql, boolean expectedException) throws Exception {
         try {
             AlterTableStmt alterTableStmt = (AlterTableStmt) UtFrameUtils.parseAndAnalyzeStmt(sql, ctx);
-            Catalog.getCurrentCatalog().getAlterInstance().processAlterTable(alterTableStmt);
+            GlobalStateMgr.getCurrentState().getAlterInstance().processAlterTable(alterTableStmt);
             if (expectedException) {
                 Assert.fail("expected exception not thrown");
             }
@@ -131,7 +128,7 @@ public class TempPartitionTest {
     }
 
     private long getPartitionIdByTabletId(long tabletId) {
-        TabletInvertedIndex index = Catalog.getCurrentInvertedIndex();
+        TabletInvertedIndex index = GlobalStateMgr.getCurrentInvertedIndex();
         TabletMeta tabletMeta = index.getTabletMeta(tabletId);
         if (tabletMeta == null) {
             return -1;
@@ -162,7 +159,7 @@ public class TempPartitionTest {
     }
 
     private void checkTabletExists(Collection<Long> tabletIds, boolean checkExist) {
-        TabletInvertedIndex invertedIndex = Catalog.getCurrentInvertedIndex();
+        TabletInvertedIndex invertedIndex = GlobalStateMgr.getCurrentInvertedIndex();
         for (Long tabletId : tabletIds) {
             if (checkExist) {
                 Assert.assertNotNull(invertedIndex.getTabletMeta(tabletId));
@@ -212,7 +209,7 @@ public class TempPartitionTest {
                         "distributed by hash(k2) buckets 1\n" +
                         "properties('replication_num' = '1');");
 
-        Database db2 = Catalog.getCurrentCatalog().getDb("default_cluster:db2");
+        Database db2 = GlobalStateMgr.getCurrentState().getDb("default_cluster:db2");
         OlapTable tbl2 = (OlapTable) db2.getTable("tbl2");
 
         testSerializeOlapTable(tbl2);
@@ -295,7 +292,7 @@ public class TempPartitionTest {
 
         String recoverStr = "recover partition p1 from db2.tbl2;";
         RecoverPartitionStmt recoverStmt = (RecoverPartitionStmt) UtFrameUtils.parseAndAnalyzeStmt(recoverStr, ctx);
-        Catalog.getCurrentCatalog().recoverPartition(recoverStmt);
+        GlobalStateMgr.getCurrentState().recoverPartition(recoverStmt);
         checkShowPartitionsResultNum("db2.tbl2", true, 3);
         checkShowPartitionsResultNum("db2.tbl2", false, 3);
 
@@ -335,7 +332,7 @@ public class TempPartitionTest {
 
         String truncateStr = "truncate table db2.tbl2 partition (p3);";
         TruncateTableStmt truncateTableStmt = (TruncateTableStmt) UtFrameUtils.parseAndAnalyzeStmt(truncateStr, ctx);
-        Catalog.getCurrentCatalog().truncateTable(truncateTableStmt);
+        GlobalStateMgr.getCurrentState().truncateTable(truncateTableStmt);
         checkShowPartitionsResultNum("db2.tbl2", true, 1);
         checkShowPartitionsResultNum("db2.tbl2", false, 3);
         checkPartitionExist(tbl2, "tp1", false, true);
@@ -418,7 +415,7 @@ public class TempPartitionTest {
 
         truncateStr = "truncate table db2.tbl2";
         truncateTableStmt = (TruncateTableStmt) UtFrameUtils.parseAndAnalyzeStmt(truncateStr, ctx);
-        Catalog.getCurrentCatalog().truncateTable(truncateTableStmt);
+        GlobalStateMgr.getCurrentState().truncateTable(truncateTableStmt);
         checkShowPartitionsResultNum("db2.tbl2", false, 3);
         checkShowPartitionsResultNum("db2.tbl2", true, 0);
 
@@ -429,7 +426,7 @@ public class TempPartitionTest {
         alterTable(stmtStr, true);
 
         // wait rollup finish
-        Map<Long, AlterJobV2> alterJobs = Catalog.getCurrentCatalog().getRollupHandler().getAlterJobsV2();
+        Map<Long, AlterJobV2> alterJobs = GlobalStateMgr.getCurrentState().getRollupHandler().getAlterJobsV2();
         for (AlterJobV2 alterJobV2 : alterJobs.values()) {
             while (!alterJobV2.getJobState().isFinalState()) {
                 System.out.println(
@@ -440,7 +437,8 @@ public class TempPartitionTest {
             Assert.assertEquals(AlterJobV2.JobState.FINISHED, alterJobV2.getJobState());
         }
 
-        OlapTable olapTable = (OlapTable) Catalog.getCurrentCatalog().getDb("default_cluster:db2").getTable("tbl2");
+        OlapTable olapTable =
+                (OlapTable) GlobalStateMgr.getCurrentState().getDb("default_cluster:db2").getTable("tbl2");
 
         // waiting table state to normal
         int retryTimes = 5;
@@ -507,7 +505,7 @@ public class TempPartitionTest {
                 "distributed by hash(k2) buckets 1\n" +
                 "properties('replication_num' = '1');");
 
-        Database db3 = Catalog.getCurrentCatalog().getDb("default_cluster:db3");
+        Database db3 = GlobalStateMgr.getCurrentState().getDb("default_cluster:db3");
         OlapTable tbl3 = (OlapTable) db3.getTable("tbl3");
 
         // base range is [min, 10), [10, 20), [20, 30)
@@ -525,7 +523,7 @@ public class TempPartitionTest {
         // now base range is [min, 10), [10, 15), [15, 25), [25, 30) -> p1,tp1,tp2,tp3
         stmtStr = "truncate table db3.tbl3";
         TruncateTableStmt truncateTableStmt = (TruncateTableStmt) UtFrameUtils.parseAndAnalyzeStmt(stmtStr, ctx);
-        Catalog.getCurrentCatalog().truncateTable(truncateTableStmt);
+        GlobalStateMgr.getCurrentState().truncateTable(truncateTableStmt);
         // 2. add temp ranges: [10, 31), and replace the [10, 15), [15, 25), [25, 30)
         stmtStr = "alter table db3.tbl3 add temporary partition tp4 values [('10'), ('31'))";
         alterTable(stmtStr, false);
@@ -542,7 +540,7 @@ public class TempPartitionTest {
         // now base range is [min, 10), [10, 30) -> p1,tp4
         stmtStr = "truncate table db3.tbl3";
         truncateTableStmt = (TruncateTableStmt) UtFrameUtils.parseAndAnalyzeStmt(stmtStr, ctx);
-        Catalog.getCurrentCatalog().truncateTable(truncateTableStmt);
+        GlobalStateMgr.getCurrentState().truncateTable(truncateTableStmt);
         // 3. add temp partition tp5 [50, 60) and replace partition tp4
         stmtStr = "alter table db3.tbl3 add temporary partition tp5 values [('50'), ('60'))";
         alterTable(stmtStr, false);

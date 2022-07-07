@@ -55,8 +55,18 @@ public class PropertyAnalyzerTest {
         Map<String, String> properties = Maps.newHashMap();
         properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, "k1");
 
-        Set<String> bfColumns = PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns);
+        Set<String> bfColumns = PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns, false);
         Assert.assertEquals(Sets.newHashSet("k1"), bfColumns);
+    }
+
+    private void assertBloomFilterNotSupport(Map<String, String> properties, List<Column> columns, String columnName) {
+        properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, columnName);
+        try {
+            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns, false);
+        } catch (AnalysisException e) {
+            Assert.assertTrue(e.getMessage(),
+                    e.getMessage().contains("Invalid bloom filter column '" + columnName + "'"));
+        }
     }
 
     @Test
@@ -67,6 +77,8 @@ public class PropertyAnalyzerTest {
         columns.add(new Column("k3", Type.BOOLEAN));
         columns.add(new Column("v1", Type.VARCHAR, false, AggregateType.REPLACE, "", ""));
         columns.add(new Column("v2", Type.BIGINT, false, AggregateType.SUM, "0", ""));
+        columns.add(new Column("kjson", Type.JSON));
+        columns.add(new Column("khll", Type.HLL));
         columns.get(0).setIsKey(true);
         columns.get(1).setIsKey(true);
 
@@ -75,7 +87,8 @@ public class PropertyAnalyzerTest {
         // no bf columns
         properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, "");
         try {
-            Assert.assertEquals(Sets.newHashSet(), PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns));
+            Assert.assertEquals(Sets.newHashSet(),
+                    PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns, false));
         } catch (AnalysisException e) {
             Assert.fail();
         }
@@ -83,31 +96,21 @@ public class PropertyAnalyzerTest {
         // k4 not exist
         properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, "k4");
         try {
-            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns);
+            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns, false);
         } catch (AnalysisException e) {
             Assert.assertTrue(e.getMessage().contains("Invalid bloom filter column 'k4'"));
         }
 
-        // tinyint not supported
-        properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, "k2");
-        try {
-            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns);
-        } catch (AnalysisException e) {
-            Assert.assertTrue(e.getMessage().contains("Invalid bloom filter column 'k2'"));
-        }
-
-        // bool not supported
-        properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, "k3");
-        try {
-            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns);
-        } catch (AnalysisException e) {
-            Assert.assertTrue(e.getMessage().contains("Invalid bloom filter column 'k3'"));
-        }
+        // not supported
+        assertBloomFilterNotSupport(properties, columns, "k2");
+        assertBloomFilterNotSupport(properties, columns, "k3");
+        assertBloomFilterNotSupport(properties, columns, "kjson");
+        assertBloomFilterNotSupport(properties, columns, "khll");
 
         // not replace value
         properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, "v2");
         try {
-            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns);
+            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns, false);
         } catch (AnalysisException e) {
             Assert.assertTrue(e.getMessage().contains("Bloom filter index only used in"));
         }
@@ -115,7 +118,7 @@ public class PropertyAnalyzerTest {
         // reduplicated column
         properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, "k1,K1");
         try {
-            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns);
+            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns, false);
         } catch (AnalysisException e) {
             Assert.assertTrue(e.getMessage().contains("Duplicate bloom filter column 'K1'"));
         }

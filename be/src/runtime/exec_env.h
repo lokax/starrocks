@@ -19,23 +19,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_RUNTIME_EXEC_ENV_H
-#define STARROCKS_BE_RUNTIME_EXEC_ENV_H
+#pragma once
 
 #include <atomic>
 #include <memory>
 
 #include "common/status.h"
-#include "exec/pipeline/pipeline_driver_dispatcher.h"
-#include "exec/pipeline/pipeline_fwd.h"
+#include "exec/workgroup/work_group_fwd.h"
 #include "storage/options.h"
+// NOTE: Be careful about adding includes here. This file is included by many files.
+// Unnecssary includes will cause compilatio very slow.
+// So please consider use forward declaraion as much as possible.
 
 namespace starrocks {
-
+class AgentServer;
 class BfdParser;
 class BrokerMgr;
 class BrpcStubCache;
-class BufferPool;
 class DataStreamMgr;
 class DiskIoMgr;
 class EvHttpServer;
@@ -43,26 +43,25 @@ class ExternalScanContextMgr;
 class FragmentMgr;
 class LoadPathMgr;
 class LoadStreamMgr;
+class StreamContextMgr;
+class TransactionMgr;
 class MemTracker;
 class MetricRegistry;
 class StorageEngine;
 class ThreadPool;
 class PriorityThreadPool;
-class ReservationTracker;
 class ResultBufferMgr;
 class ResultQueueMgr;
-class TMasterInfo;
 class LoadChannelMgr;
-class TestExecEnv;
 class ThreadResourceMgr;
-class TmpFileMgr;
 class WebPageHandler;
 class StreamLoadExecutor;
 class RoutineLoadTaskExecutor;
 class SmallFileMgr;
-class FileBlockManager;
 class PluginMgr;
 class RuntimeFilterWorker;
+class RuntimeFilterCache;
+struct RfTracePoint;
 
 class BackendServiceClient;
 class FrontendServiceClient;
@@ -71,13 +70,24 @@ template <class T>
 class ClientCache;
 class HeartbeatFlags;
 
+namespace pipeline {
+class DriverExecutor;
+class QueryContextManager;
+class DriverLimiter;
+} // namespace pipeline
+
+namespace lake {
+class GroupAssigner;
+class TabletManager;
+} // namespace lake
+
 // Execution environment for queries/plan fragments.
 // Contains all required global structures, and handles to
 // singleton services. Clients must call StartServices exactly
 // once to properly initialise service state.
 class ExecEnv {
 public:
-    // Initial exec enviorment. must call this to init all
+    // Initial exec environment. must call this to init all
     static Status init(ExecEnv* env, const std::vector<StorePath>& store_paths);
     static void destroy(ExecEnv* exec_env);
 
@@ -96,7 +106,7 @@ public:
     // declarations for classes in scoped_ptrs.
     ~ExecEnv() = default;
 
-    const std::string& token() const;
+    std::string token() const;
     ExternalScanContextMgr* external_scan_context_mgr() { return _external_scan_context_mgr; }
     MetricRegistry* metrics() const { return _metrics; }
     DataStreamMgr* stream_mgr() { return _stream_mgr; }
@@ -118,33 +128,36 @@ public:
     MemTracker* tablet_meta_mem_tracker() { return _tablet_meta_mem_tracker; }
     MemTracker* compaction_mem_tracker() { return _compaction_mem_tracker; }
     MemTracker* schema_change_mem_tracker() { return _schema_change_mem_tracker; }
-    MemTracker* snapshot_mem_tracker() { return _snapshot_mem_tracker; }
     MemTracker* column_pool_mem_tracker() { return _column_pool_mem_tracker; }
-    MemTracker* local_column_pool_mem_tracker() { return _local_column_pool_mem_tracker; }
-    MemTracker* central_column_pool_mem_tracker() { return _central_column_pool_mem_tracker; }
     MemTracker* page_cache_mem_tracker() { return _page_cache_mem_tracker; }
     MemTracker* update_mem_tracker() { return _update_mem_tracker; }
+    MemTracker* chunk_allocator_mem_tracker() { return _chunk_allocator_mem_tracker; }
+    MemTracker* clone_mem_tracker() { return _clone_mem_tracker; }
+    MemTracker* consistency_mem_tracker() { return _consistency_mem_tracker; }
 
     ThreadResourceMgr* thread_mgr() { return _thread_mgr; }
     PriorityThreadPool* thread_pool() { return _thread_pool; }
-    PriorityThreadPool* pipeline_io_thread_pool() { return _pipeline_io_thread_pool; }
+    PriorityThreadPool* pipeline_scan_io_thread_pool() { return _pipeline_scan_io_thread_pool; }
+    PriorityThreadPool* pipeline_hdfs_scan_io_thread_pool() { return _pipeline_hdfs_scan_io_thread_pool; }
+
     size_t increment_num_scan_operators(size_t n) { return _num_scan_operators.fetch_add(n); }
     size_t decrement_num_scan_operators(size_t n) { return _num_scan_operators.fetch_sub(n); }
-    PriorityThreadPool* etl_thread_pool() { return _etl_thread_pool; }
+    PriorityThreadPool* udf_call_pool() { return _udf_call_pool; }
     FragmentMgr* fragment_mgr() { return _fragment_mgr; }
-    starrocks::pipeline::DriverDispatcher* driver_dispatcher() { return _driver_dispatcher; }
-    TMasterInfo* master_info() { return _master_info; }
+    starrocks::pipeline::DriverExecutor* driver_executor() { return _driver_executor; }
+    starrocks::pipeline::DriverExecutor* wg_driver_executor() { return _wg_driver_executor; }
     LoadPathMgr* load_path_mgr() { return _load_path_mgr; }
-    DiskIoMgr* disk_io_mgr() { return _disk_io_mgr; }
-    TmpFileMgr* tmp_file_mgr() { return _tmp_file_mgr; }
     BfdParser* bfd_parser() const { return _bfd_parser; }
     BrokerMgr* broker_mgr() const { return _broker_mgr; }
     BrpcStubCache* brpc_stub_cache() const { return _brpc_stub_cache; }
-    ReservationTracker* buffer_reservation() { return _buffer_reservation; }
-    BufferPool* buffer_pool() { return _buffer_pool; }
     LoadChannelMgr* load_channel_mgr() { return _load_channel_mgr; }
     LoadStreamMgr* load_stream_mgr() { return _load_stream_mgr; }
     SmallFileMgr* small_file_mgr() { return _small_file_mgr; }
+    StreamContextMgr* stream_context_mgr() { return _stream_context_mgr; }
+    TransactionMgr* transaction_mgr() { return _transaction_mgr; }
+
+    starrocks::workgroup::ScanExecutor* scan_executor() { return _scan_executor; }
+    starrocks::workgroup::ScanExecutor* hdfs_scan_executor() { return _hdfs_scan_executor; }
 
     const std::vector<StorePath>& store_paths() const { return _store_paths; }
     void set_store_paths(const std::vector<StorePath>& paths) { _store_paths = paths; }
@@ -155,18 +168,32 @@ public:
     RoutineLoadTaskExecutor* routine_load_task_executor() { return _routine_load_task_executor; }
     HeartbeatFlags* heartbeat_flags() { return _heartbeat_flags; }
 
-    PluginMgr* plugin_mgr() { return _plugin_mgr; }
     RuntimeFilterWorker* runtime_filter_worker() { return _runtime_filter_worker; }
     Status init_mem_tracker();
 
+    RuntimeFilterCache* runtime_filter_cache() { return _runtime_filter_cache; }
+    void add_rf_event(const RfTracePoint& pt);
+
+    pipeline::QueryContextManager* query_context_mgr() { return _query_context_mgr; }
+
+    pipeline::DriverLimiter* driver_limiter() { return _driver_limiter; }
+    int64_t max_executor_threads() const { return _max_executor_threads; }
+
+    int32_t calc_pipeline_dop(int32_t pipeline_dop) const;
+
+    lake::TabletManager* lake_tablet_manager() const { return _lake_tablet_manager; }
+
+    lake::GroupAssigner* lake_group_assigner() const { return _lake_group_assigner; }
+
+    AgentServer* agent_server() const { return _agent_server; }
+
 private:
     Status _init(const std::vector<StorePath>& store_paths);
-    void _destory();
+    void _destroy();
 
-    Status _init_mem_tracker();
-    /// Initialise 'buffer_pool_' and 'buffer_reservation_' with given capacity.
-    void _init_buffer_pool(int64_t min_page_len, int64_t capacity, int64_t clean_pages_limit);
+    Status _init_storage_page_cache();
 
+private:
     std::vector<StorePath> _store_paths;
     // Leave protected so that subclasses can override
     ExternalScanContextMgr* _external_scan_context_mgr = nullptr;
@@ -194,17 +221,8 @@ private:
     // The memory used for schema change
     MemTracker* _schema_change_mem_tracker = nullptr;
 
-    // The memory used for snapshot
-    MemTracker* _snapshot_mem_tracker = nullptr;
-
     // The memory used for column pool
     MemTracker* _column_pool_mem_tracker = nullptr;
-
-    // The memory used for central column pool
-    MemTracker* _central_column_pool_mem_tracker = nullptr;
-
-    // The memory used for local column pool
-    MemTracker* _local_column_pool_mem_tracker = nullptr;
 
     // The memory used for page cache
     MemTracker* _page_cache_mem_tracker = nullptr;
@@ -212,26 +230,37 @@ private:
     // The memory tracker for update manager
     MemTracker* _update_mem_tracker = nullptr;
 
+    MemTracker* _chunk_allocator_mem_tracker = nullptr;
+
+    MemTracker* _clone_mem_tracker = nullptr;
+
+    MemTracker* _consistency_mem_tracker = nullptr;
+
     ThreadResourceMgr* _thread_mgr = nullptr;
     PriorityThreadPool* _thread_pool = nullptr;
-    PriorityThreadPool* _pipeline_io_thread_pool = nullptr;
-    std::atomic<size_t> _num_scan_operators;
-    PriorityThreadPool* _etl_thread_pool = nullptr;
+    PriorityThreadPool* _pipeline_scan_io_thread_pool = nullptr;
+    PriorityThreadPool* _pipeline_hdfs_scan_io_thread_pool = nullptr;
+    std::atomic<size_t> _num_scan_operators{0};
+    PriorityThreadPool* _udf_call_pool = nullptr;
     FragmentMgr* _fragment_mgr = nullptr;
-    starrocks::pipeline::DriverDispatcher* _driver_dispatcher;
-    TMasterInfo* _master_info = nullptr;
+    starrocks::pipeline::QueryContextManager* _query_context_mgr = nullptr;
+    starrocks::pipeline::DriverExecutor* _driver_executor = nullptr;
+    pipeline::DriverExecutor* _wg_driver_executor = nullptr;
+    pipeline::DriverLimiter* _driver_limiter;
+    int64_t _max_executor_threads; // Max thread number of executor
+
     LoadPathMgr* _load_path_mgr = nullptr;
-    DiskIoMgr* _disk_io_mgr = nullptr;
-    TmpFileMgr* _tmp_file_mgr = nullptr;
+
+    starrocks::workgroup::ScanExecutor* _scan_executor = nullptr;
+    starrocks::workgroup::ScanExecutor* _hdfs_scan_executor = nullptr;
 
     BfdParser* _bfd_parser = nullptr;
     BrokerMgr* _broker_mgr = nullptr;
     LoadChannelMgr* _load_channel_mgr = nullptr;
     LoadStreamMgr* _load_stream_mgr = nullptr;
     BrpcStubCache* _brpc_stub_cache = nullptr;
-
-    ReservationTracker* _buffer_reservation = nullptr;
-    BufferPool* _buffer_pool = nullptr;
+    StreamContextMgr* _stream_context_mgr = nullptr;
+    TransactionMgr* _transaction_mgr = nullptr;
 
     StorageEngine* _storage_engine = nullptr;
 
@@ -240,9 +269,13 @@ private:
     SmallFileMgr* _small_file_mgr = nullptr;
     HeartbeatFlags* _heartbeat_flags = nullptr;
 
-    PluginMgr* _plugin_mgr = nullptr;
-
     RuntimeFilterWorker* _runtime_filter_worker = nullptr;
+    RuntimeFilterCache* _runtime_filter_cache = nullptr;
+
+    lake::TabletManager* _lake_tablet_manager = nullptr;
+    lake::GroupAssigner* _lake_group_assigner = nullptr;
+
+    AgentServer* _agent_server = nullptr;
 };
 
 template <>
@@ -259,5 +292,3 @@ inline ClientCache<TFileBrokerServiceClient>* ExecEnv::get_client_cache<TFileBro
 }
 
 } // namespace starrocks
-
-#endif

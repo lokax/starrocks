@@ -21,16 +21,15 @@
 
 #pragma once
 
-#include <stdint.h>
-
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
 
-#include "exec/file_reader.h"
 #include "librdkafka/rdkafka.h"
 #include "runtime/message_body_sink.h"
 #include "runtime/stream_load/stream_load_pipe.h"
+#include "simdjson.h"
 
 namespace starrocks {
 
@@ -39,7 +38,7 @@ public:
     KafkaConsumerPipe(size_t max_buffered_bytes = 1024 * 1024, size_t min_chunk_size = 64 * 1024)
             : StreamLoadPipe(max_buffered_bytes, min_chunk_size) {}
 
-    virtual ~KafkaConsumerPipe() {}
+    ~KafkaConsumerPipe() override = default;
 
     Status append_with_row_delimiter(const char* data, size_t size, char row_delimiter) {
         Status st = append(data, size);
@@ -52,7 +51,13 @@ public:
         return st;
     }
 
-    Status append_json(const char* data, size_t size, char row_delimiter) { return append_and_flush(data, size); }
+    Status append_json(const char* data, size_t size, char row_delimiter) {
+        // For efficiency reasons, simdjson requires a string with a few bytes (simdjson::SIMDJSON_PADDING) at the end.
+        auto buf = ByteBuffer::allocate(size + simdjson::SIMDJSON_PADDING);
+        buf->put_bytes(data, size);
+        buf->flip();
+        return append(std::move(buf));
+    }
 };
 
 } // end namespace starrocks

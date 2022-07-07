@@ -42,6 +42,7 @@ public enum SchemaTableType {
             TSchemaTableType.SCH_GLOBAL_VARIABLES),
     SCH_KEY_COLUMN_USAGE("KEY_COLUMN_USAGE", "KEY_COLUMN_USAGE",
             TSchemaTableType.SCH_KEY_COLUMN_USAGE),
+    SCH_MATERIALIZED_VIEWS("MATERIALIZED_VIEWS", "MATERIALIZED_VIEWS", TSchemaTableType.SCH_MATERIALIZED_VIEWS),
     SCH_OPEN_TABLES("OPEN_TABLES", "OPEN_TABLES", TSchemaTableType.SCH_OPEN_TABLES),
     SCH_PARTITIONS("PARTITIONS", "PARTITIONS", TSchemaTableType.SCH_PARTITIONS),
     SCH_PLUGINS("PLUGINS", "PLUGINS", TSchemaTableType.SCH_PLUGINS),
@@ -69,7 +70,10 @@ public enum SchemaTableType {
     SCH_VARIABLES("VARIABLES", "VARIABLES", TSchemaTableType.SCH_VARIABLES),
     SCH_VIEWS("VIEWS", "VIEWS", TSchemaTableType.SCH_VIEWS),
     SCH_CREATE_TABLE("CREATE_TABLE", "CREATE_TABLE", TSchemaTableType.SCH_CREATE_TABLE),
+    SCH_TASKS("TASKS", "TASKS", TSchemaTableType.SCH_TASKS),
+    SCH_TASK_RUNS("TASK_RUNS", "TASK_RUNS", TSchemaTableType.SCH_TASK_RUNS),
     SCH_INVALID("NULL", "NULL", TSchemaTableType.SCH_INVALID);
+
     private static final String dbName = "INFORMATION_SCHEMA";
     private static SelectList fullSelectLists;
 

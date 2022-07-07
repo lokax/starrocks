@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/orc/tree/main/c++/src/TypeImpl.cc
-
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
@@ -495,7 +491,7 @@ std::unique_ptr<Type> buildSelectedType(const Type* fileType, const std::vector<
         result = new TypeImpl(fileType->getKind());
         for (uint64_t child = 0; child < fileType->getSubtypeCount(); ++child) {
             std::unique_ptr<Type> childType = buildSelectedType(fileType->getSubtype(child), selected);
-            if (childType.get() != nullptr) {
+            if (childType != nullptr) {
                 result->addStructField(fileType->getFieldName(child), std::move(childType));
             }
         }
@@ -506,7 +502,7 @@ std::unique_ptr<Type> buildSelectedType(const Type* fileType, const std::vector<
         result = new TypeImpl(fileType->getKind());
         for (uint64_t child = 0; child < fileType->getSubtypeCount(); ++child) {
             std::unique_ptr<Type> childType = buildSelectedType(fileType->getSubtype(child), selected);
-            if (childType.get() != nullptr) {
+            if (childType != nullptr) {
                 result->addUnionChild(std::move(childType));
             }
         }
@@ -562,8 +558,8 @@ std::unique_ptr<Type> TypeImpl::parseStructType(const std::string& input, size_t
     if (v.size() == 0) {
         throw std::logic_error("Struct type must contain at least one sub type.");
     }
-    for (size_t i = 0; i < v.size(); ++i) {
-        structType->addStructField(v[i].first, std::move(v[i].second));
+    for (auto& i : v) {
+        structType->addStructField(i.first, std::move(i.second));
     }
     return return_value;
 }
@@ -575,8 +571,8 @@ std::unique_ptr<Type> TypeImpl::parseUnionType(const std::string& input, size_t 
     if (v.size() == 0) {
         throw std::logic_error("Union type must contain at least one sub type.");
     }
-    for (size_t i = 0; i < v.size(); ++i) {
-        unionType->addChildType(std::move(v[i].second));
+    for (auto& i : v) {
+        unionType->addChildType(std::move(i.second));
     }
     return return_value;
 }
@@ -591,7 +587,7 @@ std::unique_ptr<Type> TypeImpl::parseDecimalType(const std::string& input, size_
     return std::unique_ptr<Type>(new TypeImpl(DECIMAL, precision, scale));
 }
 
-std::unique_ptr<Type> TypeImpl::parseCategory(std::string category, const std::string& input, size_t start,
+std::unique_ptr<Type> TypeImpl::parseCategory(const std::string& category, const std::string& input, size_t start,
                                               size_t end) {
     if (category == "boolean") {
         return std::unique_ptr<Type>(new TypeImpl(BOOLEAN));
@@ -687,7 +683,7 @@ std::vector<std::pair<std::string, ORC_UNIQUE_PTR<Type>>> TypeImpl::parseType(co
         }
 
         std::string category = input.substr(pos, endPos - pos);
-        res.push_back(std::make_pair(fieldName, parseCategory(category, input, endPos + 1, nextPos)));
+        res.emplace_back(fieldName, parseCategory(category, input, endPos + 1, nextPos));
 
         if (nextPos < end && (input[nextPos] == ')' || input[nextPos] == '>')) {
             pos = nextPos + 2;

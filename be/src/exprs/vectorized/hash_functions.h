@@ -1,10 +1,11 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
 #include "column/column_builder.h"
 #include "column/column_viewer.h"
 #include "exprs/vectorized/function_helper.h"
+#include "udf/udf.h"
 
 namespace starrocks {
 namespace vectorized {
@@ -21,13 +22,13 @@ inline ColumnPtr HashFunctions::murmur_hash3_32(FunctionContext* context,
                                                 const starrocks::vectorized::Columns& columns) {
     std::vector<ColumnViewer<TYPE_VARCHAR>> viewers;
 
-    for (int i = 0; i < columns.size(); ++i) {
-        viewers.emplace_back(columns[i]);
+    viewers.reserve(columns.size());
+    for (const auto& column : columns) {
+        viewers.emplace_back(column);
     }
 
-    ColumnBuilder<TYPE_INT> builder;
-
     size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_INT> builder(size);
     for (int row = 0; row < size; ++row) {
         uint32_t seed = HashUtil::MURMUR3_32_SEED;
         bool has_null = false;

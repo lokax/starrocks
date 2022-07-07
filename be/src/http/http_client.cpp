@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/http/http_client.cpp
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -25,7 +21,7 @@
 
 namespace starrocks {
 
-HttpClient::HttpClient() {}
+HttpClient::HttpClient() = default;
 
 HttpClient::~HttpClient() {
     if (_curl != nullptr) {
@@ -42,7 +38,7 @@ Status HttpClient::init(const std::string& url) {
     if (_curl == nullptr) {
         _curl = curl_easy_init();
         if (_curl == nullptr) {
-            return Status::InternalError("fail to initalize curl");
+            return Status::InternalError("fail to initialize curl");
         }
     } else {
         curl_easy_reset(_curl);

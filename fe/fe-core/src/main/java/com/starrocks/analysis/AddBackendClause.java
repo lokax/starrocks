@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/AddBackendClause.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -21,47 +17,19 @@
 
 package com.starrocks.analysis;
 
-import com.google.common.base.Strings;
-
 import java.util.List;
 
 public class AddBackendClause extends BackendClause {
 
-    // be in free state is not owned by any cluster
-    protected boolean isFree;
-    // cluster that backend will be added to 
-    protected String destCluster;
-
     public AddBackendClause(List<String> hostPorts) {
         super(hostPorts);
-        this.isFree = true;
-        this.destCluster = "";
-    }
-
-    public AddBackendClause(List<String> hostPorts, boolean isFree) {
-        super(hostPorts);
-        this.isFree = isFree;
-        this.destCluster = "";
-    }
-
-    public AddBackendClause(List<String> hostPorts, String destCluster) {
-        super(hostPorts);
-        this.isFree = false;
-        this.destCluster = destCluster;
     }
 
     @Override
     public String toSql() {
         StringBuilder sb = new StringBuilder();
         sb.append("ADD ");
-        if (isFree) {
-            sb.append("FREE ");
-        }
         sb.append("BACKEND ");
-
-        if (!Strings.isNullOrEmpty(destCluster)) {
-            sb.append("to").append(destCluster);
-        }
 
         for (int i = 0; i < hostPorts.size(); i++) {
             sb.append("\"").append(hostPorts.get(i)).append("\"");
@@ -70,14 +38,6 @@ public class AddBackendClause extends BackendClause {
             }
         }
         return sb.toString();
-    }
-
-    public boolean isFree() {
-        return this.isFree;
-    }
-
-    public String getDestCluster() {
-        return destCluster;
     }
 
 }

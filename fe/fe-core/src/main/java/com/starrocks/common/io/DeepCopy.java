@@ -23,6 +23,7 @@ package com.starrocks.common.io;
 
 import com.starrocks.common.FeConstants;
 import com.starrocks.meta.MetaContext;
+import com.starrocks.persist.gson.GsonUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -43,6 +44,8 @@ public class DeepCopy {
     // the param "c" is the implementation class of "dest".
     // And the "dest" class must has method "readFields(DataInput)"
     public static boolean copy(Writable orig, Writable dest, Class c) {
+        // Backup the current MetaContext before assigning a new one.
+        MetaContext oldContext = MetaContext.get();
         MetaContext metaContext = new MetaContext();
         metaContext.setMetaVersion(FeConstants.meta_version);
         metaContext.setStarRocksMetaVersion(FeConstants.starrocks_meta_version);
@@ -65,8 +68,36 @@ public class DeepCopy {
             LOG.warn("failed to copy object.", e);
             return false;
         } finally {
-            MetaContext.remove();
+            // Restore the old MetaContext.
+            if (oldContext != null) {
+                oldContext.setThreadLocalInfo();
+            } else {
+                MetaContext.remove();
+            }
         }
         return true;
+    }
+
+    public static <T> T copyWithGson(Object orig, Class<T> c) {
+        // Backup the current MetaContext before assigning a new one.
+        MetaContext oldContext = MetaContext.get();
+        MetaContext metaContext = new MetaContext();
+        metaContext.setMetaVersion(FeConstants.meta_version);
+        metaContext.setStarRocksMetaVersion(FeConstants.starrocks_meta_version);
+        metaContext.setThreadLocalInfo();
+        try {
+            String origJsonStr = GsonUtils.GSON.toJson(orig);
+            return GsonUtils.GSON.fromJson(origJsonStr, c);
+        } catch (Exception e) {
+            LOG.warn("failed to copy object.", e);
+            return null;
+        } finally {
+            // Restore the old MetaContext.
+            if (oldContext != null) {
+                oldContext.setThreadLocalInfo();
+            } else {
+                MetaContext.remove();
+            }
+        }
     }
 }

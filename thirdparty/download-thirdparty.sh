@@ -143,7 +143,7 @@ do
         URL="${REPOSITORY_URL}/${!NAME}"
         download_func ${!NAME} ${URL} $TP_SOURCE_DIR ${!MD5SUM}
         if [ "$?x" == "0x" ]; then
-            #try to download from home 
+            #try to download from home
             URL=$TP_ARCH"_DOWNLOAD"
             download_func ${!NAME} ${!URL} $TP_SOURCE_DIR ${!MD5SUM}
             if [ "$?x" == "0x" ]; then
@@ -174,6 +174,9 @@ UNZIP_CMD="unzip"
 SUFFIX_TGZ="\.(tar\.gz|tgz)$"
 SUFFIX_XZ="\.tar\.xz$"
 SUFFIX_ZIP="\.zip$"
+# temporary directory for unpacking
+# package is unpacked in tmp_dir and then renamed.
+mkdir -p $TP_SOURCE_DIR/tmp_dir
 for TP_ARCH in ${TP_ARCHIVES[*]}
 do
     NAME=$TP_ARCH"_NAME"
@@ -187,27 +190,32 @@ do
         if [[ "${!NAME}" =~ $SUFFIX_TGZ  ]]; then
             echo "$TP_SOURCE_DIR/${!NAME}"
             echo "$TP_SOURCE_DIR/${!SOURCE}"
-            if ! $TAR_CMD xzf "$TP_SOURCE_DIR/${!NAME}" -C "$TP_SOURCE_DIR/"; then
+            if ! $TAR_CMD xzf "$TP_SOURCE_DIR/${!NAME}" -C $TP_SOURCE_DIR/tmp_dir; then
                 echo "Failed to untar ${!NAME}"
                 exit 1
             fi
         elif [[ "${!NAME}" =~ $SUFFIX_XZ ]]; then
             echo "$TP_SOURCE_DIR/${!NAME}"
             echo "$TP_SOURCE_DIR/${!SOURCE}"
-            if ! $TAR_CMD xJf "$TP_SOURCE_DIR/${!NAME}" -C "$TP_SOURCE_DIR/"; then
+            if ! $TAR_CMD xJf "$TP_SOURCE_DIR/${!NAME}" -C $TP_SOURCE_DIR/tmp_dir; then
                 echo "Failed to untar ${!NAME}"
                 exit 1
             fi
         elif [[ "${!NAME}" =~ $SUFFIX_ZIP ]]; then
-            if ! $UNZIP_CMD "$TP_SOURCE_DIR/${!NAME}" -d "$TP_SOURCE_DIR/"; then
+            if ! $UNZIP_CMD "$TP_SOURCE_DIR/${!NAME}" -d $TP_SOURCE_DIR/tmp_dir; then
                 echo "Failed to unzip ${!NAME}"
                 exit 1
             fi
+        else
+            echo "nothing has been done with ${!NAME}"
+            continue
         fi
+        mv $TP_SOURCE_DIR/tmp_dir/* $TP_SOURCE_DIR/${!SOURCE}
     else
         echo "${!SOURCE} already unpacked."
     fi
 done
+rm -r $TP_SOURCE_DIR/tmp_dir
 echo "===== Unpacking all thirdparty archives...done"
 
 echo "===== Patching thirdparty archives..."
@@ -221,12 +229,17 @@ PATCHED_MARK="patched_mark"
 
 # glog patch
 cd $TP_SOURCE_DIR/$GLOG_SOURCE
-if [ ! -f $PATCHED_MARK ]; then
+if [ ! -f $PATCHED_MARK ] && [ $GLOG_SOURCE == "glog-0.3.3" ]; then
     patch -p1 < $TP_PATCH_DIR/glog-0.3.3-vlog-double-lock-bug.patch
     patch -p1 < $TP_PATCH_DIR/glog-0.3.3-for-starrocks2.patch
     patch -p1 < $TP_PATCH_DIR/glog-0.3.3-remove-unwind-dependency.patch
     # patch Makefile.am to make autoreconf work
     patch -p0 < $TP_PATCH_DIR/glog-0.3.3-makefile.patch
+    touch $PATCHED_MARK
+fi
+if [ ! -f $PATCHED_MARK ] && [ $GLOG_SOURCE == "glog-0.4.0" ]; then
+    patch -p1 < $TP_PATCH_DIR/glog-0.4.0-for-starrocks2.patch
+    patch -p1 < $TP_PATCH_DIR/glog-0.4.0-remove-unwind-dependency.patch 
     touch $PATCHED_MARK
 fi
 cd -
@@ -235,20 +248,11 @@ echo "Finished patching $GLOG_SOURCE"
 # re2 patch
 cd $TP_SOURCE_DIR/$RE2_SOURCE
 if [ ! -f $PATCHED_MARK ]; then
-    patch -p0 < $TP_PATCH_DIR/re2-2017-05-01.patch 
+    patch -p0 < $TP_PATCH_DIR/re2-2017-05-01.patch
     touch $PATCHED_MARK
 fi
 cd -
 echo "Finished patching $RE2_SOURCE"
-
-# mysql patch
-cd $TP_SOURCE_DIR/$MYSQL_SOURCE
-if [ ! -f $PATCHED_MARK ]; then
-    patch -p0 < $TP_PATCH_DIR/mysql-5.7.18.patch
-    touch $PATCHED_MARK
-fi
-cd -
-echo "Finished patching $MYSQL_SOURCE"
 
 # libevent patch
 cd $TP_SOURCE_DIR/$LIBEVENT_SOURCE
@@ -270,7 +274,7 @@ echo "Finished patching $LIBEVENT_SOURCE"
 
 # lz4 patch to disable shared library
 cd $TP_SOURCE_DIR/$LZ4_SOURCE
-if [ ! -f $PATCHED_MARK ]; then
+if [ ! -f $PATCHED_MARK ] && [ $LZ4_SOURCE == "lz4-1.7.5" ]; then
     patch -p0 < $TP_PATCH_DIR/lz4-1.7.5.patch
     touch $PATCHED_MARK
 fi
@@ -281,6 +285,10 @@ echo "Finished patching $LZ4_SOURCE"
 cd $TP_SOURCE_DIR/$BRPC_SOURCE
 if [ ! -f $PATCHED_MARK ] && [ $BRPC_SOURCE == "incubator-brpc-0.9.5" ]; then
     patch -p1 < $TP_PATCH_DIR/incubator-brpc-0.9.5.patch
+    touch $PATCHED_MARK
+fi
+if [ ! -f $PATCHED_MARK ] && [ $BRPC_SOURCE == "incubator-brpc-0.9.7" ]; then
+    patch -p1 < $TP_PATCH_DIR/incubator-brpc-0.9.7.patch
     touch $PATCHED_MARK
 fi
 cd -
@@ -317,10 +325,55 @@ echo "Finished patching $BOOST_SOURCE"
 
 # patch protobuf-3.5.1
 cd $TP_SOURCE_DIR/$PROTOBUF_SOURCE
-if [ ! -f $PATCHED_MARK ]; then
+if [ ! -f $PATCHED_MARK ] && [ $PROTOBUF_SOURCE == "protobuf-3.5.1" ]; then
     patch -p1 < $TP_PATCH_DIR/protobuf-3.5.1.patch
     touch $PATCHED_MARK
 fi
 cd -
 echo "Finished patching $PROTOBUF_SOURCE"
+
+# patch tcmalloc_hook
+cd $TP_SOURCE_DIR/$GPERFTOOLS_SOURCE
+if [ ! -f $PATCHED_MARK ] && [ $GPERFTOOLS_SOURCE = "gperftools-gperftools-2.7" ]; then
+    patch -p1 < $TP_PATCH_DIR/tcmalloc_hook.patch
+    touch $PATCHED_MARK
+fi
+cd -
+echo "Finished patching $GPERFTOOLS_SOURCE"
+
+# patch librdkafka
+cd $TP_SOURCE_DIR/$LIBRDKAFKA_SOURCE
+if [ ! -f $PATCHED_MARK ] && [ $LIBRDKAFKA_SOURCE = "librdkafka-1.7.0" ]; then
+    patch -p0 < $TP_PATCH_DIR/librdkafka.patch
+    touch $PATCHED_MARK
+fi
+cd -
+echo "Finished patching $LIBRDKAFKA_SOURCE"
+
+# patch mariadb-connector-c-3.2.5
+cd $TP_SOURCE_DIR/$MARIADB_SOURCE
+if [ ! -f $PATCHED_MARK ] && [ $MARIADB_SOURCE = "mariadb-connector-c-3.2.5" ]; then
+    patch -p0 < $TP_PATCH_DIR/mariadb-connector-c-3.2.5-for-starrocks-static-link.patch
+    touch $PATCHED_MARK
+    echo "Finished patching $MARIADB_SOURCE"
+else
+    echo "$MARIADB_SOURCE not patched"
+fi
+
+cd $TP_SOURCE_DIR/$AWS_SDK_CPP_SOURCE
+if [ ! -f $PATCHED_MARK ] && [ $AWS_SDK_CPP_SOURCE = "aws-sdk-cpp-1.9.179" ]; then
+    if [ ! -f prefetch_crt_dep_ok ]; then
+        bash ./prefetch_crt_dependency.sh
+        touch prefetch_crt_dep_ok
+    fi
+    patch -p0 < $TP_PATCH_DIR/aws-sdk-cpp-1.9.179.patch    
+    # Fix crt BB, refer to https://github.com/aws/s2n-tls/issues/3166
+    patch -p1 -f -i $TP_PATCH_DIR/aws-sdk-cpp-patch-1.9.179-s2n-compile-error.patch
+    touch $PATCHED_MARK
+    echo "Finished patching $AWS_SDK_CPP_SOURCE"
+else
+    echo "$AWS_SDK_CPP_SOURCE not patched"
+fi
+
+cd -
 

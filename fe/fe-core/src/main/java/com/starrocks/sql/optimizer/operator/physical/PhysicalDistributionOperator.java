@@ -1,12 +1,18 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.operator.physical;
 
+import com.google.common.collect.Lists;
+import com.starrocks.common.Pair;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptExpressionVisitor;
 import com.starrocks.sql.optimizer.base.DistributionSpec;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.OperatorVisitor;
+import com.starrocks.sql.optimizer.statistics.ColumnDict;
+
+import java.util.List;
+import java.util.Set;
 
 public class PhysicalDistributionOperator extends PhysicalOperator {
     public PhysicalDistributionOperator(DistributionSpec spec) {
@@ -17,14 +23,15 @@ public class PhysicalDistributionOperator extends PhysicalOperator {
         this.distributionSpec = spec;
     }
 
-    @Override
-    public boolean equals(Object obj) {
-        return this == obj;
+    private List<Pair<Integer, ColumnDict>> globalDicts = Lists.newArrayList();
+
+    public List<Pair<Integer, ColumnDict>> getGlobalDicts() {
+        return globalDicts;
     }
 
-    @Override
-    public int hashCode() {
-        return this.distributionSpec.hashCode();
+    public void setGlobalDicts(
+            List<Pair<Integer, ColumnDict>> globalDicts) {
+        this.globalDicts = globalDicts;
     }
 
     @Override
@@ -35,5 +42,10 @@ public class PhysicalDistributionOperator extends PhysicalOperator {
     @Override
     public <R, C> R accept(OptExpressionVisitor<R, C> visitor, OptExpression optExpression, C context) {
         return visitor.visitPhysicalDistribution(optExpression, context);
+    }
+
+    @Override
+    public boolean couldApplyStringDict(Set<Integer> childDictColumns) {
+        return true;
     }
 }

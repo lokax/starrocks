@@ -46,6 +46,7 @@ OPTS=$(getopt \
   -o '' \
   -l 'coverage' \
   -l 'run' \
+  -l 'help' \
   -- "$@")
 
 if [ $? != 0 ] ; then
@@ -54,23 +55,22 @@ fi
 
 eval set -- "$OPTS"
 
-RUN=
-COVERAGE=
-if [ $# == 1 ] ; then
-    #default
-    RUN=0
-    COVERAGE=0
-else
-    RUN=0
-    COVERAGE=0
-    while true; do 
-        case "$1" in
-            --coverage) COVERAGE=1 ; shift ;;
-            --run) RUN=1 ; shift ;;
-            --) shift ;  break ;;
-            *) ehco "Internal error" ; exit 1 ;;
-        esac
-    done
+HELP=0
+RUN=0
+COVERAGE=0
+while true; do 
+    case "$1" in
+        --coverage) COVERAGE=1 ; shift ;;
+        --run) RUN=1 ; shift ;;
+        --help) HELP=1 ; shift ;; 
+        --) shift ;  break ;;
+        *) ehco "Internal error" ; exit 1 ;;
+    esac
+done
+
+if [ ${HELP} -eq 1 ]; then
+    usage
+    exit 0
 fi
 
 echo "Build Frontend UT"
@@ -107,9 +107,10 @@ else
         # eg:
         # sh run-fe-ut.sh --run com.starrocks.utframe.Demo
         # sh run-fe-ut.sh --run com.starrocks.utframe.Demo#testCreateDbAndTable+test2
-        ${MVN_CMD} test -DfailIfNoTests=false -D test=$1
+        # set trimStackTrace to false to show full stack when debugging specified class or case
+        ${MVN_CMD} test -DfailIfNoTests=false -DtrimStackTrace=false -D test=$1
     else    
         echo "Run Frontend UT"
-        ${MVN_CMD} test -DfailIfNoTests=false 
+        ${MVN_CMD} test -DfailIfNoTests=false -DtrimStackTrace=false
     fi 
 fi

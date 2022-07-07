@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.operator;
 
@@ -10,9 +10,13 @@ public enum OperatorType {
     LOGICAL_PROJECT,
     LOGICAL_OLAP_SCAN,
     LOGICAL_HIVE_SCAN,
+    LOGICAL_ICEBERG_SCAN,
+    LOGICAL_HUDI_SCAN,
     LOGICAL_SCHEMA_SCAN,
     LOGICAL_MYSQL_SCAN,
     LOGICAL_ES_SCAN,
+    LOGICAL_META_SCAN,
+    LOGICAL_JDBC_SCAN,
     LOGICAL_JOIN,
     LOGICAL_AGGR,
     LOGICAL_FILTER,
@@ -27,6 +31,9 @@ public enum OperatorType {
     LOGICAL_VALUES,
     LOGICAL_REPEAT,
     LOGICAL_TABLE_FUNCTION,
+    LOGICAL_CTE_ANCHOR,
+    LOGICAL_CTE_PRODUCE,
+    LOGICAL_CTE_CONSUME,
 
     /**
      * Physical operator
@@ -35,11 +42,17 @@ public enum OperatorType {
     PHYSICAL_DISTRIBUTION,
     PHYSICAL_HASH_AGG,
     PHYSICAL_HASH_JOIN,
+    PHYSICAL_MERGE_JOIN,
+    PHYSICAL_NESTLOOP_JOIN,
     PHYSICAL_OLAP_SCAN,
     PHYSICAL_HIVE_SCAN,
+    PHYSICAL_ICEBERG_SCAN,
+    PHYSICAL_HUDI_SCAN,
     PHYSICAL_SCHEMA_SCAN,
     PHYSICAL_MYSQL_SCAN,
+    PHYSICAL_META_SCAN,
     PHYSICAL_ES_SCAN,
+    PHYSICAL_JDBC_SCAN,
     PHYSICAL_PROJECT,
     PHYSICAL_SORT,
     PHYSICAL_TOPN,
@@ -52,6 +65,12 @@ public enum OperatorType {
     PHYSICAL_REPEAT,
     PHYSICAL_FILTER,
     PHYSICAL_TABLE_FUNCTION,
+    PHYSICAL_DECODE,
+    PHYSICAL_LIMIT,
+    PHYSICAL_CTE_ANCHOR,
+    PHYSICAL_CTE_PRODUCE,
+    PHYSICAL_CTE_CONSUME,
+    PHYSICAL_NO_CTE,
 
     /**
      * Scalar operator
@@ -59,6 +78,7 @@ public enum OperatorType {
     SCALAR,
     ARRAY,
     ARRAY_ELEMENT,
+    ARRAY_SLICE,
     VARIABLE,
     CONSTANT,
     CALL,
@@ -69,6 +89,8 @@ public enum OperatorType {
     IN,
     IS_NULL,
     LIKE,
+    DICT_MAPPING,
+    CLONE,
 
     /**
      * PATTERN

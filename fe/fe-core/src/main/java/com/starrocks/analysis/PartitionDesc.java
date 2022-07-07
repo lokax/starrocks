@@ -31,16 +31,16 @@ import org.apache.commons.lang.NotImplementedException;
 import java.util.List;
 import java.util.Map;
 
-public class PartitionDesc {
+public class PartitionDesc implements ParseNode {
 
     protected PartitionType type;
 
-    public void analyze(List<ColumnDef> columnDefs, Map<String, String> otherProperties) throws AnalysisException {
-        throw new NotImplementedException();
-    }
-
     public PartitionType getType() {
         return type;
+    }
+
+    public void analyze(List<ColumnDef> columnDefs, Map<String, String> otherProperties) throws AnalysisException {
+        throw new NotImplementedException();
     }
 
     public String toSql() {

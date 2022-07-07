@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -105,6 +105,37 @@ public:
         return result == StringParser::PARSE_FAILURE || result == StringParser::PARSE_OVERFLOW;
     }
 
+    // If a decimal string is too large so that it can not be represented in decimal, then try to convert it into
+    // double value, and the double value shall be greater than the integer part of max decimal or less than the
+    // integer part of min decimal, in such situations, (max decimal + 1) and (min decimal - 1) are final result
+    // respectively. this function is used in `IN` predicates and for the purpose that convert sets of decimal
+    // strings into valid decimal values, in these scenarios, that overflow values are handled as max + 1 or min - 1
+    // values is accepted.
+    template <typename T>
+    static inline bool from_string_with_overflow_allowed(DecimalType<T>* value, int scale, const char* s, size_t n) {
+        StringParser::ParseResult result = StringParser::PARSE_SUCCESS;
+        *value = StringParser::string_to_decimal<T>(s, n, decimal_precision_limit<T>, scale, &result);
+        if (UNLIKELY(StringParser::PARSE_FAILURE == result)) {
+            return true;
+        }
+        if (UNLIKELY(StringParser::PARSE_OVERFLOW == result)) {
+            double double_value = StringParser::string_to_float<double>(s, n, &result);
+            if (result != StringParser::PARSE_SUCCESS) {
+                return true;
+            }
+            const auto max_integer = get_scale_factor<T>(decimal_precision_limit<T> - scale);
+            const auto min_integer = -max_integer;
+            if (double_value >= max_integer) {
+                *value = get_scale_factor<T>(decimal_precision_limit<T>);
+            } else if (double_value <= min_integer) {
+                *value = -get_scale_factor<T>(decimal_precision_limit<T>);
+            } else {
+                return true;
+            }
+        }
+        return false;
+    }
+
     template <typename ST>
     static inline std::string to_string(DecimalType<ST> const& value, int precision, int scale) {
         using T = typename unsigned_type<ST>::type;
@@ -140,31 +171,45 @@ public:
                 high_scale = mid_scale;
             }
         }
-        // case 1: low_scale = 0, fraction part is zero, no fraction part to output;
-        // case 2: low_scale = scale, no zeros between decimal point and first non-zero dec-digit
+        // case 1: low_scale = scale, no zeros between decimal point and first non-zero dec-digit
         //         of fraction part.
-        // case 3: low_scale < scale, (scale-low_scale) zeros are interpolated into str_decimal.
-        if (low_scale != 0) {
+        // case 2: low_scale < scale, (scale-low_scale) zeros are interpolated into str_decimal.
+        if (scale) {
             str_decimal[len++] = '.';
             const size_t zeros_interpolated = scale - low_scale;
             for (size_t i = 0; i < zeros_interpolated; ++i) {
                 str_decimal[len++] = '0';
             }
-            end = fmt::format_to(str_decimal + len, "{}", frac_part);
-            len = end - str_decimal;
+            if (frac_part) {
+                end = fmt::format_to(str_decimal + len, "{}", frac_part);
+                len = end - str_decimal;
+            }
         }
+
         s.resize(len);
         return s;
     }
 
     template <typename T>
-    static constexpr T float_overflow_indicator = std::numeric_limits<T>::lowest();
+    static constexpr T float_lower_overflow_indicator = std::numeric_limits<T>::max();
+    template <typename T>
+    static constexpr T float_upper_overflow_indicator = std::numeric_limits<T>::min();
+
     template <typename From, typename To>
     static inline bool from_float(FloatType<From> value, DecimalType<To> const& scale_factor,
                                   DecimalType<To>* dec_value) {
         *dec_value = static_cast<To>(scale_factor * static_cast<double>(value));
         if constexpr (is_decimal32<To> || is_decimal64<To>) {
-            return *dec_value == float_overflow_indicator<To>;
+            // Depending on the compiler implement, std::numeric_limits<T>::max() or std::numeric_limits<T>::max() both could be returned,
+            // when overflow is happenning in casting.
+
+            // With GCC-10.3.0, the cast on aarch64 uses fcvtzs instruction, behaving as "carries all overflows to the output precision’s largest finite number with the sign of the result before rounding".
+            // (https://developer.arm.com/documentation/ddi0487/latest)
+
+            // Meanwhile, the cast on x86_64 uses cvttsd2siq instruction, behaving as "the indefinite integer value (80000000H) is returned".
+            // (https://www.felixcloutier.com/x86/cvttsd2si)
+            return (*dec_value == float_lower_overflow_indicator<To>) ||
+                   (*dec_value == float_upper_overflow_indicator<To>);
         } else if constexpr (is_decimal128<To>) {
             // abs(value)<1.0 -> 0: Acceptable
             // abs(value)>=1.0 -> 0 or different sign: Overflow!!

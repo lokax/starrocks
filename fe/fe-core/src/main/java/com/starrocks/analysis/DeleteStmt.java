@@ -24,7 +24,8 @@ package com.starrocks.analysis;
 import com.google.common.base.Joiner;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.CompoundPredicate.Operator;
-import com.starrocks.catalog.Catalog;
+import com.starrocks.catalog.CatalogUtils;
+import com.starrocks.catalog.Table;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
 import com.starrocks.common.ErrorCode;
@@ -32,30 +33,49 @@ import com.starrocks.common.ErrorReport;
 import com.starrocks.common.UserException;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.ast.QueryStatement;
 
-import java.util.LinkedList;
 import java.util.List;
 
-public class DeleteStmt extends DdlStmt {
-    private final TableName tbl;
+public class DeleteStmt extends DmlStmt {
+    private final TableName tblName;
     private final PartitionNames partitionNames;
-    private Expr wherePredicate;
+    private final Expr wherePredicate;
 
-    private List<Predicate> deleteConditions;
+    // fields for new planer, primary key table
+    private Table table;
+    private QueryStatement queryStatement;
+
+    // fields for old planer, non-primary key table
+    private final List<Predicate> deleteConditions;
+    // Each deleteStmt corresponds to a DeleteJob.
+    // The JobID is generated here for easy correlation when cancel Delete
+    private long jobId = -1;
 
     public DeleteStmt(TableName tableName, PartitionNames partitionNames, Expr wherePredicate) {
-        this.tbl = tableName;
+        this.tblName = tableName;
         this.partitionNames = partitionNames;
         this.wherePredicate = wherePredicate;
-        this.deleteConditions = new LinkedList<Predicate>();
+        this.deleteConditions = Lists.newLinkedList();
     }
 
-    public String getTableName() {
-        return tbl.getTbl();
+    public long getJobId() {
+        return jobId;
     }
 
-    public String getDbName() {
-        return tbl.getDb();
+    public void setJobId(long jobId) {
+        this.jobId = jobId;
+    }
+
+    @Override
+    public TableName getTableName() {
+        return tblName;
+    }
+
+    public Expr getWherePredicate() {
+        return wherePredicate;
     }
 
     public List<String> getPartitionNames() {
@@ -70,11 +90,13 @@ public class DeleteStmt extends DdlStmt {
     public void analyze(Analyzer analyzer) throws UserException {
         super.analyze(analyzer);
 
-        if (tbl == null) {
+        if (tblName == null) {
             throw new AnalysisException("Table is not set");
         }
 
-        tbl.analyze(analyzer);
+        tblName.analyze(analyzer);
+
+        CatalogUtils.checkOlapTableHasStarOSPartition(tblName.getDb(), tblName.getTbl());
 
         if (partitionNames != null) {
             partitionNames.analyze(analyzer);
@@ -89,14 +111,6 @@ public class DeleteStmt extends DdlStmt {
 
         // analyze predicate
         analyzePredicate(wherePredicate);
-
-        // check access
-        if (!Catalog.getCurrentCatalog().getAuth().checkTblPriv(ConnectContext.get(), tbl.getDb(), tbl.getTbl(),
-                PrivPredicate.LOAD)) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "LOAD",
-                    ConnectContext.get().getQualifiedUser(),
-                    ConnectContext.get().getRemoteIP(), tbl.getTbl());
-        }
     }
 
     private void analyzePredicate(Expr predicate) throws AnalysisException {
@@ -154,7 +168,7 @@ public class DeleteStmt extends DdlStmt {
     @Override
     public String toSql() {
         StringBuilder sb = new StringBuilder();
-        sb.append("DELETE FROM ").append(tbl.toSql());
+        sb.append("DELETE FROM ").append(tblName.toSql());
         if (partitionNames != null) {
             sb.append(" PARTITION (");
             sb.append(Joiner.on(", ").join(partitionNames.getPartitionNames()));
@@ -164,4 +178,28 @@ public class DeleteStmt extends DdlStmt {
         return sb.toString();
     }
 
+    public boolean supportNewPlanner() {
+        // table must present if analyzed by new analyzer
+        return table != null;
+    }
+
+    public void setTable(Table table) {
+        this.table = table;
+    }
+
+    public Table getTable() {
+        return table;
+    }
+
+    public void setQueryStatement(QueryStatement queryStatement) {
+        this.queryStatement = queryStatement;
+    }
+
+    public QueryStatement getQueryStatement() {
+        return queryStatement;
+    }
+
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
+        return visitor.visitDeleteStatement(this, context);
+    }
 }

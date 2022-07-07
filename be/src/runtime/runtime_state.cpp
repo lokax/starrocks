@@ -22,25 +22,23 @@
 #include "runtime/runtime_state.h"
 
 #include <boost/algorithm/string/join.hpp>
+#include <cstring>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
 
 #include "common/logging.h"
 #include "common/object_pool.h"
 #include "common/status.h"
 #include "exec/exec_node.h"
-#include "exprs/vectorized/runtime_filter_bank.h"
-#include "runtime/buffered_block_mgr2.h"
-#include "runtime/bufferpool/reservation_tracker.h"
-#include "runtime/bufferpool/reservation_util.h"
+#include "exec/pipeline/query_context.h"
+#include "runtime/datetime_value.h"
 #include "runtime/descriptors.h"
 #include "runtime/exec_env.h"
-#include "runtime/initial_reservations.h"
 #include "runtime/load_path_mgr.h"
 #include "runtime/mem_tracker.h"
 #include "runtime/runtime_filter_worker.h"
-#include "util/load_error_hub.h"
 #include "util/pretty_printer.h"
 #include "util/timezone_utils.h"
 #include "util/uid_util.h"
@@ -50,52 +48,38 @@ namespace starrocks {
 // for ut only
 RuntimeState::RuntimeState(const TUniqueId& fragment_instance_id, const TQueryOptions& query_options,
                            const TQueryGlobals& query_globals, ExecEnv* exec_env)
-        : _profile("Fragment " + print_id(fragment_instance_id)),
-          _unreported_error_idx(0),
-          _fragment_mem_tracker(NULL),
+        : _unreported_error_idx(0),
           _obj_pool(new ObjectPool()),
           _is_cancelled(false),
           _per_fragment_instance_idx(0),
-          _root_node_id(-1),
           _num_rows_load_total(0),
           _num_rows_load_filtered(0),
           _num_rows_load_unselected(0),
-          _num_print_error_rows(0),
-          _error_log_file_path(),
-          _error_log_file(nullptr),
-          _instance_buffer_reservation(new ReservationTracker) {
+          _num_print_error_rows(0) {
+    _profile = std::make_shared<RuntimeProfile>("Fragment " + print_id(fragment_instance_id));
     Status status = init(fragment_instance_id, query_options, query_globals, exec_env);
     DCHECK(status.ok());
 }
 
-RuntimeState::RuntimeState(const TExecPlanFragmentParams& fragment_params, const TQueryOptions& query_options,
-                           const TQueryGlobals& query_globals, ExecEnv* exec_env)
-        : _profile("Fragment " + print_id(fragment_params.params.fragment_instance_id)),
-          _unreported_error_idx(0),
-          _query_id(fragment_params.params.query_id),
-          _fragment_mem_tracker(NULL),
+RuntimeState::RuntimeState(const TUniqueId& query_id, const TUniqueId& fragment_instance_id,
+                           const TQueryOptions& query_options, const TQueryGlobals& query_globals, ExecEnv* exec_env)
+        : _unreported_error_idx(0),
+          _query_id(query_id),
           _obj_pool(new ObjectPool()),
-          _is_cancelled(false),
           _per_fragment_instance_idx(0),
-          _root_node_id(-1),
           _num_rows_load_total(0),
           _num_rows_load_filtered(0),
           _num_rows_load_unselected(0),
-          _num_print_error_rows(0),
-          _error_log_file_path(),
-          _error_log_file(nullptr),
-          _instance_buffer_reservation(new ReservationTracker) {
-    Status status = init(fragment_params.params.fragment_instance_id, query_options, query_globals, exec_env);
+          _num_print_error_rows(0) {
+    _profile = std::make_shared<RuntimeProfile>("Fragment " + print_id(fragment_instance_id));
+    Status status = init(fragment_instance_id, query_options, query_globals, exec_env);
     DCHECK(status.ok());
 }
 
 RuntimeState::RuntimeState(const TQueryGlobals& query_globals)
-        : _profile("<unnamed>"),
-          _unreported_error_idx(0),
-          _obj_pool(new ObjectPool()),
-          _is_cancelled(false),
-          _per_fragment_instance_idx(0) {
-    _query_options.batch_size = DEFAULT_BATCH_SIZE;
+        : _unreported_error_idx(0), _obj_pool(new ObjectPool()), _is_cancelled(false), _per_fragment_instance_idx(0) {
+    _profile = std::make_shared<RuntimeProfile>("<unnamed>");
+    _query_options.batch_size = DEFAULT_CHUNK_SIZE;
     if (query_globals.__isset.time_zone) {
         _timezone = query_globals.time_zone;
         _timestamp_ms = query_globals.timestamp_ms;
@@ -115,7 +99,6 @@ RuntimeState::RuntimeState(const TQueryGlobals& query_globals)
 }
 
 RuntimeState::~RuntimeState() {
-    _block_mgr2.reset();
     // close error log file
     if (_error_log_file != nullptr && _error_log_file->is_open()) {
         _error_log_file->close();
@@ -123,40 +106,9 @@ RuntimeState::~RuntimeState() {
         _error_log_file = nullptr;
     }
 
-    if (_error_hub != nullptr) {
-        _error_hub->close();
-    }
-
-    // Release the reservation, which should be unused at the point.
-    if (_instance_buffer_reservation != nullptr) {
-        _instance_buffer_reservation->Close();
-    }
-
-    if (_initial_reservations != nullptr) {
-        _initial_reservations->ReleaseResources();
-    }
-
-    if (_buffer_reservation != nullptr) {
-        _buffer_reservation->Close();
-    }
-
     if (_exec_env != nullptr && _exec_env->thread_mgr() != nullptr) {
         _exec_env->thread_mgr()->unregister_pool(_resource_pool);
     }
-
-#ifndef BE_TEST
-    // LogUsage() walks the MemTracker tree top-down when the memory limit is exceeded.
-    // Break the link between the instance_mem_tracker and its parent (_query_mem_tracker)
-    // before the _instance_mem_tracker and its children are destroyed.
-    if (_instance_mem_tracker.get() != NULL) {
-        // May be NULL if InitMemTrackers() is not called, for example from tests.
-        _instance_mem_tracker->close();
-    }
-
-    if (_query_mem_tracker.get() != NULL) {
-        _query_mem_tracker->close();
-    }
-#endif
 }
 
 Status RuntimeState::init(const TUniqueId& fragment_instance_id, const TQueryOptions& query_options,
@@ -191,84 +143,64 @@ Status RuntimeState::init(const TUniqueId& fragment_instance_id, const TQueryOpt
         _query_options.max_errors = 100;
     }
 
-    if (_query_options.batch_size <= 0) {
-        _query_options.batch_size = DEFAULT_BATCH_SIZE;
+    // if BE was in grayscale upgrade. old BE chunk size was 4096.
+    // if FE set a zero batch_size, batch_size will be set to DEFAULT_CHUNK_SIZE
+    // (DEFAULT_CHUNK_SIZE was 2048 before version 2.0/2.1.0). which will cause overflow
+    if (_query_options.batch_size <= DEFAULT_CHUNK_SIZE) {
+        _query_options.batch_size = DEFAULT_CHUNK_SIZE;
     }
 
     // Register with the thread mgr
-    if (exec_env != NULL) {
+    if (exec_env != nullptr) {
         _resource_pool = exec_env->thread_mgr()->register_pool();
-        DCHECK(_resource_pool != NULL);
+        DCHECK(_resource_pool != nullptr);
     }
-    _db_name = "insert_stmt";
-    _import_label = print_id(fragment_instance_id);
     _runtime_filter_port = _obj_pool->add(new RuntimeFilterPort(this));
 
     return Status::OK();
 }
 
-Status RuntimeState::init_mem_trackers(const TUniqueId& query_id) {
+void RuntimeState::init_mem_trackers(const TUniqueId& query_id, MemTracker* parent) {
     bool has_query_mem_tracker = _query_options.__isset.mem_limit && (_query_options.mem_limit > 0);
     int64_t bytes_limit = has_query_mem_tracker ? _query_options.mem_limit : -1;
-    auto* mem_tracker_counter = ADD_COUNTER(&_profile, "MemoryLimit", TUnit::BYTES);
+    auto* mem_tracker_counter = ADD_COUNTER(_profile.get(), "MemoryLimit", TUnit::BYTES);
     mem_tracker_counter->set(bytes_limit);
 
-    _query_mem_tracker = std::make_unique<MemTracker>(MemTracker::QUERY, bytes_limit, runtime_profile()->name(),
-                                                      _exec_env->query_pool_mem_tracker());
-    _instance_mem_tracker =
-            std::make_unique<MemTracker>(&_profile, -1, runtime_profile()->name(), _query_mem_tracker.get());
-    RETURN_IF_ERROR(init_buffer_poolstate());
-
-    _initial_reservations =
-            _obj_pool->add(new InitialReservations(_obj_pool.get(), _buffer_reservation, _query_mem_tracker.get(),
-                                                   _query_options.initial_reservation_total_claims));
-    RETURN_IF_ERROR(_initial_reservations->Init(_query_id, min_reservation()));
-    DCHECK_EQ(0, _initial_reservation_refcnt.load());
-
-    if (_instance_buffer_reservation != nullptr) {
-        _instance_buffer_reservation->InitChildTracker(&_profile, _buffer_reservation, _instance_mem_tracker.get(),
-                                                       std::numeric_limits<int64_t>::max());
+    if (parent == nullptr) {
+        parent = _exec_env->query_pool_mem_tracker();
     }
 
-    return Status::OK();
+    _query_mem_tracker =
+            std::make_shared<MemTracker>(MemTracker::QUERY, bytes_limit, runtime_profile()->name(), parent);
+    _instance_mem_tracker =
+            std::make_shared<MemTracker>(_profile.get(), -1, runtime_profile()->name(), _query_mem_tracker.get());
+    _instance_mem_pool = std::make_unique<MemPool>();
+}
+
+void RuntimeState::init_mem_trackers(const std::shared_ptr<MemTracker>& query_mem_tracker) {
+    DCHECK(query_mem_tracker != nullptr);
+
+    auto* mem_tracker_counter = ADD_COUNTER(_profile.get(), "MemoryLimit", TUnit::BYTES);
+    mem_tracker_counter->set(query_mem_tracker->limit());
+
+    // all fragment instances in a BE shared a common query_mem_tracker.
+    _query_mem_tracker = query_mem_tracker;
+    _instance_mem_tracker =
+            std::make_shared<MemTracker>(_profile.get(), -1L, runtime_profile()->name(), _query_mem_tracker.get());
+    _instance_mem_pool = std::make_unique<MemPool>();
 }
 
 Status RuntimeState::init_instance_mem_tracker() {
     _instance_mem_tracker = std::make_unique<MemTracker>(-1);
+    _instance_mem_pool = std::make_unique<MemPool>();
     return Status::OK();
 }
 
-Status RuntimeState::init_buffer_poolstate() {
-    ExecEnv* exec_env = ExecEnv::GetInstance();
-    int64_t mem_limit = _query_mem_tracker->lowest_limit();
-    int64_t max_reservation;
-    if (query_options().__isset.buffer_pool_limit && query_options().buffer_pool_limit > 0) {
-        max_reservation = query_options().buffer_pool_limit;
-    } else if (mem_limit == -1) {
-        // No query mem limit. The process-wide reservation limit is the only limit on
-        // reservations.
-        max_reservation = std::numeric_limits<int64_t>::max();
-    } else {
-        DCHECK_GE(mem_limit, 0);
-        max_reservation = ReservationUtil::GetReservationLimitFromMemLimit(mem_limit);
+ObjectPool* RuntimeState::global_obj_pool() const {
+    if (_query_ctx == nullptr) {
+        return obj_pool();
     }
-    _buffer_reservation = _obj_pool->add(new ReservationTracker);
-    _buffer_reservation->InitChildTracker(NULL, exec_env->buffer_reservation(), _query_mem_tracker.get(),
-                                          max_reservation);
-    return Status::OK();
-}
-
-Status RuntimeState::create_block_mgr() {
-    DCHECK(_block_mgr2.get() == NULL);
-
-    int64_t block_mgr_limit = _query_mem_tracker->limit();
-    if (block_mgr_limit < 0) {
-        block_mgr_limit = std::numeric_limits<int64_t>::max();
-    }
-    RETURN_IF_ERROR(BufferedBlockMgr2::create(this, _query_mem_tracker.get(), runtime_profile(),
-                                              _exec_env->tmp_file_mgr(), block_mgr_limit,
-                                              _exec_env->disk_io_mgr()->max_read_buffer_size(), &_block_mgr2));
-    return Status::OK();
+    return _query_ctx->object_pool();
 }
 
 std::string RuntimeState::error_log() {
@@ -320,11 +252,11 @@ Status RuntimeState::set_mem_limit_exceeded(MemTracker* tracker, int64_t failed_
         }
     }
 
-    DCHECK(_query_mem_tracker.get() != NULL);
+    DCHECK(_query_mem_tracker.get() != nullptr);
     std::stringstream ss;
     ss << "Memory Limit Exceeded\n";
     if (failed_allocation_size != 0) {
-        DCHECK(tracker != NULL);
+        DCHECK(tracker != nullptr);
         ss << "  " << tracker->label() << " could not allocate "
            << PrettyPrinter::print(failed_allocation_size, TUnit::BYTES) << " without exceeding limit." << std::endl;
     }
@@ -337,18 +269,21 @@ Status RuntimeState::set_mem_limit_exceeded(MemTracker* tracker, int64_t failed_
 Status RuntimeState::check_query_state(const std::string& msg) {
     // TODO: it would be nice if this also checked for cancellation, but doing so breaks
     // cases where we use Status::Cancelled("Cancelled") to indicate that the limit was reached.
+    return query_status();
+}
+
+Status RuntimeState::check_mem_limit(const std::string& msg) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnonnull-compare"
     RETURN_IF_LIMIT_EXCEEDED(this, msg);
 #pragma pop
-    return query_status();
+    return Status::OK();
 }
 
 const int64_t MAX_ERROR_NUM = 50;
 
 Status RuntimeState::create_error_log_file() {
-    _exec_env->load_path_mgr()->get_load_error_file_name(_db_name, _import_label, _fragment_instance_id,
-                                                         &_error_log_file_path);
+    _exec_env->load_path_mgr()->get_load_error_file_name(_fragment_instance_id, &_error_log_file_path);
     std::string error_log_absolute_path =
             _exec_env->load_path_mgr()->get_load_error_absolute_path(_error_log_file_path);
     _error_log_file = new std::ofstream(error_log_absolute_path, std::ifstream::out);
@@ -359,6 +294,14 @@ Status RuntimeState::create_error_log_file() {
         return Status::InternalError(error_msg.str());
     }
     return Status::OK();
+}
+
+bool RuntimeState::has_reached_max_error_msg_num(bool is_summary) {
+    if (_num_print_error_rows.load(std::memory_order_relaxed) > MAX_ERROR_NUM && !is_summary) {
+        return true;
+    } else {
+        return false;
+    }
 }
 
 void RuntimeState::append_error_msg_to_file(const std::string& line, const std::string& error_msg, bool is_summary) {
@@ -387,40 +330,65 @@ void RuntimeState::append_error_msg_to_file(const std::string& line, const std::
 
     std::stringstream out;
     if (is_summary) {
-        out << "Summary: ";
+        out << "Error: ";
         out << error_msg;
     } else {
         // Note: export reason first in case src line too long and be truncated.
-        out << "Reason: " << error_msg;
-        out << ". src line: [" << line << "]; ";
+        out << "Error: " << error_msg << ". Row: " << line;
     }
 
     if (!out.str().empty()) {
         (*_error_log_file) << out.str() << std::endl;
-        export_load_error(out.str());
     }
 }
 
 const int64_t HUB_MAX_ERROR_NUM = 10;
-
-void RuntimeState::export_load_error(const std::string& err_msg) {
-    if (_error_hub == nullptr) {
-        if (_load_error_hub_info == nullptr) {
-            return;
-        }
-        LoadErrorHub::create_hub(_exec_env, _load_error_hub_info.get(), _error_log_file_path, &_error_hub);
-    }
-
-    LoadErrorHub::ErrorMsg err(_load_job_id, err_msg);
-    // TODO(lingbin): think if should check return value?
-    _error_hub->export_error(err);
-}
 
 int64_t RuntimeState::get_load_mem_limit() const {
     if (_query_options.__isset.load_mem_limit && _query_options.load_mem_limit > 0) {
         return _query_options.load_mem_limit;
     }
     return 0;
+}
+
+const vectorized::GlobalDictMaps& RuntimeState::get_query_global_dict_map() const {
+    return _query_global_dicts;
+}
+
+const vectorized::GlobalDictMaps& RuntimeState::get_load_global_dict_map() const {
+    return _load_global_dicts;
+}
+
+vectorized::GlobalDictMaps* RuntimeState::mutable_query_global_dict_map() {
+    return &_query_global_dicts;
+}
+
+Status RuntimeState::init_query_global_dict(const GlobalDictLists& global_dict_list) {
+    return _build_global_dict(global_dict_list, &_query_global_dicts);
+}
+
+Status RuntimeState::init_load_global_dict(const GlobalDictLists& global_dict_list) {
+    return _build_global_dict(global_dict_list, &_load_global_dicts);
+}
+
+Status RuntimeState::_build_global_dict(const GlobalDictLists& global_dict_list, vectorized::GlobalDictMaps* result) {
+    for (const auto& global_dict : global_dict_list) {
+        DCHECK_EQ(global_dict.ids.size(), global_dict.strings.size());
+        vectorized::GlobalDictMap dict_map;
+        vectorized::RGlobalDictMap rdict_map;
+        int dict_sz = global_dict.ids.size();
+        for (int i = 0; i < dict_sz; ++i) {
+            const std::string& dict_key = global_dict.strings[i];
+            auto* data = _instance_mem_pool->allocate(dict_key.size());
+            RETURN_IF_UNLIKELY_NULL(data, Status::MemoryAllocFailed("alloc mem for global dict failed"));
+            memcpy(data, dict_key.data(), dict_key.size());
+            Slice slice(data, dict_key.size());
+            dict_map.emplace(slice, global_dict.ids[i]);
+            rdict_map.emplace(global_dict.ids[i], slice);
+        }
+        result->emplace(uint32_t(global_dict.columnId), std::make_pair(std::move(dict_map), std::move(rdict_map)));
+    }
+    return Status::OK();
 }
 
 } // end namespace starrocks

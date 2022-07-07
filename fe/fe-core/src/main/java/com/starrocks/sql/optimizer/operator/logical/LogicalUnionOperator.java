@@ -1,8 +1,9 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.operator.logical;
 
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptExpressionVisitor;
+import com.starrocks.sql.optimizer.operator.Operator;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.OperatorVisitor;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
@@ -14,8 +15,15 @@ public class LogicalUnionOperator extends LogicalSetOperator {
 
     public LogicalUnionOperator(List<ColumnRefOperator> result, List<List<ColumnRefOperator>> childOutputColumns,
                                 boolean isUnionAll) {
-        super(OperatorType.LOGICAL_UNION, result, childOutputColumns);
+        super(OperatorType.LOGICAL_UNION, result, childOutputColumns, Operator.DEFAULT_LIMIT, null);
         this.isUnionAll = isUnionAll;
+    }
+
+    private LogicalUnionOperator(LogicalUnionOperator.Builder builder) {
+        super(OperatorType.LOGICAL_UNION, builder.outputColumnRefOp, builder.childOutputColumns,
+                builder.getLimit(),
+                builder.getProjection());
+        this.isUnionAll = builder.isUnionAll;
     }
 
     public boolean isUnionAll() {
@@ -30,5 +38,26 @@ public class LogicalUnionOperator extends LogicalSetOperator {
     @Override
     public <R, C> R accept(OptExpressionVisitor<R, C> visitor, OptExpression optExpression, C context) {
         return visitor.visitLogicalUnion(optExpression, context);
+    }
+
+    public static class Builder extends LogicalSetOperator.Builder<LogicalUnionOperator, LogicalUnionOperator.Builder> {
+        private boolean isUnionAll;
+
+        @Override
+        public LogicalUnionOperator build() {
+            return new LogicalUnionOperator(this);
+        }
+
+        @Override
+        public Builder withOperator(LogicalUnionOperator unionOperator) {
+            super.withOperator(unionOperator);
+            isUnionAll = unionOperator.isUnionAll;
+            return this;
+        }
+
+        public Builder isUnionAll(boolean isUnionAll) {
+            this.isUnionAll = isUnionAll;
+            return this;
+        }
     }
 }

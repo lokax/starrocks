@@ -1,8 +1,9 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
 #include "column/array_column.h"
+#include "column/chunk.h"
 #include "column/column_helper.h"
 #include "column/type_traits.h"
 #include "column/vectorized_fwd.h"
@@ -29,7 +30,7 @@ public:
     VectorizedCastArrayExpr(Expr* cast_element_expr, const TExprNode& node)
             : Expr(node), _cast_element_expr(cast_element_expr) {}
 
-    ~VectorizedCastArrayExpr() override{};
+    ~VectorizedCastArrayExpr() override = default;
 
     ColumnPtr evaluate(ExprContext* context, vectorized::Chunk* ptr) override {
         ColumnPtr column = _children[0]->evaluate(context, ptr);

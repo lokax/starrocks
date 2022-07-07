@@ -34,11 +34,11 @@ public class MysqlSerializer {
     private ByteArrayOutputStream out;
     private MysqlCapability capability;
 
-    public MysqlSerializer(ByteArrayOutputStream out) {
+    private MysqlSerializer(ByteArrayOutputStream out) {
         this(out, MysqlCapability.DEFAULT_CAPABILITY);
     }
 
-    public MysqlSerializer(ByteArrayOutputStream out, MysqlCapability capability) {
+    private MysqlSerializer(ByteArrayOutputStream out, MysqlCapability capability) {
         this.out = out;
         this.capability = capability;
     }
@@ -166,7 +166,7 @@ public class MysqlSerializer {
 
     public void writeField(String db, String table, Column column, boolean sendDefault) {
         Type columnType = column.getType();
-        // Catalog Name: length encoded string
+        // GlobalStateMgr Name: length encoded string
         writeLenEncodedString("def");
         // Schema: length encoded string
         writeLenEncodedString(db);
@@ -204,7 +204,7 @@ public class MysqlSerializer {
      * https://dev.mysql.com/doc/internals/en/com-query-response.html#column-definition
      */
     public void writeField(String colName, Type type) {
-        // Catalog Name: length encoded string
+        // GlobalStateMgr Name: length encoded string
         writeLenEncodedString("def");
         // Schema: length encoded string
         writeLenEncodedString("");

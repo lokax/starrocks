@@ -52,14 +52,15 @@ message(STATUS "Build target arch is ${CMAKE_BUILD_TARGET_ARCH}")
 
 # Set dirs
 set(BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
-set(ENV{STARROCKS_HOME} "${BASE_DIR}/../")
 set(BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 set(THIRDPARTY_DIR "$ENV{STARROCKS_THIRDPARTY}/installed/")
+set(STARROCKS_THIRDPARTY "$ENV{STARROCKS_THIRDPARTY}")
 set(GENSRC_DIR "${BASE_DIR}/../gensrc/build/")
 set(SRC_DIR "${BASE_DIR}/src/")
 set(TEST_DIR "${CMAKE_SOURCE_DIR}/test/")
 set(OUTPUT_DIR "${BASE_DIR}/output")
 set(CONTRIB_DIR "${BASE_DIR}/../contrib/")
+set(CMAKE_EXPORT_COMPILECOMMANDS ON)
 
 if (APPLE)
     set(MAKE_TEST "ON")
@@ -68,8 +69,9 @@ else()
 endif()
 message(STATUS "make test: ${MAKE_TEST}")
 
-option(WITH_MYSQL "Support access MySQL" ON)
 option(WITH_GCOV "Build binary with gcov to get code coverage" OFF)
+
+option(USE_STAROS "Use StarOS to manager tablet info" OFF)
 
 # Check gcc
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -77,9 +79,9 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         message(FATAL_ERROR "Need GCC version at least 4.8.2")
     endif()
 
-    if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER "7.3.0")
-        message(STATUS "GCC version ${CMAKE_CXX_COMPILER_VERSION} is greater than 7.3.0, disable -Werror. Be careful with compile warnings.")
-    else()
+    if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER "10.3.0")
+        message(STATUS "GCC version ${CMAKE_CXX_COMPILER_VERSION} is greater than 10.3.0, disable -Werror. Be careful with compile warnings.")
+    elseif(${MAKE_TEST} STREQUAL "OFF")
         #   -Werror: compile warnings should be errors when using the toolchain compiler.
         set(CXX_GCC_FLAGS "${CXX_GCC_FLAGS} -Werror")
     endif()
@@ -115,18 +117,24 @@ if(NOT ${MAKE_GENSRC_RESULT} EQUAL 0 AND NOT APPLE)
     message(FATAL_ERROR "Failed to build ${BASE_DIR}/../gensrc/")
 endif()
 
+# Add common cmake prefix path and link library path
+list(APPEND CMAKE_PREFIX_PATH ${THIRDPARTY_DIR}/lib/cmake)
+list(APPEND CMAKE_PREFIX_PATH ${THIRDPARTY_DIR}/lib64/cmake)
+link_directories(${THIRDPARTY_DIR}/lib ${THIRDPARTY_DIR}/lib64)
+
 # Set Boost
 set(Boost_DEBUG FALSE)
 set(Boost_USE_MULTITHREADED ON)
+set(Boost_NO_BOOST_CMAKE ON)
 set(BOOST_ROOT ${THIRDPARTY_DIR})
 # boost suppress warning is supported on cmake 3.20
 # https://cmake.org/cmake/help/latest/module/FindBoost.html
 set(Boost_NO_WARN_NEW_VERSIONS ON)
 
 if (NOT APPLE)
-    find_package(Boost 1.55.0 REQUIRED COMPONENTS thread regex filesystem system date_time program_options)
+    find_package(Boost 1.75.0 REQUIRED COMPONENTS thread regex filesystem system date_time program_options)
 else()
-    find_package(Boost 1.55.0 COMPONENTS thread regex filesystem system date_time program_options)
+    find_package(Boost 1.75.0 COMPONENTS thread regex filesystem system date_time program_options)
 endif()
 include_directories(${Boost_INCLUDE_DIRS})
 message(STATUS ${Boost_LIBRARIES})
@@ -178,21 +186,26 @@ set_target_properties(thrift PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/
 add_library(thriftnb STATIC IMPORTED)
 set_target_properties(thriftnb PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libthriftnb.a)
 
-if (WITH_MYSQL)
-    add_library(mysql STATIC IMPORTED)
-    set_target_properties(mysql PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libmysqlclient.a)
-endif()
+add_library(mysql STATIC IMPORTED)
+set_target_properties(mysql PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/mariadb/libmariadbclient.a)
 
-if (WITH_HDFS)
-    add_library(hdfs STATIC IMPORTED)
-    set_target_properties(hdfs PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libhdfs.a)
-endif()
-
-add_library(libevent STATIC IMPORTED)
-set_target_properties(libevent PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libevent.a)
+add_library(hdfs STATIC IMPORTED)
+set_target_properties(hdfs PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libhdfs.a)
 
 add_library(crypto STATIC IMPORTED)
 set_target_properties(crypto PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libcrypto.a)
+
+set(AWSSDK_ROOT_DIR ${THIRDPARTY_DIR})
+set(AWSSDK_COMMON_RUNTIME_LIBS "aws-crt-cpp;aws-c-auth;aws-c-cal;aws-c-common;aws-c-compression;aws-c-event-stream;aws-c-http;aws-c-io;aws-c-mqtt;aws-c-s3;aws-checksums;s2n")
+foreach(lib IN ITEMS ${AWSSDK_COMMON_RUNTIME_LIBS})
+    list(APPEND CMAKE_PREFIX_PATH ${THIRDPARTY_DIR}/lib/${lib}/cmake)
+    list(APPEND CMAKE_PREFIX_PATH ${THIRDPARTY_DIR}/lib64/${lib}/cmake)
+endforeach()
+find_package(AWSSDK REQUIRED COMPONENTS core s3 s3-crt transfer)
+include_directories(${AWSSDK_INCLUDE_DIRS})
+
+add_library(libevent STATIC IMPORTED)
+set_target_properties(libevent PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libevent.a)
 
 add_library(openssl STATIC IMPORTED)
 set_target_properties(openssl PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libssl.a)
@@ -217,9 +230,6 @@ set_target_properties(zstd PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib64/
 
 add_library(arrow STATIC IMPORTED)
 set_target_properties(arrow PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib64/libarrow.a)
-
-add_library(double-conversion STATIC IMPORTED)
-set_target_properties(double-conversion PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib64/libdouble-conversion.a)
 
 add_library(parquet STATIC IMPORTED)
 set_target_properties(parquet PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib64/libparquet.a)
@@ -260,13 +270,69 @@ set_target_properties(fmt PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib64/l
 add_library(ryu STATIC IMPORTED)
 set_target_properties(ryu PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib64/libryu.a)
 
-add_library(breakpad STATIC IMPORTED)
-set_target_properties(breakpad PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libbreakpad_client.a)
+# Disable minidump on aarch64, hence breakpad is not needed.
+if ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86" OR "${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86_64")
+    add_library(breakpad STATIC IMPORTED)
+    set_target_properties(breakpad PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libbreakpad_client.a)
+endif()
 
 add_library(hyperscan STATIC IMPORTED)
 set_target_properties(hyperscan PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libhs.a)
 
+add_library(simdjson STATIC IMPORTED)
+set_target_properties(simdjson PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libsimdjson.a)
+
+add_library(velocypack STATIC IMPORTED)
+set_target_properties(velocypack PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libvelocypack.a)
+
 find_program(THRIFT_COMPILER thrift ${CMAKE_SOURCE_DIR}/bin)
+
+add_library(http_client_curl STATIC IMPORTED GLOBAL)
+set_target_properties(http_client_curl PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib64/libhttp_client_curl.a)
+
+add_library(opentelemetry_common STATIC IMPORTED GLOBAL)
+set_target_properties(opentelemetry_common PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib64/libopentelemetry_common.a)
+
+add_library(opentelemetry_trace STATIC IMPORTED GLOBAL)
+set_target_properties(opentelemetry_trace PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib64/libopentelemetry_trace.a)
+
+add_library(opentelemetry_resources STATIC IMPORTED GLOBAL)
+set_target_properties(opentelemetry_resources PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib64/libopentelemetry_resources.a)
+
+
+add_library(opentelemetry_exporter_jaeger_trace STATIC IMPORTED GLOBAL)
+set_target_properties(opentelemetry_exporter_jaeger_trace PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib64/libopentelemetry_exporter_jaeger_trace.a)
+
+if ("${USE_STAROS}" STREQUAL "ON")
+     find_package(protobuf CONFIG REQUIRED)
+     message(STATUS "Using protobuf ${protobuf_VERSION}")
+     message(STATUS "protobuf include path: ${protobuf_INCLUDE_DIRS}")
+     message(STATUS "protobuf libs: ${protobuf_LIBS}")
+
+     find_package(gRPC CONFIG REQUIRED)
+     message(STATUS "Using gRPC ${gRPC_VERSION}")
+     get_target_property(gRPC_INCLUDE_DIR gRPC::grpc INTERFACE_INCLUDE_DIRECTORIES)
+     include_directories(${gRPC_INCLUDE_DIR})
+
+     find_package(starlet CONFIG REQUIRED)
+     message(STATUS "Using starlet ${starlet_VERSION}")
+     message(STATUS "starlet inc dir: ${STARLET_INCLUDE_DIRS}")
+     message(STATUS "starlet lib dir: ${STARLET_LIBS}")
+     include_directories(${STARLET_INCLUDE_DIRS})
+     add_library(starlet STATIC IMPORTED)
+     set_target_properties(starlet PROPERTIES IMPORTED_LOCATION ${STARLET_LIBS}/libstarlet.a)
+
+     add_library(starlet_fslib_all STATIC IMPORTED GLOBAL)
+     set_target_properties(starlet_fslib_all PROPERTIES IMPORTED_LOCATION ${STARLET_LIBS}/libstarlet_fslib_all.a)
+
+     set(STARROCKS_DEPENDENCIES
+        ${STARROCKS_DEPENDENCIES}
+        starlet
+        gRPC::grpc++_reflection
+        gRPC::grpc++
+        starlet_fslib_all
+        )
+endif()
 
 # Check if functions are supported in this platform. All flags will generated
 # in gensrc/build/common/env_config.h.
@@ -298,6 +364,9 @@ set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-deprecated -Wno-vla -Wno-comment"
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG")
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DBOOST_SYSTEM_NO_DEPRECATED -DBOOST_UUID_RANDOM_PROVIDER_FORCE_POSIX")
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Werror=return-type -Werror=switch")
+if (${USE_STAROS} STREQUAL "ON")
+    set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DUSE_STAROS")
+endif()
 
 # When LLVM is used, should give GCC_HOME to get c++11 header to use new string and list
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -309,17 +378,16 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
 endif()
 
 if ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86" OR "${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86_64")
-    set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -msse4.2 -mavx2")
+    if (USE_SSE4_2)
+        set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -msse4.2")
+    endif()
+    if (USE_AVX2)
+        set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -mavx2")
+    endif()
+elseif ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "aarch64")
+    set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -march=armv8-a+crc")
 endif()
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS}  -Wno-attributes -DS2_USE_GFLAGS -DS2_USE_GLOG")
-
-if (WITH_HDFS)
-    set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DSTARROCKS_WITH_HDFS")
-endif()
-
-if (WITH_MYSQL)
-    set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DSTARROCKS_WITH_MYSQL")
-endif()
 
 if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 7.0)
     set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -faligned-new")
@@ -343,7 +411,7 @@ set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -gz=zlib")
 # Debug information is stored as dwarf2 to be as compatible as possible
 #   -Werror: compile warnings should be errors when using the toolchain compiler.
 # Only enable for debug builds because this is what we test in pre-commit tests.
-set(CXX_FLAGS_DEBUG "${CXX_GCC_FLAGS} -ggdb -O0 -gdwarf-4")
+set(CXX_FLAGS_DEBUG "${CXX_GCC_FLAGS} -ggdb -O0 -gdwarf-4 -DDEBUG")
 
 # For CMAKE_BUILD_TYPE=Release
 #   -O3: Enable all compiler optimizations
@@ -369,7 +437,7 @@ SET(CXX_FLAGS_TSAN "${CXX_GCC_FLAGS} -O0 -ggdb3 -fsanitize=thread -DTHREAD_SANIT
 # Set compile flags based on the build type.
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG")
     SET(CMAKE_CXX_FLAGS ${CXX_FLAGS_DEBUG})
-elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE" OR "${CMAKE_BUILD_TYPE}" STREQUAL "BCC")
+elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
     SET(CMAKE_CXX_FLAGS ${CXX_FLAGS_RELEASE})
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "ASAN")
     SET(CMAKE_CXX_FLAGS "${CXX_FLAGS_ASAN}")
@@ -404,8 +472,12 @@ include_directories(
     ${GPERFTOOLS_HOME}/include
     ${THIRDPARTY_DIR}/include/thrift/
     ${THIRDPARTY_DIR}/include/event/
-    ${THIRDPARTY_DIR}/include/breakpad/
 )
+
+
+if ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86" OR "${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86_64")
+    include_directories(${THIRDPARTY_DIR}/include/breakpad/)
+endif()
 
 set(WL_START_GROUP "-Wl,--start-group")
 set(WL_END_GROUP "-Wl,--end-group")
@@ -416,17 +488,21 @@ set(STARROCKS_LINK_LIBS
     Agent
     Common
     Column
-    Env
+    Connector
     Exec
     Exprs
+    FileSystem
     Formats
     Gutil
-    Memory
-    Olap
+    IO
+    Serde
+    Storage
     Rowset
-    OlapFs
     Runtime
     Service
+    ServiceBE
+    ServiceCN
+    Types
     Udf
     Util
     StarRocksGen
@@ -434,17 +510,38 @@ set(STARROCKS_LINK_LIBS
     TestUtil
     Tools
     Geo
-    Plugin
     ${WL_END_GROUP}
 )
+
+set(STARROCKS_DEPENDENCIES ${STARROCKS_DEPENDENCIES}
+    mysql
+)
+
+
+set(STARROCKS_DEPENDENCIES ${STARROCKS_DEPENDENCIES}
+    hdfs
+    jvm
+)
+set(JAVA_HOME ${THIRDPARTY_DIR}/open_jdk/)
+add_library(jvm SHARED IMPORTED)
+FILE(GLOB_RECURSE LIB_JVM ${JAVA_HOME}/jre/lib/*/libjvm.so)
+set_target_properties(jvm PROPERTIES IMPORTED_LOCATION ${LIB_JVM})
+include_directories(${JAVA_HOME}/include)
+include_directories(${JAVA_HOME}/include/linux)
+
+
+
+set(STARROCKS_DEPENDENCIES ${STARROCKS_DEPENDENCIES}
+    ${AWSSDK_LINK_LIBRARIES}
+    ${AWSSDK_PLATFORM_DEPS}
+    )
+
 
 # Set thirdparty libraries
 set(STARROCKS_DEPENDENCIES
     ${STARROCKS_DEPENDENCIES}
     ${WL_START_GROUP}
     rocksdb
-    librdkafka_cpp
-    librdkafka
     libs2
     snappy
     ${Boost_LIBRARIES}
@@ -453,6 +550,8 @@ set(STARROCKS_DEPENDENCIES
     glog
     re2
     pprof
+    # Put lz4 in front of librdkafka to make sure that segment use the native lz4 library to compress/decompress page
+    # Otherwise, he will use the lz4 Library in librdkafka
     lz4
     libevent
     curl
@@ -466,7 +565,6 @@ set(STARROCKS_DEPENDENCIES
     leveldb
     bitshuffle
     roaring
-    double-conversion
     jemalloc
     brotlicommon
     brotlidec
@@ -478,22 +576,24 @@ set(STARROCKS_DEPENDENCIES
     cctz
     fmt
     ryu
-    breakpad
     hyperscan
+    simdjson
+    librdkafka_cpp
+    librdkafka
+    velocypack
+    opentelemetry_trace
+    http_client_curl
+    opentelemetry_resources
+    opentelemetry_common
+    opentelemetry_exporter_jaeger_trace
     ${WL_END_GROUP}
 )
 
-if (WITH_MYSQL)
-    set(STARROCKS_DEPENDENCIES ${STARROCKS_DEPENDENCIES}
-        mysql
-        )
-endif()
-
-if (WITH_HDFS)
-    set(STARROCKS_DEPENDENCIES ${STARROCKS_DEPENDENCIES}
-        hdfs
-        jvm
-        )
+if ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86" OR "${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86_64")
+    set(STARROCKS_DEPENDENCIES
+        ${STARROCKS_DEPENDENCIES}
+        breakpad
+    )
 endif()
 
 # Add all external dependencies. They should come after the starrocks libs.
@@ -504,14 +604,8 @@ set(STARROCKS_LINK_LIBS ${STARROCKS_LINK_LIBS}
     -static-libgcc
 )
 
-if ("${CMAKE_BUILD_TYPE}" STREQUAL "BCC")
-    set(STARROCKS_LINK_LIBS ${STARROCKS_LINK_LIBS}
-        -Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2
-    )
-endif()
-
 # Add sanitize static link flags or tcmalloc
-if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG" OR "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE" OR "${CMAKE_BUILD_TYPE}" STREQUAL "BCC")
+if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG" OR "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
     set(STARROCKS_LINK_LIBS ${STARROCKS_LINK_LIBS} tcmalloc)
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "ASAN")
     set(STARROCKS_LINK_LIBS ${STARROCKS_LINK_LIBS} -static-libasan)
@@ -546,8 +640,7 @@ set (TEST_LINK_LIBS ${STARROCKS_LINK_LIBS}
 set(BUILD_SHARED_LIBS OFF)
 
 if (${MAKE_TEST} STREQUAL "ON")
-    SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-arcs -ftest-coverage -DGTEST_USE_OWN_TR1_TUPLE=0")
-    SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-arcs -ftest-coverage -lgcov")
+    SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DGTEST_USE_OWN_TR1_TUPLE=0")
     add_definitions(-DBE_TEST)
 else()
     # output *.a, *.so, *.dylib to output/tmp
@@ -559,25 +652,28 @@ endif ()
 
 add_subdirectory(${SRC_DIR}/agent)
 add_subdirectory(${SRC_DIR}/common)
+add_subdirectory(${SRC_DIR}/connector)
 add_subdirectory(${SRC_DIR}/column)
 add_subdirectory(${SRC_DIR}/formats)
-add_subdirectory(${SRC_DIR}/env)
+add_subdirectory(${SRC_DIR}/fs)
 add_subdirectory(${SRC_DIR}/exec)
 add_subdirectory(${SRC_DIR}/exprs)
 add_subdirectory(${SRC_DIR}/gen_cpp)
 add_subdirectory(${SRC_DIR}/geo)
 add_subdirectory(${SRC_DIR}/gutil)
 add_subdirectory(${SRC_DIR}/http)
+add_subdirectory(${SRC_DIR}/io)
 add_subdirectory(${SRC_DIR}/storage)
 add_subdirectory(${SRC_DIR}/runtime)
+add_subdirectory(${SRC_DIR}/serde)
 add_subdirectory(${SRC_DIR}/service)
 add_subdirectory(${SRC_DIR}/testutil)
+add_subdirectory(${SRC_DIR}/types)
 add_subdirectory(${SRC_DIR}/udf)
 
 add_subdirectory(${SRC_DIR}/tools)
 
 add_subdirectory(${SRC_DIR}/util)
-add_subdirectory(${SRC_DIR}/plugin)
 
 # Utility CMake function to make specifying tests and benchmarks less verbose
 FUNCTION(ADD_BE_TEST TEST_NAME)
@@ -588,7 +684,7 @@ FUNCTION(ADD_BE_TEST TEST_NAME)
     get_filename_component(TEST_FILE_NAME ${TEST_NAME} NAME)
 
     ADD_EXECUTABLE(${TEST_FILE_NAME} ${TEST_NAME}.cpp)
-    TARGET_LINK_LIBRARIES(${TEST_FILE_NAME} ${TEST_LINK_LIBS})
+    TARGET_LINK_LIBRARIES(${TEST_FILE_NAME} ${TEST_LINK_LIBS} gtest_main)
     SET_TARGET_PROPERTIES(${TEST_FILE_NAME} PROPERTIES COMPILE_FLAGS "-fno-access-control")
     if (NOT "${TEST_DIR_NAME}" STREQUAL "")
         SET_TARGET_PROPERTIES(${TEST_FILE_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${BUILD_OUTPUT_ROOT_DIRECTORY}/${TEST_DIR_NAME}")
@@ -596,43 +692,48 @@ FUNCTION(ADD_BE_TEST TEST_NAME)
     ADD_TEST(${TEST_FILE_NAME} "${BUILD_OUTPUT_ROOT_DIRECTORY}/${TEST_NAME}")
 ENDFUNCTION()
 
-FUNCTION(ADD_BE_PLUGIN PLUGIN_NAME)
+# Add a benchmark to BE
+FUNCTION(ADD_BE_BENCH TEST_NAME)
+
+    if (${WITH_BENCH} STREQUAL "OFF")
+        return()
+    endif()
+
     set(BUILD_OUTPUT_ROOT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/")
-
+    # This gets the directory where the test is from (e.g. 'exprs' or 'runtime')
     get_filename_component(DIR_NAME ${CMAKE_CURRENT_SOURCE_DIR} NAME)
-    get_filename_component(PLUGIN_DIR_NAME ${PLUGIN_NAME} PATH)
-    get_filename_component(PLUGIN_FILE_NAME ${PLUGIN_NAME} NAME)
+    get_filename_component(TEST_DIR_NAME ${TEST_NAME} PATH)
+    get_filename_component(TEST_FILE_NAME ${TEST_NAME} NAME)
 
-    ADD_LIBRARY(${PLUGIN_FILE_NAME} SHARED ${PLUGIN_NAME}.cpp)
+    find_package(benchmark REQUIRED)
+    ADD_EXECUTABLE(${TEST_FILE_NAME} ${TEST_NAME}.cpp)
+    TARGET_LINK_LIBRARIES(${TEST_FILE_NAME} ${TEST_LINK_LIBS} benchmark benchmark_main)
 
-    TARGET_LINK_LIBRARIES(${PLUGIN_FILE_NAME} ${STARROCKS_LINK_LIBS})
-    SET_TARGET_PROPERTIES(${PLUGIN_FILE_NAME} PROPERTIES COMPILE_FLAGS "-fno-access-control")
-
-    if (NOT "${PLUGIN_DIR_NAME}" STREQUAL "")
-        SET_TARGET_PROPERTIES(${PLUGIN_FILE_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${BUILD_OUTPUT_ROOT_DIRECTORY}/${PLUGIN_DIR_NAME}")
-    endif ()
-
+    SET_TARGET_PROPERTIES(${TEST_FILE_NAME} PROPERTIES COMPILE_FLAGS "-fno-access-control")
+    SET_TARGET_PROPERTIES(${TEST_FILE_NAME} PROPERTIES COMPILE_FLAGS ${CXX_FLAGS_RELEASE})
+    if (NOT "${TEST_DIR_NAME}" STREQUAL "")
+        SET_TARGET_PROPERTIES(${TEST_FILE_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${BUILD_OUTPUT_ROOT_DIRECTORY}/${TEST_DIR_NAME}")
+    endif()
+    ADD_TEST(${TEST_FILE_NAME} "${BUILD_OUTPUT_ROOT_DIRECTORY}/${TEST_NAME}")
 ENDFUNCTION()
+
 
 if (${MAKE_TEST} STREQUAL "ON")
     add_subdirectory(test)
-    # The following commands should be removed after all tests mreged into a single binary.
-    add_subdirectory(${TEST_DIR}/exec)
-    add_subdirectory(${TEST_DIR}/http)
-    add_subdirectory(${TEST_DIR}/storage)
-    add_subdirectory(${TEST_DIR}/runtime)
-    add_subdirectory(${TEST_DIR}/util)
 endif ()
 
 # Install be
 install(DIRECTORY DESTINATION ${OUTPUT_DIR})
 install(DIRECTORY DESTINATION ${OUTPUT_DIR}/bin)
 install(DIRECTORY DESTINATION ${OUTPUT_DIR}/conf)
+install(DIRECTORY DESTINATION ${OUTPUT_DIR}/lib)
 
 install(FILES
     ${BASE_DIR}/../bin/common.sh
     ${BASE_DIR}/../bin/start_be.sh
+    ${BASE_DIR}/../bin/start_cn.sh
     ${BASE_DIR}/../bin/stop_be.sh
+    ${BASE_DIR}/../bin/stop_cn.sh
     ${BASE_DIR}/../bin/show_be_version.sh
     ${BASE_DIR}/../bin/meta_tool.sh
     PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
@@ -642,10 +743,12 @@ install(FILES
 
 install(FILES
     ${BASE_DIR}/../conf/be.conf
+    ${BASE_DIR}/../conf/cn.conf
     ${BASE_DIR}/../conf/hadoop_env.sh
     DESTINATION ${OUTPUT_DIR}/conf)
 
 install(DIRECTORY
     ${BASE_DIR}/../webroot/be/
     DESTINATION ${OUTPUT_DIR}/www)
+
 

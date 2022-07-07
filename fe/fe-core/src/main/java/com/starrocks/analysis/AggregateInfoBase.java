@@ -132,13 +132,6 @@ public abstract class AggregateInfoBase {
             SlotDescriptor slotDesc = analyzer.addSlotDescriptor(result);
             slotDesc.initFromExpr(expr);
             if (i < aggregateExprStartIndex) {
-                // register equivalence between grouping slot and grouping expr;
-                // do this only when the grouping expr isn't a constant, otherwise
-                // it'll simply show up as a gratuitous HAVING predicate
-                // (which would actually be incorrect if the constant happens to be NULL)
-                if (!expr.isConstant()) {
-                    analyzer.createAuxEquivPredicate(new SlotRef(slotDesc), expr.clone());
-                }
             } else {
                 Preconditions.checkArgument(expr instanceof FunctionCallExpr);
                 FunctionCallExpr aggExpr = (FunctionCallExpr) expr;
@@ -152,10 +145,10 @@ public abstract class AggregateInfoBase {
 
                 // COUNT(), NDV() and NDV_NO_FINALIZE() are non-nullable. The latter two are used
                 // by compute stats and compute incremental stats, respectively.
-                if (aggExpr.getFnName().getFunction().equals(FunctionSet.COUNT)
-                        || aggExpr.getFnName().getFunction().equals("ndv")
-                        || aggExpr.getFnName().getFunction().equals(FunctionSet.BITMAP_UNION_INT)
-                        || aggExpr.getFnName().getFunction().equals("ndv_no_finalize")) {
+                if (aggExpr.getFnName().getFunction().equalsIgnoreCase(FunctionSet.COUNT)
+                        || aggExpr.getFnName().getFunction().equalsIgnoreCase(FunctionSet.NDV)
+                        || aggExpr.getFnName().getFunction().equalsIgnoreCase(FunctionSet.BITMAP_UNION_INT)
+                        || aggExpr.getFnName().getFunction().equalsIgnoreCase(FunctionSet.NDV_NO_FINALIZE)) {
                     // TODO: Consider making nullability a property of types or of builtin agg fns.
                     // row_number(), rank(), and dense_rank() are non-nullable as well.
                     slotDesc.setIsNullable(false);
@@ -181,28 +174,12 @@ public abstract class AggregateInfoBase {
         return result;
     }
 
-    /**
-     * Marks the slots required for evaluating an Analytic/AggregateInfo by
-     * resolving the materialized aggregate/analytic exprs against smap,
-     * and then marking their slots.
-     */
-    public abstract void materializeRequiredSlots(Analyzer analyzer,
-                                                  ExprSubstitutionMap smap);
-
     public ArrayList<Expr> getGroupingExprs() {
         return groupingExprs_;
     }
 
     public ArrayList<FunctionCallExpr> getAggregateExprs() {
         return aggregateExprs_;
-    }
-
-    public TupleDescriptor getOutputTupleDesc() {
-        return outputTupleDesc_;
-    }
-
-    public TupleDescriptor getIntermediateTupleDesc() {
-        return intermediateTupleDesc_;
     }
 
     public TupleId getIntermediateTupleId() {

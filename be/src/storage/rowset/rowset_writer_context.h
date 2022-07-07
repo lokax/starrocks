@@ -19,17 +19,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_OLAP_ROWSET_ROWSET_WRITER_CONTEXT_H
-#define STARROCKS_BE_SRC_OLAP_ROWSET_ROWSET_WRITER_CONTEXT_H
+#pragma once
 
-#include "env/env.h"
+#include "fs/fs.h"
 #include "gen_cpp/olap_file.pb.h"
-#include "storage/fs/fs_util.h"
-#include "storage/vectorized/type_utils.h"
+#include "runtime/global_dict/types_fwd_decl.h"
+#include "storage/type_utils.h"
 
 namespace starrocks {
 
 class TabletSchema;
+
+enum RowsetWriterType { kHorizontal = 0, kVertical = 1 };
 
 class RowsetWriterContext {
 public:
@@ -42,16 +43,11 @@ public:
     RowsetWriterContext(const RowsetWriterContext&) = default;
     RowsetWriterContext& operator=(const RowsetWriterContext&) = default;
 
-    /*
-     * The fields were arranged based on size to reduce sizeof(RowsetWriterContext).
-     */
-    MemTracker* mem_tracker = nullptr;
-
     std::string rowset_path_prefix;
 
-    Env* env = Env::Default();
-    fs::BlockManager* block_mgr = fs::fs_util::block_manager();
     const TabletSchema* tablet_schema = nullptr;
+    std::shared_ptr<TabletSchema> partial_update_tablet_schema = nullptr;
+    std::vector<int32_t> referenced_column_ids;
 
     RowsetId rowset_id{};
     int64_t tablet_id = 0;
@@ -59,12 +55,11 @@ public:
     int64_t partition_id = 0;
     int64_t txn_id = 0;
     Version version{};
-    VersionHash version_hash = 0;
     TabletUid tablet_uid = {0, 0};
     PUniqueId load_id{};
+    bool schema_change_sorting = false;
 
     RowsetStatePB rowset_state = PREPARED;
-    RowsetTypePB rowset_type = BETA_ROWSET;
     SegmentsOverlapPB segments_overlap = OVERLAP_UNKNOWN;
 
     // segment file use uint32 to represent row number, therefore the maximum is UINT32_MAX.
@@ -76,8 +71,10 @@ public:
     DataFormatVersion memory_format_version;
     // On-disk data format.
     DataFormatVersion storage_format_version;
+
+    vectorized::GlobalDictByNameMaps* global_dicts = nullptr;
+
+    RowsetWriterType writer_type = kHorizontal;
 };
 
 } // namespace starrocks
-
-#endif // STARROCKS_BE_SRC_OLAP_ROWSET_ROWSET_WRITER_CONTEXT_H

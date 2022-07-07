@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
@@ -24,7 +24,7 @@ public class PruneTopNColumnsRule extends TransformationRule {
         LogicalTopNOperator topNOperator = (LogicalTopNOperator) input.getOp();
         ColumnRefSet requiredInputColumns = topNOperator.getRequiredChildInputColumns();
 
-        ColumnRefSet requiredOutputColumns = context.getTaskContext().get(0).getRequiredColumns();
+        ColumnRefSet requiredOutputColumns = context.getTaskContext().getRequiredColumns();
 
         // Change the requiredOutputColumns in context
         requiredOutputColumns.union(requiredInputColumns);

@@ -19,24 +19,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_OLAP_FIELD_H
-#define STARROCKS_BE_SRC_OLAP_FIELD_H
+#pragma once
 
 #include <sstream>
 #include <string>
 
 #include "runtime/mem_pool.h"
-#include "storage/aggregate_func.h"
 #include "storage/decimal_type_info.h"
 #include "storage/key_coder.h"
 #include "storage/olap_common.h"
 #include "storage/olap_define.h"
-#include "storage/row_cursor_cell.h"
 #include "storage/tablet_schema.h"
 #include "storage/types.h"
 #include "storage/utils.h"
 #include "util/hash_util.hpp"
-#include "util/mem_util.hpp"
 #include "util/slice.h"
 
 namespace starrocks {
@@ -50,7 +46,6 @@ public:
             : _name(column.name()),
               _type_info(get_type_info(column)),
               _key_coder(get_key_coder(column.type())),
-              _agg_info(get_aggregate_info(column.aggregation(), column.type())),
               _index_size(column.index_length()),
               _length(column.length()),
               _is_nullable(column.is_nullable()) {
@@ -58,11 +53,10 @@ public:
                column.type() != OLAP_FIELD_TYPE_DECIMAL128);
     }
 
-    Field(const TabletColumn column, std::shared_ptr<TypeInfo>&& type_info)
+    Field(const TabletColumn& column, std::shared_ptr<TypeInfo>&& type_info)
             : _name(column.name()),
               _type_info(type_info),
               _key_coder(get_key_coder(column.type())),
-              _agg_info(get_aggregate_info(column.aggregation(), column.type())),
               _index_size(column.index_length()),
               _length(column.length()),
               _is_nullable(column.is_nullable()) {}
@@ -90,35 +84,14 @@ public:
     // reserve memory from continuous memory.
     virtual char* allocate_value(MemPool* pool) const { return (char*)pool->allocate(_type_info->size()); }
 
-    void agg_update(RowCursorCell* dest, const RowCursorCell& src, MemPool* mem_pool = nullptr) const {
-        _agg_info->update(dest, src, mem_pool);
-    }
-
-    void agg_finalize(RowCursorCell* dst, MemPool* mem_pool) const { _agg_info->finalize(dst, mem_pool); }
-
-    virtual void consume(RowCursorCell* dst, const char* src, bool src_null, MemPool* mem_pool,
-                         ObjectPool* agg_pool) const {
-        _agg_info->init(dst, src, src_null, mem_pool, agg_pool);
-    }
-
-    // todo(kks): Unify AggregateInfo::init method and Field::agg_init method
-
-    // This function will initialize destination with source.
-    // This functionn differs copy functionn in that if this field
-    // contain aggregate information, this functionn will initialize
-    // destination in aggregate format, and update with srouce content.
-    virtual void agg_init(RowCursorCell* dst, const RowCursorCell& src, MemPool* mem_pool, ObjectPool* agg_pool) const {
-        direct_copy(dst, src, mem_pool);
-    }
-
     virtual char* allocate_memory(char* cell_ptr, char* variable_ptr) const { return variable_ptr; }
 
     virtual size_t get_variable_len() const { return 0; }
 
     virtual Field* clone() const {
-        auto* local = new Field();
-        this->clone(local);
-        return local;
+        std::unique_ptr<Field> local = std::make_unique<Field>();
+        this->clone(local.get());
+        return local.release();
     }
 
     // Test if these two cell is equal with each other
@@ -161,11 +134,6 @@ public:
         }
         return l_null ? 0 : _type_info->cmp(lhs.cell_ptr(), rhs.cell_ptr());
     }
-
-    // Used to compare short key index. Because short key will truncate
-    // a varchar column, this function will handle in this condition.
-    template <typename LhsCellType, typename RhsCellType>
-    inline int index_cmp(const LhsCellType& lhs, const RhsCellType& rhs) const;
 
     // Copy source cell's content to destination cell directly.
     // For string type, this function assume that destination has
@@ -217,17 +185,13 @@ public:
     void shallow_copy_content(char* dst, const char* src) const { _type_info->shallow_copy(dst, src); }
 
     //convert and copy field from src to desc
-    OLAPStatus convert_from(char* dest, const char* src, const TypeInfoPtr& src_type, MemPool* mem_pool) const {
+    Status convert_from(char* dest, const char* src, const TypeInfoPtr& src_type, MemPool* mem_pool) const {
         return _type_info->convert_from(dest, src, src_type, mem_pool);
     }
 
-    // Copy srouce content to destination in index format.
-    template <typename DstCellType, typename SrcCellType>
-    void to_index(DstCellType* dst, const SrcCellType& src) const;
-
     // used by init scan key stored in string format
     // value_string should end with '\0'
-    OLAPStatus from_string(char* buf, const std::string& value_string) const {
+    Status from_string(char* buf, const std::string& value_string) const {
         return _type_info->from_string(buf, value_string);
     }
 
@@ -249,7 +213,6 @@ public:
     uint32_t hash_code(const CellType& cell, uint32_t seed) const;
 
     FieldType type() const { return _type_info->type(); }
-    FieldAggregationMethod aggregation() const { return _agg_info->agg_method(); }
     const TypeInfoPtr& type_info() const { return _type_info; }
     bool is_nullable() const { return _is_nullable; }
 
@@ -270,21 +233,12 @@ public:
 
     std::string to_zone_map_string(const char* value) const {
         switch (type()) {
-        case OLAP_FIELD_TYPE_DECIMAL32: {
-            auto* decimal_type_info = down_cast<DecimalTypeInfo<OLAP_FIELD_TYPE_DECIMAL32>*>(type_info().get());
-            return decimal_type_info->to_zone_map_string(value);
-        }
-        case OLAP_FIELD_TYPE_DECIMAL64: {
-            auto* decimal_type_info = down_cast<DecimalTypeInfo<OLAP_FIELD_TYPE_DECIMAL64>*>(type_info().get());
-            return decimal_type_info->to_zone_map_string(value);
-        }
-        case OLAP_FIELD_TYPE_DECIMAL128: {
-            auto* decimal_type_info = down_cast<DecimalTypeInfo<OLAP_FIELD_TYPE_DECIMAL128>*>(type_info().get());
-            return decimal_type_info->to_zone_map_string(value);
-        }
-        default: {
+        case OLAP_FIELD_TYPE_DECIMAL32:
+        case OLAP_FIELD_TYPE_DECIMAL64:
+        case OLAP_FIELD_TYPE_DECIMAL128:
+            return get_decimal_zone_map_string(type_info().get(), value);
+        default:
             return type_info()->to_string(value);
-        }
         }
     }
 
@@ -307,16 +261,18 @@ public:
     virtual std::string debug_string() const {
         std::stringstream ss;
         ss << "(type=" << _type_info->type() << ",index_size=" << _index_size << ",is_nullable=" << _is_nullable
-           << ",aggregation=" << _agg_info->agg_method() << ",length=" << _length << ")";
+           << ",length=" << _length << ")";
         return ss.str();
     }
 
 protected:
     char* allocate_string_value(MemPool* pool) const {
         char* type_value = (char*)pool->allocate(sizeof(Slice));
+        assert(type_value != nullptr);
         auto slice = reinterpret_cast<Slice*>(type_value);
         slice->size = _length;
         slice->data = (char*)pool->allocate(slice->size);
+        assert(slice->data != nullptr);
         return type_value;
     }
 
@@ -336,83 +292,11 @@ protected:
     std::string _name;
     TypeInfoPtr _type_info;
     const KeyCoder* _key_coder;
-    const AggregateInfo* _agg_info;
     uint16_t _index_size;
     uint32_t _length;
     bool _is_nullable;
     std::vector<std::unique_ptr<Field>> _sub_fields;
 };
-
-template <typename LhsCellType, typename RhsCellType>
-int Field::index_cmp(const LhsCellType& lhs, const RhsCellType& rhs) const {
-    bool l_null = lhs.is_null();
-    bool r_null = rhs.is_null();
-    if (l_null != r_null) {
-        return l_null ? -1 : 1;
-    } else if (l_null) {
-        return 0;
-    }
-
-    int32_t res = 0;
-    if (type() == OLAP_FIELD_TYPE_VARCHAR) {
-        const Slice* l_slice = reinterpret_cast<const Slice*>(lhs.cell_ptr());
-        const Slice* r_slice = reinterpret_cast<const Slice*>(rhs.cell_ptr());
-
-        if (r_slice->size + OLAP_STRING_MAX_BYTES > _index_size ||
-            l_slice->size + OLAP_STRING_MAX_BYTES > _index_size) {
-            // if field length is larger than short key, only compare prefix to make sure that
-            // the same short key block will be scanned.
-            int compare_size = _index_size - OLAP_STRING_MAX_BYTES;
-            // l_slice size and r_slice size may be less than compare_size
-            // so calculate the min of the three size as new compare_size
-            compare_size = std::min(std::min(compare_size, (int)l_slice->size), (int)r_slice->size);
-
-            // This functionn is used to compare prefix index.
-            // Only the fixed length of prefix index should be compared.
-            // If r_slice->size > l_slice->size, igonre the extra parts directly.
-            res = strncmp(l_slice->data, r_slice->data, compare_size);
-            if (res == 0 && compare_size != (_index_size - OLAP_STRING_MAX_BYTES)) {
-                if (l_slice->size < r_slice->size) {
-                    res = -1;
-                } else if (l_slice->size > r_slice->size) {
-                    res = 1;
-                } else {
-                    res = 0;
-                }
-            }
-        } else {
-            res = l_slice->compare(*r_slice);
-        }
-    } else {
-        res = _type_info->cmp(lhs.cell_ptr(), rhs.cell_ptr());
-    }
-
-    return res;
-}
-
-template <typename DstCellType, typename SrcCellType>
-void Field::to_index(DstCellType* dst, const SrcCellType& src) const {
-    bool is_null = src.is_null();
-    dst->set_is_null(is_null);
-    if (is_null) {
-        return;
-    }
-
-    if (type() == OLAP_FIELD_TYPE_VARCHAR) {
-        memset(dst->mutable_cell_ptr(), 0, _index_size);
-        const Slice* slice = reinterpret_cast<const Slice*>(src.cell_ptr());
-        size_t copy_size =
-                slice->size < _index_size - OLAP_STRING_MAX_BYTES ? slice->size : _index_size - OLAP_STRING_MAX_BYTES;
-        *reinterpret_cast<StringLengthType*>(dst->mutable_cell_ptr()) = copy_size;
-        memory_copy((char*)dst->mutable_cell_ptr() + OLAP_STRING_MAX_BYTES, slice->data, copy_size);
-    } else if (type() == OLAP_FIELD_TYPE_CHAR) {
-        memset(dst->mutable_cell_ptr(), 0, _index_size);
-        const Slice* slice = reinterpret_cast<const Slice*>(src.cell_ptr());
-        memory_copy(dst->mutable_cell_ptr(), slice->data, _index_size);
-    } else {
-        memory_copy(dst->mutable_cell_ptr(), src.cell_ptr(), size());
-    }
-}
 
 template <typename CellType>
 uint32_t Field::hash_code(const CellType& cell, uint32_t seed) const {
@@ -425,24 +309,8 @@ uint32_t Field::hash_code(const CellType& cell, uint32_t seed) const {
 
 class CharField : public Field {
 public:
-    explicit CharField() : Field() {}
+    explicit CharField() {}
     explicit CharField(const TabletColumn& column) : Field(column) {}
-
-    // the char field is especial, which need the _length info when consume raw data
-    void consume(RowCursorCell* dst, const char* src, bool src_null, MemPool* mem_pool,
-                 ObjectPool* agg_pool) const override {
-        dst->set_is_null(src_null);
-        if (src_null) {
-            return;
-        }
-
-        auto* value = reinterpret_cast<const StringValue*>(src);
-        auto* dest_slice = (Slice*)(dst->mutable_cell_ptr());
-        dest_slice->size = _length;
-        dest_slice->data = (char*)mem_pool->allocate(dest_slice->size);
-        memcpy(dest_slice->data, value->ptr, value->len);
-        memset(dest_slice->data + value->len, 0, dest_slice->size - value->len);
-    }
 
     size_t get_variable_len() const override { return _length; }
 
@@ -455,9 +323,9 @@ public:
     }
 
     CharField* clone() const override {
-        auto* local = new CharField();
-        Field::clone(local);
-        return local;
+        std::unique_ptr<CharField> local = std::make_unique<CharField>();
+        Field::clone(local.get());
+        return local.release();
     }
 
     char* allocate_value(MemPool* pool) const override { return Field::allocate_string_value(pool); }
@@ -471,7 +339,7 @@ public:
 
 class VarcharField : public Field {
 public:
-    explicit VarcharField() : Field() {}
+    explicit VarcharField() {}
     explicit VarcharField(const TabletColumn& column) : Field(column) {}
 
     size_t get_variable_len() const override { return _length - OLAP_STRING_MAX_BYTES; }
@@ -486,9 +354,9 @@ public:
     }
 
     VarcharField* clone() const override {
-        auto* local = new VarcharField();
-        Field::clone(local);
-        return local;
+        std::unique_ptr<VarcharField> local = std::make_unique<VarcharField>();
+        Field::clone(local.get());
+        return local.release();
     }
 
     char* allocate_value(MemPool* pool) const override { return Field::allocate_string_value(pool); }
@@ -502,14 +370,8 @@ public:
 
 class BitmapAggField : public Field {
 public:
-    explicit BitmapAggField() : Field() {}
+    explicit BitmapAggField() {}
     explicit BitmapAggField(const TabletColumn& column) : Field(column) {}
-
-    // bitmap storage data always not null
-    void agg_init(RowCursorCell* dst, const RowCursorCell& src, MemPool* mem_pool,
-                  ObjectPool* agg_pool) const override {
-        _agg_info->init(dst, (const char*)src.cell_ptr(), src.is_null(), mem_pool, agg_pool);
-    }
 
     char* allocate_memory(char* cell_ptr, char* variable_ptr) const override {
         auto slice = (Slice*)cell_ptr;
@@ -518,22 +380,16 @@ public:
     }
 
     BitmapAggField* clone() const override {
-        auto* local = new BitmapAggField();
-        Field::clone(local);
-        return local;
+        std::unique_ptr<BitmapAggField> local = std::make_unique<BitmapAggField>();
+        Field::clone(local.get());
+        return local.release();
     }
 };
 
 class HllAggField : public Field {
 public:
-    explicit HllAggField() : Field() {}
+    explicit HllAggField() {}
     explicit HllAggField(const TabletColumn& column) : Field(column) {}
-
-    // Hll storage data always not null
-    void agg_init(RowCursorCell* dst, const RowCursorCell& src, MemPool* mem_pool,
-                  ObjectPool* agg_pool) const override {
-        _agg_info->init(dst, (const char*)src.cell_ptr(), false, mem_pool, agg_pool);
-    }
 
     char* allocate_memory(char* cell_ptr, char* variable_ptr) const override {
         auto slice = (Slice*)cell_ptr;
@@ -542,22 +398,16 @@ public:
     }
 
     HllAggField* clone() const override {
-        auto* local = new HllAggField();
-        Field::clone(local);
-        return local;
+        std::unique_ptr<HllAggField> local = std::make_unique<HllAggField>();
+        Field::clone(local.get());
+        return local.release();
     }
 };
 
 class PercentileAggField : public Field {
 public:
-    PercentileAggField() : Field() {}
+    PercentileAggField() {}
     explicit PercentileAggField(const TabletColumn& column) : Field(column) {}
-
-    // Hll storage data always not null
-    void agg_init(RowCursorCell* dst, const RowCursorCell& src, MemPool* mem_pool,
-                  ObjectPool* agg_pool) const override {
-        _agg_info->init(dst, (const char*)src.cell_ptr(), false, mem_pool, agg_pool);
-    }
 
     char* allocate_memory(char* cell_ptr, char* variable_ptr) const override {
         auto slice = (Slice*)cell_ptr;
@@ -566,9 +416,9 @@ public:
     }
 
     PercentileAggField* clone() const override {
-        auto* local = new PercentileAggField();
-        Field::clone(local);
-        return local;
+        std::unique_ptr<PercentileAggField> local = std::make_unique<PercentileAggField>();
+        Field::clone(local.get());
+        return local.release();
     }
 };
 
@@ -583,20 +433,15 @@ public:
             case OLAP_FIELD_TYPE_VARCHAR:
                 return new VarcharField(column);
             case OLAP_FIELD_TYPE_ARRAY: {
-                std::unique_ptr<Field> item_field(FieldFactory::create(column.get_sub_column(0)));
+                std::unique_ptr<Field> item_field(FieldFactory::create(column.subcolumn(0)));
                 auto* local = new Field(column);
                 local->add_sub_field(std::move(item_field));
                 return local;
             }
             case OLAP_FIELD_TYPE_DECIMAL32:
-                return new Field(column, std::make_shared<DecimalTypeInfo<OLAP_FIELD_TYPE_DECIMAL32>>(
-                                                 column.precision(), column.scale()));
             case OLAP_FIELD_TYPE_DECIMAL64:
-                return new Field(column, std::make_shared<DecimalTypeInfo<OLAP_FIELD_TYPE_DECIMAL64>>(
-                                                 column.precision(), column.scale()));
             case OLAP_FIELD_TYPE_DECIMAL128:
-                return new Field(column, std::make_shared<DecimalTypeInfo<OLAP_FIELD_TYPE_DECIMAL128>>(
-                                                 column.precision(), column.scale()));
+                return new Field(column, get_decimal_type_info(column.type(), column.precision(), column.scale()));
             default:
                 return new Field(column);
             }
@@ -616,20 +461,15 @@ public:
             case OLAP_FIELD_TYPE_VARCHAR:
                 return new VarcharField(column);
             case OLAP_FIELD_TYPE_ARRAY: {
-                std::unique_ptr<Field> item_field(FieldFactory::create(column.get_sub_column(0)));
-                auto* local = new Field(column);
+                std::unique_ptr<Field> item_field(FieldFactory::create(column.subcolumn(0)));
+                std::unique_ptr<Field> local = std::make_unique<Field>(column);
                 local->add_sub_field(std::move(item_field));
-                return local;
+                return local.release();
             }
             case OLAP_FIELD_TYPE_DECIMAL32:
-                return new Field(column, std::make_shared<DecimalTypeInfo<OLAP_FIELD_TYPE_DECIMAL32>>(
-                                                 column.precision(), column.scale()));
             case OLAP_FIELD_TYPE_DECIMAL64:
-                return new Field(column, std::make_shared<DecimalTypeInfo<OLAP_FIELD_TYPE_DECIMAL64>>(
-                                                 column.precision(), column.scale()));
             case OLAP_FIELD_TYPE_DECIMAL128:
-                return new Field(column, std::make_shared<DecimalTypeInfo<OLAP_FIELD_TYPE_DECIMAL128>>(
-                                                 column.precision(), column.scale()));
+                return new Field(column, get_decimal_type_info(column.type(), column.precision(), column.scale()));
             default:
                 return new Field(column);
             }
@@ -654,5 +494,3 @@ public:
 };
 
 } // namespace starrocks
-
-#endif // STARROCKS_BE_SRC_OLAP_FIELD_H

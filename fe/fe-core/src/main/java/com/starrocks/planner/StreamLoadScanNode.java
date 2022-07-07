@@ -40,8 +40,8 @@ import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.common.Config;
 import com.starrocks.common.UserException;
+import com.starrocks.common.Config;
 import com.starrocks.load.Load;
 import com.starrocks.task.StreamLoadTask;
 import com.starrocks.thrift.TBrokerRangeDesc;
@@ -58,7 +58,6 @@ import com.starrocks.thrift.TUniqueId;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -124,12 +123,6 @@ public class StreamLoadScanNode extends LoadScanNode {
             }
             rangeDesc.setStrip_outer_array(streamLoadTask.isStripOuterArray());
         }
-        // csv/json/parquet load is controlled by Config::enable_vectorized_file_load
-        // if Config::enable_vectorized_file_load is set true,
-        // vectorized load will been enabled
-        if (rangeDesc.format_type != TFileFormatType.FORMAT_ORC && !Config.enable_vectorized_file_load) {
-            useVectorizedLoad = false;
-        }
         rangeDesc.setSplittable(false);
         switch (streamLoadTask.getFileType()) {
             case FILE_LOCAL:
@@ -152,7 +145,8 @@ public class StreamLoadScanNode extends LoadScanNode {
 
         Load.initColumns(dstTable, streamLoadTask.getColumnExprDescs(), null /* no hadoop function */,
                 exprsByName, analyzer, srcTupleDesc, slotDescByName,
-                params, true, useVectorizedLoad, Lists.newArrayList());
+                params, true, useVectorizedLoad, Lists.newArrayList(),
+                streamLoadTask.getFormatType() == TFileFormatType.FORMAT_JSON, streamLoadTask.isPartialUpdate());
 
         rangeDesc.setNum_of_columns_from_file(srcTupleDesc.getSlots().size());
         brokerScanRange.addToRanges(rangeDesc);
@@ -160,14 +154,11 @@ public class StreamLoadScanNode extends LoadScanNode {
         // analyze where statement
         initWhereExpr(streamLoadTask.getWhereExpr(), analyzer);
 
-        computeStats(analyzer);
-        createDefaultSmap(analyzer);
-
         if (streamLoadTask.getColumnSeparator() != null) {
             String sep = streamLoadTask.getColumnSeparator().getColumnSeparator();
             byte[] setBytes = sep.getBytes(StandardCharsets.UTF_8);
             params.setColumn_separator(setBytes[0]);
-            if (sep.length() > 50) {
+            if (setBytes.length > 50) {
                 throw new UserException("the column separator is limited to a maximum of 50 bytes");
             }
             if (setBytes.length > 1) {
@@ -178,7 +169,14 @@ public class StreamLoadScanNode extends LoadScanNode {
         }
         if (streamLoadTask.getRowDelimiter() != null) {
             String sep = streamLoadTask.getRowDelimiter().getRowDelimiter();
-            params.setRow_delimiter(sep.getBytes(StandardCharsets.UTF_8)[0]);
+            byte[] sepBytes = sep.getBytes(StandardCharsets.UTF_8);
+            params.setRow_delimiter(sepBytes[0]);
+            if (sepBytes.length > 50) {
+                throw new UserException("the row delimiter is limited to a maximum of 50 bytes");
+            }
+            if (sepBytes.length > 1) {
+                params.setMulti_row_delimiter(sep);
+            }
         } else {
             params.setRow_delimiter((byte) '\n');
         }
@@ -190,7 +188,7 @@ public class StreamLoadScanNode extends LoadScanNode {
     }
 
     @Override
-    public void finalize(Analyzer analyzer) throws UserException, UserException {
+    public void finalizeStats(Analyzer analyzer) throws UserException, UserException {
         finalizeParams();
     }
 
@@ -213,12 +211,18 @@ public class StreamLoadScanNode extends LoadScanNode {
                     if (dstSlotDesc.getColumn().isAllowNull()) {
                         srcSlotDesc.setIsNullable(true);
                     }
-                    expr = new SlotRef(srcSlotDesc);
+                    SlotRef slotRef = new SlotRef(srcSlotDesc);
+                    slotRef.setColumnName(dstSlotDesc.getColumn().getName());
+                    expr = slotRef;
                 } else {
                     Column column = dstSlotDesc.getColumn();
-                    if (column.getDefaultValue() != null) {
-                        expr = new StringLiteral(dstSlotDesc.getColumn().getDefaultValue());
-                    } else {
+                    Column.DefaultValueType defaultValueType = column.getDefaultValueType();
+                    if (defaultValueType == Column.DefaultValueType.CONST) {
+                        expr = new StringLiteral(column.calculatedDefaultValue());
+                    } else if (defaultValueType == Column.DefaultValueType.VARY) {
+                        throw new UserException("Column(" + column + ") has unsupported default value:"
+                                + column.getDefaultExpr().getExpr());
+                    } else if (defaultValueType == Column.DefaultValueType.NULL) {
                         if (column.isAllowNull()) {
                             expr = NullLiteral.create(column.getType());
                         } else {
@@ -248,18 +252,9 @@ public class StreamLoadScanNode extends LoadScanNode {
 
             if (negative && dstSlotDesc.getColumn().getAggregationType() == AggregateType.SUM) {
                 expr = new ArithmeticExpr(ArithmeticExpr.Operator.MULTIPLY, expr, new IntLiteral(-1));
-                expr.analyze(analyzer);
+                expr = Expr.analyzeAndCastFold(expr);
             }
             expr = castToSlot(dstSlotDesc, expr);
-
-            // check expr is vectorized or not.
-            if (useVectorizedLoad) {
-                if (!expr.isVectorized()) {
-                    useVectorizedLoad = false;
-                } else {
-                    expr.setUseVectorized(true);
-                }
-            }
 
             brokerScanRange.params.putToExpr_of_dest_slot(dstSlotDesc.getId().asInt(), expr.treeToThrift());
         }
@@ -275,6 +270,7 @@ public class StreamLoadScanNode extends LoadScanNode {
     protected void toThrift(TPlanNode planNode) {
         planNode.setNode_type(TPlanNodeType.FILE_SCAN_NODE);
         TFileScanNode fileScanNode = new TFileScanNode(desc.getId().asInt());
+        fileScanNode.setEnable_pipeline_load(Config.enable_pipeline_load);
         planNode.setFile_scan_node(fileScanNode);
     }
 
@@ -299,22 +295,7 @@ public class StreamLoadScanNode extends LoadScanNode {
     }
 
     @Override
-    public boolean isVectorized() {
-        // Column mapping expr already checked in finalizeParams function
-        for (Expr expr : conjuncts) {
-            if (!expr.isVectorized()) {
-                return false;
-            }
-        }
-
-        return useVectorizedLoad;
-    }
-
-    @Override
-    public void setUseVectorized(boolean flag) {
-        this.useVectorized = flag;
-        for (Expr expr : conjuncts) {
-            expr.setUseVectorized(flag);
-        }
+    public boolean canUsePipeLine() {
+        return Config.enable_pipeline_load;
     }
 }

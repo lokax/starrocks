@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
@@ -26,11 +26,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-import static com.starrocks.sql.optimizer.rule.transformation.JoinPredicateUtils.pushDownOnPredicate;
-import static com.starrocks.sql.optimizer.rule.transformation.JoinPredicateUtils.pushDownPredicate;
 import static java.util.function.Function.identity;
 
-public class PushDownPredicateJoinRule extends TransformationRule {
+public class PushDownPredicateJoinRule extends PushDownJoinPredicateBase {
     public PushDownPredicateJoinRule() {
         super(RuleType.TF_PUSH_DOWN_PREDICATE_JOIN, Pattern.create(OperatorType.LOGICAL_FILTER)
                 .addChildren(Pattern.create(OperatorType.LOGICAL_JOIN)
@@ -52,7 +50,7 @@ public class PushDownPredicateJoinRule extends TransformationRule {
         if (join.getJoinType().isLeftOuterJoin()) {
             for (ScalarOperator e : Utils.extractConjuncts(predicate)) {
                 ColumnRefSet usedColumns = e.getUsedColumns();
-                if (leftColumns.contains(usedColumns)) {
+                if (leftColumns.containsAll(usedColumns)) {
                     leftPushDown.add(e);
                 } else {
                     remainingFilter.add(e);
@@ -61,7 +59,7 @@ public class PushDownPredicateJoinRule extends TransformationRule {
         } else if (join.getJoinType().isRightOuterJoin()) {
             for (ScalarOperator e : Utils.extractConjuncts(predicate)) {
                 ColumnRefSet usedColumns = e.getUsedColumns();
-                if (rightColumns.contains(usedColumns)) {
+                if (rightColumns.containsAll(usedColumns)) {
                     rightPushDown.add(e);
                 } else {
                     remainingFilter.add(e);
@@ -80,7 +78,7 @@ public class PushDownPredicateJoinRule extends TransformationRule {
         } else if (join.getJoinType().isLeftSemiAntiJoin()) {
             for (ScalarOperator e : Utils.extractConjuncts(predicate)) {
                 ColumnRefSet usedColumns = e.getUsedColumns();
-                if (leftColumns.contains(usedColumns)) {
+                if (leftColumns.containsAll(usedColumns)) {
                     leftPushDown.add(e);
                 } else {
                     remainingFilter.add(e);
@@ -89,7 +87,7 @@ public class PushDownPredicateJoinRule extends TransformationRule {
         } else if (join.getJoinType().isRightSemiAntiJoin()) {
             for (ScalarOperator e : Utils.extractConjuncts(predicate)) {
                 ColumnRefSet usedColumns = e.getUsedColumns();
-                if (rightColumns.contains(usedColumns)) {
+                if (rightColumns.containsAll(usedColumns)) {
                     rightPushDown.add(e);
                 } else {
                     remainingFilter.add(e);
@@ -97,17 +95,23 @@ public class PushDownPredicateJoinRule extends TransformationRule {
             }
         }
 
-        joinOpt = pushDownPredicate(joinOpt, Utils.compoundAnd(leftPushDown), Utils.compoundAnd(rightPushDown));
+        joinOpt = pushDownPredicate(joinOpt, leftPushDown, rightPushDown);
 
+        LogicalJoinOperator newJoinOperator;
         if (!remainingFilter.isEmpty()) {
             if (join.getJoinType().isInnerJoin()) {
-                join.setOnPredicate(
-                        Utils.compoundAnd(join.getOnPredicate(), Utils.compoundAnd(remainingFilter)));
+                newJoinOperator = new LogicalJoinOperator.Builder().withOperator(join)
+                        .setOnPredicate(Utils.compoundAnd(join.getOnPredicate(), Utils.compoundAnd(remainingFilter)))
+                        .build();
             } else {
-                join.setPredicate(Utils.compoundAnd(remainingFilter));
+                newJoinOperator = new LogicalJoinOperator.Builder().withOperator(join)
+                        .setPredicate(Utils.compoundAnd(remainingFilter)).build();
             }
+        } else {
+            newJoinOperator = join;
         }
-        return joinOpt;
+
+        return OptExpression.create(newJoinOperator, joinOpt.getInputs());
     }
 
     private void convertOuterToInner(OptExpression input) {
@@ -119,30 +123,42 @@ public class PushDownPredicateJoinRule extends TransformationRule {
         ColumnRefSet rightColumns = joinOpt.getInputs().get(1).getOutputColumns();
 
         if (join.getJoinType().isLeftOuterJoin()) {
-            if (canEliminateNull(rightColumns, filter.getPredicate().clone())) {
-                join.setJoinType(JoinOperator.INNER_JOIN);
+            if (canEliminateNull(rightColumns, filter.getPredicate())) {
+                input.setChild(0, OptExpression.create(new LogicalJoinOperator.Builder().withOperator(join)
+                                .setJoinType(JoinOperator.INNER_JOIN)
+                                .build(),
+                        input.inputAt(0).getInputs()));
             }
         } else if (join.getJoinType().isRightOuterJoin()) {
-            if (canEliminateNull(leftColumns, filter.getPredicate().clone())) {
-                join.setJoinType(JoinOperator.INNER_JOIN);
+            if (canEliminateNull(leftColumns, filter.getPredicate())) {
+                input.setChild(0, OptExpression.create(new LogicalJoinOperator.Builder().withOperator(join)
+                        .setJoinType(JoinOperator.INNER_JOIN).build(), input.inputAt(0).getInputs()));
             }
         } else if (join.getJoinType().isFullOuterJoin()) {
             boolean canConvertLeft = false;
             boolean canConvertRight = false;
 
-            if (canEliminateNull(leftColumns, filter.getPredicate().clone())) {
+            if (canEliminateNull(leftColumns, filter.getPredicate())) {
                 canConvertLeft = true;
             }
-            if (canEliminateNull(rightColumns, filter.getPredicate().clone())) {
+            if (canEliminateNull(rightColumns, filter.getPredicate())) {
                 canConvertRight = true;
             }
 
             if (canConvertLeft && canConvertRight) {
-                join.setJoinType(JoinOperator.INNER_JOIN);
+                input.setChild(0, OptExpression.create(
+
+                        new LogicalJoinOperator.Builder().withOperator(join)
+                                .setJoinType(JoinOperator.INNER_JOIN)
+                                .build(), input.inputAt(0).getInputs()));
             } else if (canConvertLeft) {
-                join.setJoinType(JoinOperator.LEFT_OUTER_JOIN);
+                input.setChild(0, OptExpression.create(new LogicalJoinOperator.Builder().withOperator(join)
+                                .setJoinType(JoinOperator.LEFT_OUTER_JOIN).build(),
+                        input.inputAt(0).getInputs()));
             } else if (canConvertRight) {
-                join.setJoinType(JoinOperator.RIGHT_OUTER_JOIN);
+                input.setChild(0, OptExpression.create(new LogicalJoinOperator.Builder().withOperator(join)
+                                .setJoinType(JoinOperator.RIGHT_OUTER_JOIN).build(),
+                        input.inputAt(0).getInputs()));
             }
         }
     }
@@ -154,13 +170,13 @@ public class PushDownPredicateJoinRule extends TransformationRule {
      * it proves that the expression can filter the NULL value in nullColumns
      * 4: Return true to prove that NULL values can be eliminated, and vice versa
      */
-    public boolean canEliminateNull(ColumnRefSet nullColumns, ScalarOperator expression) {
+    private boolean canEliminateNull(ColumnRefSet nullColumns, ScalarOperator expression) {
         Map<ColumnRefOperator, ScalarOperator> m = Arrays.stream(nullColumns.getColumnIds()).boxed()
                 .map(id -> new ColumnRefOperator(id, Type.INVALID, "", true))
                 .collect(Collectors.toMap(identity(), col -> ConstantOperator.createNull(col.getType())));
 
         for (ScalarOperator e : Utils.extractConjuncts(expression)) {
-            ScalarOperator nullEval = new ReplaceColumnRefRewriter(m).visit(e, null);
+            ScalarOperator nullEval = new ReplaceColumnRefRewriter(m).rewrite(e);
 
             ScalarOperatorRewriter scalarRewriter = new ScalarOperatorRewriter();
             //The calculation of the null value is in the constant fold
@@ -182,48 +198,72 @@ public class PushDownPredicateJoinRule extends TransformationRule {
 
         if (join.getJoinType().isCrossJoin() || join.getJoinType().isInnerJoin()) {
             // The effect will be better, first do the range derive, and then do the equivalence derive
-            ScalarOperator predicate = JoinPredicateUtils
-                    .rangePredicateDerive(Utils.compoundAnd(join.getOnPredicate(), filter.getPredicate()));
-            predicate = JoinPredicateUtils.equivalenceDerive(predicate, true);
+            ScalarOperator predicate =
+                    rangePredicateDerive(Utils.compoundAnd(join.getOnPredicate(), filter.getPredicate()));
+            predicate = equivalenceDerive(predicate, true);
             return Lists.newArrayList(pushDownOnPredicate(input.getInputs().get(0), predicate));
         } else {
             if (join.getJoinType().isOuterJoin()) {
                 convertOuterToInner(input);
+                join = (LogicalJoinOperator) input.inputAt(0).getOp();
             }
 
             if (join.getJoinType().isCrossJoin() || join.getJoinType().isInnerJoin()) {
-                ScalarOperator predicate = JoinPredicateUtils
-                        .rangePredicateDerive(Utils.compoundAnd(join.getOnPredicate(), filter.getPredicate()));
-                predicate = JoinPredicateUtils.equivalenceDerive(predicate, true);
+                ScalarOperator predicate =
+                        rangePredicateDerive(Utils.compoundAnd(join.getOnPredicate(), filter.getPredicate()));
+                predicate = equivalenceDerive(predicate, true);
                 return Lists.newArrayList(pushDownOnPredicate(input.getInputs().get(0), predicate));
             } else {
-                ScalarOperator predicate = JoinPredicateUtils.rangePredicateDerive(filter.getPredicate());
+                ScalarOperator predicate = rangePredicateDerive(filter.getPredicate());
                 List<ScalarOperator> leftPushDown = Lists.newArrayList();
                 List<ScalarOperator> rightPushDown = Lists.newArrayList();
-                // For SQl: select * from t1 left join t2 on t1.id = t2.id where t1.id > 1
-                // Infer t2.id > 1 and Push down it to right child
-                if (join.getJoinType().isLeftOuterJoin() || join.getJoinType().isRightOuterJoin()) {
-                    ColumnRefSet leftOutputColumns = joinOpt.getInputs().get(0).getOutputColumns();
-                    ColumnRefSet rightOutputColumns = joinOpt.getInputs().get(1).getOutputColumns();
-                    ScalarOperator derivedPredicate = JoinPredicateUtils.equivalenceDerive(
-                            Utils.compoundAnd(join.getOnPredicate(), filter.getPredicate()), false);
-                    List<ScalarOperator> derivedPredicates = Utils.extractConjuncts(derivedPredicate);
-
-                    if (join.getJoinType().isLeftOuterJoin()) {
-                        for (ScalarOperator p : derivedPredicates) {
-                            if (rightOutputColumns.contains(derivedPredicate.getUsedColumns())) {
-                                rightPushDown.add(p);
-                            }
-                        }
-                    } else if (join.getJoinType().isRightOuterJoin()) {
-                        for (ScalarOperator p : derivedPredicates) {
-                            if (leftOutputColumns.contains(derivedPredicate.getUsedColumns())) {
-                                leftPushDown.add(p);
-                            }
-                        }
-                    }
-                }
+                equivalenceDeriveOnOuterOrSemi(Utils.compoundAnd(join.getOnPredicate(), predicate), joinOpt, join,
+                        leftPushDown, rightPushDown);
                 return Lists.newArrayList(pushDownOuterOrSemiJoin(input, predicate, leftPushDown, rightPushDown));
+            }
+        }
+    }
+
+    private void equivalenceDeriveOnOuterOrSemi(ScalarOperator predicate, OptExpression joinOpt,
+                                                LogicalJoinOperator join, List<ScalarOperator> leftPushDown,
+                                                List<ScalarOperator> rightPushDown) {
+        // For SQl: select * from t1 left join t2 on t1.id = t2.id where t1.id > 1
+        // Infer t2.id > 1 and Push down it to right child
+        if (!join.getJoinType().isSemiJoin() && !join.getJoinType().isOuterJoin()) {
+            return;
+        }
+
+        ColumnRefSet leftOutputColumns = joinOpt.getInputs().get(0).getOutputColumns();
+        ColumnRefSet rightOutputColumns = joinOpt.getInputs().get(1).getOutputColumns();
+
+        ScalarOperator derivedPredicate = equivalenceDerive(predicate, false);
+        List<ScalarOperator> derivedPredicates = Utils.extractConjuncts(derivedPredicate);
+
+        if (join.getJoinType().isLeftSemiJoin()) {
+            for (ScalarOperator p : derivedPredicates) {
+                if (rightOutputColumns.containsAll(p.getUsedColumns())) {
+                    rightPushDown.add(p);
+                }
+            }
+        } else if (join.getJoinType().isLeftOuterJoin()) {
+            for (ScalarOperator p : derivedPredicates) {
+                if (rightOutputColumns.containsAll(p.getUsedColumns()) &&
+                        canEliminateNull(rightOutputColumns, p.clone())) {
+                    rightPushDown.add(p);
+                }
+            }
+        } else if (join.getJoinType().isRightSemiJoin()) {
+            for (ScalarOperator p : derivedPredicates) {
+                if (leftOutputColumns.containsAll(p.getUsedColumns())) {
+                    leftPushDown.add(p);
+                }
+            }
+        } else if (join.getJoinType().isRightOuterJoin()) {
+            for (ScalarOperator p : derivedPredicates) {
+                if (leftOutputColumns.containsAll(p.getUsedColumns()) &&
+                        canEliminateNull(leftOutputColumns, p.clone())) {
+                    leftPushDown.add(p);
+                }
             }
         }
     }

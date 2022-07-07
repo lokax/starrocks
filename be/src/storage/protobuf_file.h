@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -12,11 +12,11 @@ class Message;
 
 namespace starrocks {
 
-class Env;
+class FileSystem;
 
 class ProtobufFile {
 public:
-    ProtobufFile(std::string path, Env* env = nullptr);
+    ProtobufFile(std::string path, FileSystem* fs = nullptr);
     ~ProtobufFile() = default;
 
     Status save(const ::google::protobuf::Message& message, bool sync);
@@ -25,7 +25,7 @@ public:
 
 private:
     std::string _path;
-    Env* _env;
+    FileSystem* _fs;
 };
 
 } // namespace starrocks

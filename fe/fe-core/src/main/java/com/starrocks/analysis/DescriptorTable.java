@@ -28,8 +28,6 @@ import com.starrocks.catalog.PartitionKey;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.IdGenerator;
 import com.starrocks.thrift.TDescriptorTable;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -44,7 +42,6 @@ import java.util.Map;
  * them unique ids..
  */
 public class DescriptorTable {
-    private static final Logger LOG = LogManager.getLogger(DescriptorTable.class);
 
     private final HashMap<TupleId, TupleDescriptor> tupleDescs = new HashMap<TupleId, TupleDescriptor>();
     // List of referenced tables with no associated TupleDescriptor to ship to the BE.
@@ -85,22 +82,6 @@ public class DescriptorTable {
         }
         slotDescs.put(result.getId(), result);
         return result;
-    }
-
-    /**
-     * Create copy of src with new id. The returned descriptor has its mem layout
-     * computed.
-     */
-    public TupleDescriptor copyTupleDescriptor(TupleId srcId, String debugName) {
-        TupleDescriptor d = new TupleDescriptor(tupleIdGenerator_.getNextId(), debugName);
-        tupleDescs.put(d.getId(), d);
-        // create copies of slots
-        TupleDescriptor src = tupleDescs.get(srcId);
-        for (SlotDescriptor slot : src.getSlots()) {
-            copySlotDescriptor(d, slot);
-        }
-        d.computeMemLayout();
-        return d;
     }
 
     /**
@@ -175,9 +156,7 @@ public class DescriptorTable {
             }
         }
 
-        for (Table table : referencedTables) {
-            referencedTbls.add(table);
-        }
+        referencedTbls.addAll(referencedTables);
 
         for (Table tbl : referencedTbls) {
             result.addToTableDescriptors(

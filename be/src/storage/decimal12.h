@@ -25,13 +25,13 @@
 #include <iostream>
 #include <string>
 
-#include "storage/olap_define.h"
+#include "common/status.h"
 
 namespace starrocks {
 
 // the sign of integer must be same as fraction
 struct decimal12_t {
-    decimal12_t() : integer(0), fraction(0) {}
+    decimal12_t() {}
     decimal12_t(int64_t int_part, int32_t frac_part) {
         integer = int_part;
         fraction = frac_part;
@@ -100,14 +100,14 @@ struct decimal12_t {
         return std::string(buf);
     }
 
-    OLAPStatus from_string(const std::string& str);
+    Status from_string(const std::string& str);
 
     static const int32_t FRAC_RATIO = 1000000000;
     static const int32_t MAX_INT_DIGITS_NUM = 18;
     static const int32_t MAX_FRAC_DIGITS_NUM = 9;
 
-    int64_t integer;
-    int32_t fraction;
+    int64_t integer{0};
+    int32_t fraction{0};
 } __attribute__((packed));
 
 inline std::ostream& operator<<(std::ostream& os, const decimal12_t& val) {

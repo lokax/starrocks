@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.operator.logical;
 
 import com.starrocks.catalog.TableFunction;
@@ -11,6 +11,7 @@ import com.starrocks.sql.optimizer.operator.OperatorVisitor;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.Objects;
 
@@ -38,6 +39,14 @@ public class LogicalTableFunctionOperator extends LogicalOperator {
         this(fnResultColumnRefSet, fn, fnParamColumnProjectMap, new ColumnRefSet());
     }
 
+    private LogicalTableFunctionOperator(Builder builder) {
+        super(OperatorType.LOGICAL_TABLE_FUNCTION, builder.getLimit(), builder.getPredicate(), builder.getProjection());
+        this.fnResultColumnRefSet = builder.fnResultColumnRefSet;
+        this.fn = builder.fn;
+        this.fnParamColumnProjectMap = builder.fnParamColumnProjectMap;
+        this.outerColumnRefSet = builder.outerColumnRefSet;
+    }
+
     public ColumnRefSet getFnResultColumnRefSet() {
         return fnResultColumnRefSet;
     }
@@ -60,9 +69,13 @@ public class LogicalTableFunctionOperator extends LogicalOperator {
 
     @Override
     public ColumnRefSet getOutputColumns(ExpressionContext expressionContext) {
-        ColumnRefSet outputColumns = (ColumnRefSet) outerColumnRefSet.clone();
-        outputColumns.union(fnResultColumnRefSet);
-        return outputColumns;
+        if (projection != null) {
+            return new ColumnRefSet(new ArrayList<>(projection.getColumnRefMap().keySet()));
+        } else {
+            ColumnRefSet outputColumns = (ColumnRefSet) outerColumnRefSet.clone();
+            outputColumns.union(fnResultColumnRefSet);
+            return outputColumns;
+        }
     }
 
     @Override
@@ -95,5 +108,29 @@ public class LogicalTableFunctionOperator extends LogicalOperator {
     @Override
     public int hashCode() {
         return Objects.hash(super.hashCode(), fn, fnResultColumnRefSet, outerColumnRefSet, fnParamColumnProjectMap);
+    }
+
+    public static class Builder
+            extends LogicalOperator.Builder<LogicalTableFunctionOperator, LogicalTableFunctionOperator.Builder> {
+        private TableFunction fn;
+        private ColumnRefSet fnResultColumnRefSet;
+        private ColumnRefSet outerColumnRefSet;
+        private Map<ColumnRefOperator, ScalarOperator> fnParamColumnProjectMap;
+
+        @Override
+        public LogicalTableFunctionOperator build() {
+            return new LogicalTableFunctionOperator(this);
+        }
+
+        @Override
+        public LogicalTableFunctionOperator.Builder withOperator(LogicalTableFunctionOperator tableFunctionOperator) {
+            super.withOperator(tableFunctionOperator);
+
+            this.fnResultColumnRefSet = tableFunctionOperator.fnResultColumnRefSet;
+            this.fn = tableFunctionOperator.fn;
+            this.fnParamColumnProjectMap = tableFunctionOperator.fnParamColumnProjectMap;
+            this.outerColumnRefSet = tableFunctionOperator.outerColumnRefSet;
+            return this;
+        }
     }
 }

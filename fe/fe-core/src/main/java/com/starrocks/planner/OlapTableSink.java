@@ -21,18 +21,21 @@
 
 package com.starrocks.planner;
 
+import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Range;
+import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.SlotDescriptor;
 import com.starrocks.analysis.TupleDescriptor;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.DistributionInfo;
+import com.starrocks.catalog.ExpressionRangePartitionInfo;
 import com.starrocks.catalog.HashDistributionInfo;
 import com.starrocks.catalog.KeysType;
+import com.starrocks.catalog.LocalTablet;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
 import com.starrocks.catalog.MaterializedIndexMeta;
@@ -42,7 +45,9 @@ import com.starrocks.catalog.PartitionKey;
 import com.starrocks.catalog.PartitionType;
 import com.starrocks.catalog.RangePartitionInfo;
 import com.starrocks.catalog.Tablet;
+import com.starrocks.catalog.lake.LakeTablet;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
@@ -50,6 +55,7 @@ import com.starrocks.common.InternalErrorCode;
 import com.starrocks.common.Status;
 import com.starrocks.common.UserException;
 import com.starrocks.load.Load;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.thrift.TDataSink;
@@ -66,6 +72,7 @@ import com.starrocks.thrift.TOlapTableSchemaParam;
 import com.starrocks.thrift.TOlapTableSink;
 import com.starrocks.thrift.TTabletLocation;
 import com.starrocks.thrift.TUniqueId;
+import com.starrocks.transaction.TransactionState;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -77,11 +84,12 @@ import java.util.stream.Collectors;
 public class OlapTableSink extends DataSink {
     private static final Logger LOG = LogManager.getLogger(OlapTableSink.class);
 
+    private final int clusterId;
     // input variables
-    private OlapTable dstTable;
-    private TupleDescriptor tupleDescriptor;
+    private final OlapTable dstTable;
+    private final TupleDescriptor tupleDescriptor;
     // specified partition ids. this list should not be empty and should contains all related partition ids
-    private List<Long> partitionIds;
+    private final List<Long> partitionIds;
 
     // set after init called
     private TDataSink tDataSink;
@@ -91,14 +99,22 @@ public class OlapTableSink extends DataSink {
         this.tupleDescriptor = tupleDescriptor;
         Preconditions.checkState(!CollectionUtils.isEmpty(partitionIds));
         this.partitionIds = partitionIds;
+        this.clusterId = dstTable.getClusterId();
     }
 
     public void init(TUniqueId loadId, long txnId, long dbId, long loadChannelTimeoutS) throws AnalysisException {
         TOlapTableSink tSink = new TOlapTableSink();
         tSink.setLoad_id(loadId);
         tSink.setTxn_id(txnId);
+        TransactionState txnState =
+                GlobalStateMgr.getCurrentGlobalTransactionMgr()
+                        .getTransactionState(dbId, txnId);
+        if (txnState != null) {
+            tSink.setTxn_trace_parent(txnState.getTraceParent());
+        }
         tSink.setDb_id(dbId);
         tSink.setLoad_channel_timeout_s(loadChannelTimeoutS);
+        tSink.setIs_lake_table(dstTable.isLakeTable());
         tDataSink = new TDataSink(TDataSinkType.DATA_SPLIT_SINK);
         tDataSink.setType(TDataSinkType.OLAP_TABLE_SINK);
         tDataSink.setOlap_table_sink(tSink);
@@ -262,6 +278,10 @@ public class OlapTableSink extends DataSink {
                         }
                     }
                 }
+                if (rangePartitionInfo instanceof ExpressionRangePartitionInfo) {
+                    ExpressionRangePartitionInfo exprPartitionInfo = (ExpressionRangePartitionInfo) rangePartitionInfo;
+                    partitionParam.setPartition_exprs(Expr.treesToThrift(exprPartitionInfo.getPartitionExprs()));
+                }
                 break;
             }
             case UNPARTITIONED: {
@@ -269,7 +289,14 @@ public class OlapTableSink extends DataSink {
                 Preconditions.checkArgument(table.getPartitions().size() == 1,
                         "Number of table partitions is not 1 for unpartitioned table, partitionNum="
                                 + table.getPartitions().size());
-                Partition partition = table.getPartitions().iterator().next();
+                Partition partition = null;
+                if (partitionIds != null) {
+                    Preconditions.checkState(partitionIds.size() == 1,
+                            "invalid partitionIds size:{}", partitionIds.size());
+                    partition = table.getPartition(partitionIds.get(0));
+                } else {
+                    partition = table.getPartitions().iterator().next();
+                }
 
                 TOlapTablePartition tPartition = new TOlapTablePartition();
                 tPartition.setId(partition.getId());
@@ -299,24 +326,34 @@ public class OlapTableSink extends DataSink {
             Partition partition = table.getPartition(partitionId);
             int quorum = table.getPartitionInfo().getQuorumNum(partition.getId());
             for (MaterializedIndex index : partition.getMaterializedIndices(IndexExtState.ALL)) {
-                // we should ensure the replica backend is alive
-                // otherwise, there will be a 'unknown node id, id=xxx' error for stream load
                 for (Tablet tablet : index.getTablets()) {
-                    Multimap<Long, Long> bePathsMap = tablet.getNormalReplicaBackendPathMap();
-                    if (bePathsMap.keySet().size() < quorum) {
-                        throw new UserException(InternalErrorCode.REPLICA_FEW_ERR,
-                                "tablet " + tablet.getId() + " has few replicas: " + bePathsMap.keySet().size());
+                    if (table.isLakeTable()) {
+                        locationParam.addToTablets(new TTabletLocation(
+                                tablet.getId(), Lists.newArrayList(((LakeTablet) tablet).getPrimaryBackendId())));
+                    } else {
+                        // we should ensure the replica backend is alive
+                        // otherwise, there will be a 'unknown node id, id=xxx' error for stream load
+                        LocalTablet localTablet = (LocalTablet) tablet;
+                        Multimap<Long, Long> bePathsMap =
+                                localTablet.getNormalReplicaBackendPathMap(table.getClusterId());
+                        if (bePathsMap.keySet().size() < quorum) {
+                            throw new UserException(InternalErrorCode.REPLICA_FEW_ERR,
+                                    "Tablet lost replicas. Check if any backend is down or not. tablet_id: "
+                                            + tablet.getId() + ", backends: " +
+                                            Joiner.on(",").join(localTablet.getBackends()));
+                        }
+                        locationParam
+                                .addToTablets(
+                                        new TTabletLocation(tablet.getId(), Lists.newArrayList(bePathsMap.keySet())));
+                        allBePathsMap.putAll(bePathsMap);
                     }
-                    locationParam
-                            .addToTablets(new TTabletLocation(tablet.getId(), Lists.newArrayList(bePathsMap.keySet())));
-                    allBePathsMap.putAll(bePathsMap);
                 }
             }
         }
 
         // check if disk capacity reach limit
         // this is for load process, so use high water mark to check
-        Status st = Catalog.getCurrentSystemInfo().checkExceedDiskCapacityLimit(allBePathsMap, true);
+        Status st = GlobalStateMgr.getCurrentSystemInfo().checkExceedDiskCapacityLimit(allBePathsMap, true);
         if (!st.ok()) {
             throw new DdlException(st.getErrorMsg());
         }
@@ -325,7 +362,7 @@ public class OlapTableSink extends DataSink {
 
     private TNodesInfo createStarrocksNodesInfo() {
         TNodesInfo nodesInfo = new TNodesInfo();
-        SystemInfoService systemInfoService = Catalog.getCurrentSystemInfo();
+        SystemInfoService systemInfoService = GlobalStateMgr.getCurrentState().getOrCreateSystemInfo(clusterId);
         for (Long id : systemInfoService.getBackendIds(false)) {
             Backend backend = systemInfoService.getBackend(id);
             nodesInfo.addToNodes(new TNodeInfo(backend.getId(), 0, backend.getHost(), backend.getBrpcPort()));
@@ -333,5 +370,8 @@ public class OlapTableSink extends DataSink {
         return nodesInfo;
     }
 
+    public boolean canUsePipeLine() {
+        return Config.enable_pipeline_load;
+    }
 }
 

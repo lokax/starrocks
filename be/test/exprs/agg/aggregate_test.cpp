@@ -1,18 +1,32 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include <gtest/gtest.h>
 #include <math.h>
 
+#include <algorithm>
+
+#include "column/array_column.h"
+#include "column/column_builder.h"
+#include "column/fixed_length_column.h"
 #include "column/nullable_column.h"
+#include "column/vectorized_fwd.h"
 #include "exprs/agg/aggregate_factory.h"
+#include "exprs/agg/any_value.h"
 #include "exprs/agg/maxmin.h"
 #include "exprs/agg/nullable_aggregate.h"
 #include "exprs/agg/sum.h"
-#include "runtime/vectorized/time_types.h"
+#include "exprs/anyval_util.h"
+#include "exprs/vectorized/arithmetic_operation.h"
+#include "gen_cpp/Data_types.h"
+#include "gutil/casts.h"
+#include "runtime/mem_pool.h"
+#include "runtime/time_types.h"
 #include "testutil/function_utils.h"
+#include "types/bitmap_value.h"
 #include "udf/udf_internal.h"
-#include "util/bitmap_value.h"
 #include "util/slice.h"
+#include "util/thrift_util.h"
+#include "util/unaligned_access.h"
 
 namespace starrocks::vectorized {
 
@@ -31,10 +45,40 @@ private:
     FunctionContext* ctx{};
 };
 
+class ManagedAggrState {
+public:
+    ~ManagedAggrState() { _func->destroy(_ctx, _state); }
+    static std::unique_ptr<ManagedAggrState> create(FunctionContext* ctx, const AggregateFunction* func) {
+        return std::make_unique<ManagedAggrState>(ctx, func);
+    }
+    AggDataPtr state() { return _state; }
+
+private:
+    ManagedAggrState(FunctionContext* ctx, const AggregateFunction* func) : _ctx(ctx), _func(func) {
+        _state = _mem_pool.allocate_aligned(func->size(), func->alignof_size());
+        _func->create(_ctx, _state);
+    }
+    FunctionContext* _ctx;
+    const AggregateFunction* _func;
+    MemPool _mem_pool;
+    AggDataPtr _state;
+};
+
 template <typename T>
 ColumnPtr gen_input_column1() {
     using DataColumn = typename ColumnTraits<T>::ColumnType;
     auto column = DataColumn::create();
+    for (int i = 0; i < 1024; i++) {
+        column->append(i);
+    }
+    column->append(100);
+    column->append(200);
+    return column;
+}
+
+template <PrimitiveType PT>
+ColumnPtr gen_input_decimal_column1(const FunctionContext::TypeDesc* type_desc) {
+    auto column = RunTimeColumnType<PT>::create(type_desc->precision, type_desc->scale);
     for (int i = 0; i < 1024; i++) {
         column->append(i);
     }
@@ -131,6 +175,15 @@ ColumnPtr gen_input_column2<DateValue>() {
     return column;
 }
 
+template <PrimitiveType PT>
+ColumnPtr gen_input_decimal_column2(const FunctionContext::TypeDesc* type_desc) {
+    auto column = RunTimeColumnType<PT>::create(type_desc->precision, type_desc->scale);
+    for (int i = 2000; i < 3000; i++) {
+        column->append(i);
+    }
+    return column;
+}
+
 template <typename T, typename TResult>
 void test_agg_function(FunctionContext* ctx, const AggregateFunction* func, TResult update_result1,
                        TResult update_result2, TResult merge_result) {
@@ -138,19 +191,21 @@ void test_agg_function(FunctionContext* ctx, const AggregateFunction* func, TRes
     auto result_column = ResultColumn::create();
 
     // update input column 1
-    std::unique_ptr<ManagedAggregateState> state = ManagedAggregateState::Make(func);
-    ColumnPtr column = gen_input_column1<T>();
+    auto aggr_state = ManagedAggrState::create(ctx, func);
+    ColumnPtr column;
+    column = gen_input_column1<T>();
     const Column* row_column = column.get();
-    func->update_batch_single_state(ctx, row_column->size(), &row_column, state->mutable_data());
-    func->finalize_to_column(ctx, state->data(), result_column.get());
+    func->update_batch_single_state(ctx, row_column->size(), &row_column, aggr_state->state());
+    func->finalize_to_column(ctx, aggr_state->state(), result_column.get());
     ASSERT_EQ(update_result1, result_column->get_data()[0]);
 
     // update input column 2
-    std::unique_ptr<ManagedAggregateState> state2 = ManagedAggregateState::Make(func);
-    ColumnPtr column2 = gen_input_column2<T>();
+    auto aggr_state2 = ManagedAggrState::create(ctx, func);
+    ColumnPtr column2;
+    column2 = gen_input_column2<T>();
     row_column = column2.get();
-    func->update_batch_single_state(ctx, row_column->size(), &row_column, state2->mutable_data());
-    func->finalize_to_column(ctx, state2->data(), result_column.get());
+    func->update_batch_single_state(ctx, row_column->size(), &row_column, aggr_state2->state());
+    func->finalize_to_column(ctx, aggr_state2->state(), result_column.get());
     ASSERT_EQ(update_result2, result_column->get_data()[1]);
 
     // merge column 1 and column 2
@@ -159,9 +214,46 @@ void test_agg_function(FunctionContext* ctx, const AggregateFunction* func, TRes
     if (func_name == "count" || func_name == "sum" || func_name == "maxmin") {
         serde_column = ResultColumn::create();
     }
-    func->serialize_to_column(ctx, state->data(), serde_column.get());
-    func->merge(ctx, serde_column.get(), state2->data(), 0);
-    func->finalize_to_column(ctx, state2->data(), result_column.get());
+
+    func->serialize_to_column(ctx, aggr_state->state(), serde_column.get());
+    func->merge(ctx, serde_column.get(), aggr_state2->state(), 0);
+    func->finalize_to_column(ctx, aggr_state2->state(), result_column.get());
+    ASSERT_EQ(merge_result, result_column->get_data()[2]);
+}
+
+template <PrimitiveType PT, typename TResult = RunTimeCppType<TYPE_DECIMAL128>, typename = DecimalPTGuard<PT>>
+void test_decimal_agg_function(FunctionContext* ctx, const AggregateFunction* func, TResult update_result1,
+                               TResult update_result2, TResult merge_result) {
+    using ResultColumn = RunTimeColumnType<TYPE_DECIMAL128>;
+    const auto& result_type = ctx->get_return_type();
+    auto result_column = ResultColumn::create(result_type.precision, result_type.scale);
+
+    // update input column 1
+    auto aggr_state = ManagedAggrState::create(ctx, func);
+    ColumnPtr column = gen_input_decimal_column1<PT>(ctx->get_arg_type(0));
+    const Column* row_column = column.get();
+    func->update_batch_single_state(ctx, row_column->size(), &row_column, aggr_state->state());
+    func->finalize_to_column(ctx, aggr_state->state(), result_column.get());
+    ASSERT_EQ(update_result1, result_column->get_data()[0]);
+
+    // update input column 2
+    auto aggr_state2 = ManagedAggrState::create(ctx, func);
+    ColumnPtr column2 = gen_input_decimal_column2<PT>(ctx->get_arg_type(0));
+    row_column = column2.get();
+    func->update_batch_single_state(ctx, row_column->size(), &row_column, aggr_state2->state());
+    func->finalize_to_column(ctx, aggr_state2->state(), result_column.get());
+    ASSERT_EQ(update_result2, result_column->get_data()[1]);
+
+    // merge column 1 and column 2
+    ColumnPtr serde_column = BinaryColumn::create();
+    std::string func_name = func->get_name();
+    if (func_name == "count" || func_name == "sum" || func_name == "decimal_sum" || func_name == "maxmin") {
+        serde_column = ResultColumn::create(result_type.precision, result_type.scale);
+    }
+
+    func->serialize_to_column(ctx, aggr_state->state(), serde_column.get());
+    func->merge(ctx, serde_column.get(), aggr_state2->state(), 0);
+    func->finalize_to_column(ctx, aggr_state2->state(), result_column.get());
     ASSERT_EQ(merge_result, result_column->get_data()[2]);
 }
 
@@ -171,27 +263,27 @@ void test_agg_variance_function(FunctionContext* ctx, const AggregateFunction* f
     using ResultColumn = typename ColumnTraits<TResult>::ColumnType;
     auto result_column = ResultColumn::create();
 
+    auto state = ManagedAggrState::create(ctx, func);
     // update input column 1
-    std::unique_ptr<ManagedAggregateState> state = ManagedAggregateState::Make(func);
     ColumnPtr column = gen_input_column1<T>();
     const Column* row_column = column.get();
-    func->update_batch_single_state(ctx, row_column->size(), &row_column, state->mutable_data());
-    func->finalize_to_column(ctx, state->data(), result_column.get());
+    func->update_batch_single_state(ctx, row_column->size(), &row_column, state->state());
+    func->finalize_to_column(ctx, state->state(), result_column.get());
     ASSERT_EQ(update_result1, result_column->get_data()[0]);
 
     // update input column 2
-    std::unique_ptr<ManagedAggregateState> state2 = ManagedAggregateState::Make(func);
+    auto state2 = ManagedAggrState::create(ctx, func);
     ColumnPtr column2 = gen_input_column2<T>();
     row_column = column2.get();
-    func->update_batch_single_state(ctx, row_column->size(), &row_column, state2->mutable_data());
-    func->finalize_to_column(ctx, state2->data(), result_column.get());
+    func->update_batch_single_state(ctx, row_column->size(), &row_column, state2->state());
+    func->finalize_to_column(ctx, state2->state(), result_column.get());
     ASSERT_EQ(update_result2, result_column->get_data()[1]);
 
     // merge column 1 and column 2
     ColumnPtr serde_column = BinaryColumn::create();
-    func->serialize_to_column(ctx, state->data(), serde_column.get());
-    func->merge(ctx, serde_column.get(), state2->data(), 0);
-    func->finalize_to_column(ctx, state2->data(), result_column.get());
+    func->serialize_to_column(ctx, state->state(), serde_column.get());
+    func->merge(ctx, serde_column.get(), state2->state(), 0);
+    func->finalize_to_column(ctx, state2->state(), result_column.get());
     ASSERT_TRUE(abs(merge_result - result_column->get_data()[2]) < 1e-8);
 }
 
@@ -233,6 +325,36 @@ TEST_F(AggregateTest, test_sum) {
                                                       DecimalV2Value{24});
 }
 
+TEST_F(AggregateTest, test_decimal_sum) {
+    {
+        const auto* func = get_aggregate_function("decimal_sum", TYPE_DECIMAL32, TYPE_DECIMAL128, false,
+                                                  TFunctionBinaryType::BUILTIN, 3);
+        auto* ctx = FunctionContext::create_test_context(
+                {FunctionContext::TypeDesc{.type = TYPE_DECIMAL32, .precision = 9, .scale = 9}},
+                FunctionContext::TypeDesc{.type = TYPE_DECIMAL128, .precision = 38, .scale = 9});
+        std::unique_ptr<FunctionContext> gc_ctx(ctx);
+        test_decimal_agg_function<TYPE_DECIMAL32>(ctx, func, 524076, 2499500, 3023576);
+    }
+    {
+        const auto* func = get_aggregate_function("decimal_sum", TYPE_DECIMAL64, TYPE_DECIMAL128, false,
+                                                  TFunctionBinaryType::BUILTIN, 3);
+        auto* ctx = FunctionContext::create_test_context(
+                {FunctionContext::TypeDesc{.type = TYPE_DECIMAL64, .precision = 9, .scale = 3}},
+                FunctionContext::TypeDesc{.type = TYPE_DECIMAL128, .precision = 38, .scale = 3});
+        std::unique_ptr<FunctionContext> gc_ctx(ctx);
+        test_decimal_agg_function<TYPE_DECIMAL64>(ctx, func, 524076, 2499500, 3023576);
+    }
+    {
+        const auto* func = get_aggregate_function("decimal_sum", TYPE_DECIMAL128, TYPE_DECIMAL128, false,
+                                                  TFunctionBinaryType::BUILTIN, 3);
+        auto* ctx = FunctionContext::create_test_context(
+                {FunctionContext::TypeDesc{.type = TYPE_DECIMAL128, .precision = 38, .scale = 15}},
+                FunctionContext::TypeDesc{.type = TYPE_DECIMAL128, .precision = 38, .scale = 15});
+        std::unique_ptr<FunctionContext> gc_ctx(ctx);
+        test_decimal_agg_function<TYPE_DECIMAL128>(ctx, func, 524076, 2499500, 3023576);
+    }
+}
+
 TEST_F(AggregateTest, test_avg) {
     const AggregateFunction* func = get_aggregate_function("avg", TYPE_SMALLINT, TYPE_DOUBLE, false);
     test_agg_function<int16_t, double>(ctx, func, 524076 / 1026.0, 2499500 / 1000.0, 3023576 / 2026.0);
@@ -263,6 +385,45 @@ TEST_F(AggregateTest, test_avg) {
 
     func = get_aggregate_function("avg", TYPE_DATE, TYPE_DATE, false);
     test_agg_function<DateValue, DateValue>(ctx, func, DateValue{2454716}, DateValue{2106058}, DateValue{2280387});
+}
+
+TEST_F(AggregateTest, test_decimal_avg) {
+    {
+        const auto* func = get_aggregate_function("decimal_avg", TYPE_DECIMAL32, TYPE_DECIMAL128, false,
+                                                  TFunctionBinaryType::BUILTIN, 3);
+        auto* ctx = FunctionContext::create_test_context(
+                {FunctionContext::TypeDesc{.type = TYPE_DECIMAL32, .precision = 9, .scale = 9}},
+                FunctionContext::TypeDesc{.type = TYPE_DECIMAL128, .precision = 38, .scale = 12});
+        std::unique_ptr<FunctionContext> gc_ctx(ctx);
+        auto update_result1 = decimal_div_integer<int128_t>(524076, 1026, 9);
+        auto update_result2 = decimal_div_integer<int128_t>(2499500, 1000, 9);
+        auto merge_result = decimal_div_integer<int128_t>(3023576, 2026, 9);
+        test_decimal_agg_function<TYPE_DECIMAL32>(ctx, func, update_result1, update_result2, merge_result);
+    }
+    {
+        const auto* func = get_aggregate_function("decimal_avg", TYPE_DECIMAL64, TYPE_DECIMAL128, false,
+                                                  TFunctionBinaryType::BUILTIN, 3);
+        auto* ctx = FunctionContext::create_test_context(
+                {FunctionContext::TypeDesc{.type = TYPE_DECIMAL64, .precision = 9, .scale = 3}},
+                FunctionContext::TypeDesc{.type = TYPE_DECIMAL128, .precision = 38, .scale = 9});
+        std::unique_ptr<FunctionContext> gc_ctx(ctx);
+        auto update_result1 = decimal_div_integer<int128_t>(524076, 1026, 3);
+        auto update_result2 = decimal_div_integer<int128_t>(2499500, 1000, 3);
+        auto merge_result = decimal_div_integer<int128_t>(3023576, 2026, 3);
+        test_decimal_agg_function<TYPE_DECIMAL64>(ctx, func, update_result1, update_result2, merge_result);
+    }
+    {
+        const auto* func = get_aggregate_function("decimal_avg", TYPE_DECIMAL128, TYPE_DECIMAL128, false,
+                                                  TFunctionBinaryType::BUILTIN, 3);
+        auto* ctx = FunctionContext::create_test_context(
+                {FunctionContext::TypeDesc{.type = TYPE_DECIMAL128, .precision = 38, .scale = 15}},
+                FunctionContext::TypeDesc{.type = TYPE_DECIMAL128, .precision = 38, .scale = 15});
+        std::unique_ptr<FunctionContext> gc_ctx(ctx);
+        auto update_result1 = decimal_div_integer<int128_t>(524076, 1026, 15);
+        auto update_result2 = decimal_div_integer<int128_t>(2499500, 1000, 15);
+        auto merge_result = decimal_div_integer<int128_t>(3023576, 2026, 15);
+        test_decimal_agg_function<TYPE_DECIMAL128>(ctx, func, update_result1, update_result2, merge_result);
+    }
 }
 
 TEST_F(AggregateTest, test_variance) {
@@ -617,10 +778,151 @@ TEST_F(AggregateTest, test_sum_distinct) {
                                                       DecimalV2Value(21));
 }
 
+TEST_F(AggregateTest, test_decimal_multi_distinct_sum) {
+    {
+        const auto* func = get_aggregate_function("decimal_multi_distinct_sum", TYPE_DECIMAL32, TYPE_DECIMAL128, false,
+                                                  TFunctionBinaryType::BUILTIN, 3);
+        auto* ctx = FunctionContext::create_test_context(
+                {FunctionContext::TypeDesc{.type = TYPE_DECIMAL32, .precision = 9, .scale = 9}},
+                FunctionContext::TypeDesc{.type = TYPE_DECIMAL128, .precision = 38, .scale = 9});
+        std::unique_ptr<FunctionContext> gc_ctx(ctx);
+        test_decimal_agg_function<TYPE_DECIMAL32>(ctx, func, 523776, 2499500, 3023276);
+    }
+    {
+        const auto* func = get_aggregate_function("decimal_multi_distinct_sum", TYPE_DECIMAL64, TYPE_DECIMAL128, false,
+                                                  TFunctionBinaryType::BUILTIN, 3);
+        auto* ctx = FunctionContext::create_test_context(
+                {FunctionContext::TypeDesc{.type = TYPE_DECIMAL64, .precision = 9, .scale = 3}},
+                FunctionContext::TypeDesc{.type = TYPE_DECIMAL128, .precision = 38, .scale = 3});
+        std::unique_ptr<FunctionContext> gc_ctx(ctx);
+        test_decimal_agg_function<TYPE_DECIMAL64>(ctx, func, 523776, 2499500, 3023276);
+    }
+    {
+        const auto* func = get_aggregate_function("decimal_multi_distinct_sum", TYPE_DECIMAL128, TYPE_DECIMAL128, false,
+                                                  TFunctionBinaryType::BUILTIN, 3);
+        auto* ctx = FunctionContext::create_test_context(
+                {FunctionContext::TypeDesc{.type = TYPE_DECIMAL128, .precision = 38, .scale = 15}},
+                FunctionContext::TypeDesc{.type = TYPE_DECIMAL128, .precision = 38, .scale = 15});
+        std::unique_ptr<FunctionContext> gc_ctx(ctx);
+        test_decimal_agg_function<TYPE_DECIMAL128>(ctx, func, 523776, 2499500, 3023276);
+    }
+}
+
+TEST_F(AggregateTest, test_window_funnel) {
+    std::vector<FunctionContext::TypeDesc> arg_types = {
+            AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_primtive_type(TYPE_BIGINT)),
+            AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_primtive_type(TYPE_DATETIME)),
+            AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_primtive_type(TYPE_INT)),
+            AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_primtive_type(TYPE_ARRAY))};
+
+    auto return_type = AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_primtive_type(TYPE_INT));
+    std::unique_ptr<FunctionContext> local_ctx(FunctionContext::create_test_context(std::move(arg_types), return_type));
+
+    const AggregateFunction* func = get_aggregate_function("window_funnel", TYPE_DATETIME, TYPE_INT, false);
+    ColumnBuilder<TYPE_BOOLEAN> builder(config::vector_chunk_size);
+    // Type.BIGINT, Type.DATETIME, Type.INT, Type.ARRAY_BOOLEAN
+    builder.append(true);
+    builder.append(true);
+    builder.append(true);
+    builder.append(true);
+    builder.append(true);
+    builder.append(true);
+    auto data_col = builder.build(false);
+
+    auto offsets = UInt32Column::create();
+    offsets->append(2);                                    // [true, true]
+    offsets->append(4);                                    // [true, true]
+    offsets->append(6);                                    // [true, true]
+    auto column4 = ArrayColumn::create(data_col, offsets); // array_column, 4th column
+
+    auto column1 = Int64Column::create(); // first column, but there use const.
+    column1->append(1800);
+    // column1->append(1800);
+
+    auto column2 = TimestampColumn::create();
+    column2->append(TimestampValue::create(2022, 6, 10, 12, 30, 30)); // 2nd column.
+
+    auto const_column1 = ColumnHelper::create_const_column<TYPE_BIGINT>(1800, 1);
+    auto column3 = ColumnHelper::create_const_column<TYPE_INT>(2, 1);
+    Columns const_columns;
+    const_columns.emplace_back(const_column1); // first column
+    const_columns.emplace_back(column3);
+    const_columns.emplace_back(column3); // 3rd const column
+    local_ctx->impl()->set_constant_columns(const_columns);
+
+    std::vector<const Column*> raw_column; // to column list.
+    raw_column.resize(4);
+    raw_column[0] = column1.get();
+    raw_column[1] = column2.get();
+    raw_column[2] = column3.get();
+    raw_column[3] = column4.get();
+
+    using ResultColumn = typename ColumnTraits<int32_t>::ColumnType;
+    auto result_column = ResultColumn::create();
+    auto state = ManagedAggrState::create(ctx, func);
+    func->update(local_ctx.get(), raw_column.data(), state->state(), 0);
+    func->finalize_to_column(local_ctx.get(), state->state(), result_column.get());
+    // args: (1800, timestamp, 0, [true, true])
+    // only have one row, but condition is all true, so result is 2.
+    ASSERT_EQ(2, result_column->get_data()[0]);
+}
+
+TEST_F(AggregateTest, test_dict_merge) {
+    const AggregateFunction* func = get_aggregate_function("dict_merge", TYPE_ARRAY, TYPE_VARCHAR, false);
+    ColumnBuilder<TYPE_VARCHAR> builder(config::vector_chunk_size);
+    builder.append(Slice("key1"));
+    builder.append(Slice("key2"));
+    builder.append(Slice("starrocks-1"));
+    builder.append(Slice("starrocks-starrocks"));
+    builder.append(Slice("starrocks-starrocks"));
+    auto data_col = builder.build(false);
+
+    auto offsets = UInt32Column::create();
+    offsets->append(0);
+    offsets->append(0);
+    offsets->append(2);
+    offsets->append(5);
+    // []
+    // [key1, key2]
+    // [sr-1, sr-2, sr-3]
+    auto col = ArrayColumn::create(data_col, offsets);
+    const Column* column = col.get();
+    auto state = ManagedAggrState::create(ctx, func);
+    func->update_batch_single_state(ctx, col->size(), &column, state->state());
+
+    auto res = BinaryColumn::create();
+    func->finalize_to_column(ctx, state->state(), res.get());
+
+    ASSERT_EQ(res->size(), 1);
+    auto slice = res->get_slice(0);
+    std::map<int, std::string> datas;
+    auto dict = from_json_string<TGlobalDict>(std::string(slice.data, slice.size));
+    int sz = dict.ids.size();
+    for (int i = 0; i < sz; ++i) {
+        datas.emplace(dict.ids[i], dict.strings[i]);
+    }
+    ASSERT_EQ(dict.ids.size(), dict.strings.size());
+
+    std::set<std::string> origin_data;
+    std::set<int> ids;
+    auto binary_column = down_cast<BinaryColumn*>(data_col.get());
+    for (int i = 0; i < binary_column->size(); ++i) {
+        auto slice = binary_column->get_slice(i);
+        origin_data.emplace(slice.data, slice.size);
+    }
+
+    for (const auto& [k, v] : datas) {
+        ASSERT_TRUE(origin_data.count(v) != 0);
+        origin_data.erase(v);
+    }
+
+    ASSERT_TRUE(origin_data.empty());
+}
+
 TEST_F(AggregateTest, test_sum_nullable) {
     using NullableSumInt64 = NullableAggregateFunctionState<SumAggregateState<int64_t>>;
     const AggregateFunction* sum_null = get_aggregate_function("sum", TYPE_INT, TYPE_BIGINT, true);
-    std::unique_ptr<ManagedAggregateState> state = ManagedAggregateState::Make(sum_null);
+    auto state = ManagedAggrState::create(ctx, sum_null);
 
     auto data_column = Int32Column::create();
     auto null_column = NullColumn::create();
@@ -633,17 +935,17 @@ TEST_F(AggregateTest, test_sum_nullable) {
     const Column* row_column = column.get();
 
     // test update
-    sum_null->update_batch_single_state(ctx, column->size(), &row_column, state->mutable_data());
-    auto* null_state = (NullableSumInt64*)state->mutable_data();
+    sum_null->update_batch_single_state(ctx, column->size(), &row_column, state->state());
+    auto* null_state = (NullableSumInt64*)state->state();
     int64_t result = *reinterpret_cast<const int64_t*>(null_state->nested_state());
     ASSERT_EQ(2450, result);
 
     // test serialize
     auto serde_column2 = NullableColumn::create(Int64Column::create(), NullColumn::create());
-    sum_null->serialize_to_column(ctx, state->data(), serde_column2.get());
+    sum_null->serialize_to_column(ctx, state->state(), serde_column2.get());
 
     // test merge
-    std::unique_ptr<ManagedAggregateState> state2 = ManagedAggregateState::Make(sum_null);
+    auto state2 = ManagedAggrState::create(ctx, sum_null);
 
     auto data_column2 = Int32Column::create();
     auto null_column2 = NullColumn::create();
@@ -654,12 +956,12 @@ TEST_F(AggregateTest, test_sum_nullable) {
     auto column2 = NullableColumn::create(std::move(data_column2), std::move(null_column2));
     const Column* row_column2 = column2.get();
 
-    sum_null->update_batch_single_state(ctx, column2->size(), &row_column2, state2->mutable_data());
+    sum_null->update_batch_single_state(ctx, column2->size(), &row_column2, state2->state());
 
-    sum_null->merge(ctx, serde_column2.get(), state2->mutable_data(), 0);
+    sum_null->merge(ctx, serde_column2.get(), state2->state(), 0);
 
     auto result_column = NullableColumn::create(Int64Column::create(), NullColumn::create());
-    sum_null->finalize_to_column(ctx, state2->data(), result_column.get());
+    sum_null->finalize_to_column(ctx, state2->state(), result_column.get());
 
     const Column& result_data_column = result_column->data_column_ref();
     const auto& result_data = static_cast<const Int64Column&>(result_data_column);
@@ -668,7 +970,7 @@ TEST_F(AggregateTest, test_sum_nullable) {
 
 TEST_F(AggregateTest, test_count_nullable) {
     const AggregateFunction* func = get_aggregate_function("count", TYPE_BIGINT, TYPE_BIGINT, true);
-    std::unique_ptr<ManagedAggregateState> state = ManagedAggregateState::Make(func);
+    auto state = ManagedAggrState::create(ctx, func);
 
     auto data_column = Int32Column::create();
     auto null_column = NullColumn::create();
@@ -681,15 +983,15 @@ TEST_F(AggregateTest, test_count_nullable) {
     auto column = NullableColumn::create(std::move(data_column), std::move(null_column));
 
     const Column* row_column = column.get();
-    func->update_batch_single_state(ctx, column->size(), &row_column, state->mutable_data());
+    func->update_batch_single_state(ctx, column->size(), &row_column, state->state());
 
-    int64_t result = *reinterpret_cast<int64_t*>(state->mutable_data());
+    int64_t result = *reinterpret_cast<int64_t*>(state->state());
     ASSERT_EQ(512, result);
 }
 
 TEST_F(AggregateTest, test_bitmap_nullable) {
     const AggregateFunction* bitmap_null = get_aggregate_function("bitmap_union_int", TYPE_INT, TYPE_BIGINT, true);
-    std::unique_ptr<ManagedAggregateState> state = ManagedAggregateState::Make(bitmap_null);
+    auto state = ManagedAggrState::create(ctx, bitmap_null);
 
     auto data_column = Int32Column::create();
     auto null_column = NullColumn::create();
@@ -703,10 +1005,10 @@ TEST_F(AggregateTest, test_bitmap_nullable) {
     const Column* row_column = column.get();
 
     // test update
-    bitmap_null->update_batch_single_state(ctx, column->size(), &row_column, state->mutable_data());
+    bitmap_null->update_batch_single_state(ctx, column->size(), &row_column, state->state());
 
     auto result_column = NullableColumn::create(Int64Column::create(), NullColumn::create());
-    bitmap_null->finalize_to_column(ctx, state->data(), result_column.get());
+    bitmap_null->finalize_to_column(ctx, state->state(), result_column.get());
 
     const Column& result_data_column = result_column->data_column_ref();
     const auto& result_data = static_cast<const Int64Column&>(result_data_column);
@@ -717,7 +1019,7 @@ TEST_F(AggregateTest, test_bitmap_nullable) {
 TEST_F(AggregateTest, test_group_concat) {
     const AggregateFunction* group_concat_function =
             get_aggregate_function("group_concat", TYPE_VARCHAR, TYPE_VARCHAR, false);
-    std::unique_ptr<ManagedAggregateState> state = ManagedAggregateState::Make(group_concat_function);
+    auto state = ManagedAggrState::create(ctx, group_concat_function);
 
     auto data_column = BinaryColumn::create();
 
@@ -730,18 +1032,112 @@ TEST_F(AggregateTest, test_group_concat) {
     const Column* row_column = data_column.get();
 
     // test update
-    group_concat_function->update_batch_single_state(ctx, data_column->size(), &row_column, state->mutable_data());
+    group_concat_function->update_batch_single_state(ctx, data_column->size(), &row_column, state->state());
 
     auto result_column = BinaryColumn::create();
-    group_concat_function->finalize_to_column(ctx, state->data(), result_column.get());
+    group_concat_function->finalize_to_column(ctx, state->state(), result_column.get());
 
     ASSERT_EQ("starrocks0, starrocks1, starrocks2, starrocks3, starrocks4, starrocks5", result_column->get_data()[0]);
+}
+
+TEST_F(AggregateTest, test_group_concat_const_seperator) {
+    std::vector<FunctionContext::TypeDesc> arg_types = {
+            AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_primtive_type(TYPE_VARCHAR)),
+            AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_primtive_type(TYPE_VARCHAR))};
+
+    auto return_type = AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_primtive_type(TYPE_VARCHAR));
+    std::unique_ptr<FunctionContext> local_ctx(FunctionContext::create_test_context(std::move(arg_types), return_type));
+
+    const AggregateFunction* group_concat_function =
+            get_aggregate_function("group_concat", TYPE_VARCHAR, TYPE_VARCHAR, false);
+    auto state = ManagedAggrState::create(ctx, group_concat_function);
+
+    auto data_column = BinaryColumn::create();
+
+    data_column->append("abc");
+    data_column->append("bcd");
+    data_column->append("cde");
+    data_column->append("def");
+    data_column->append("efg");
+    data_column->append("fgh");
+    data_column->append("ghi");
+    data_column->append("hij");
+    data_column->append("ijk");
+
+    auto separator_column = ColumnHelper::create_const_column<TYPE_VARCHAR>("", 1);
+
+    std::vector<const Column*> raw_columns;
+    raw_columns.resize(2);
+    raw_columns[0] = data_column.get();
+    raw_columns[1] = separator_column.get();
+
+    Columns const_columns;
+    const_columns.emplace_back(data_column);
+    const_columns.emplace_back(separator_column);
+    local_ctx->impl()->set_constant_columns(const_columns);
+
+    // test update
+    group_concat_function->update_batch_single_state(local_ctx.get(), data_column->size(), raw_columns.data(),
+                                                     state->state());
+
+    auto result_column = BinaryColumn::create();
+    group_concat_function->finalize_to_column(local_ctx.get(), state->state(), result_column.get());
+
+    ASSERT_EQ("abcbcdcdedefefgfghghihijijk", result_column->get_data()[0]);
+}
+
+TEST_F(AggregateTest, test_percentile_cont) {
+    std::vector<FunctionContext::TypeDesc> arg_types = {
+            AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_primtive_type(TYPE_DOUBLE)),
+            AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_primtive_type(TYPE_DOUBLE))};
+    auto return_type = AnyValUtil::column_type_to_type_desc(TypeDescriptor::from_primtive_type(TYPE_DOUBLE));
+    std::unique_ptr<FunctionContext> local_ctx(FunctionContext::create_test_context(std::move(arg_types), return_type));
+
+    const AggregateFunction* func = get_aggregate_function("percentile_cont", TYPE_DOUBLE, TYPE_DOUBLE, false);
+
+    // update input column 1
+    auto state1 = ManagedAggrState::create(ctx, func);
+
+    auto data_column1 = DoubleColumn::create();
+    auto const_colunm1 = ColumnHelper::create_const_column<TYPE_DOUBLE>(0.1, 1);
+    data_column1->append(3.0);
+    data_column1->append(3.0);
+
+    std::vector<const Column*> raw_columns1;
+    raw_columns1.resize(2);
+    raw_columns1[0] = data_column1.get();
+    raw_columns1[1] = const_colunm1.get();
+
+    func->update_batch_single_state(local_ctx.get(), data_column1->size(), raw_columns1.data(), state1->state());
+
+    // update input column 2
+    auto state2 = ManagedAggrState::create(ctx, func);
+
+    auto data_column2 = DoubleColumn::create();
+    auto const_colunm2 = ColumnHelper::create_const_column<TYPE_DOUBLE>(0.1, 1);
+    data_column2->append(6.0);
+
+    std::vector<const Column*> raw_columns2;
+    raw_columns2.resize(2);
+    raw_columns2[0] = data_column2.get();
+    raw_columns2[1] = const_colunm2.get();
+
+    func->update_batch_single_state(local_ctx.get(), data_column2->size(), raw_columns2.data(), state2->state());
+
+    // merge column 1 and column 2
+    ColumnPtr serde_column = BinaryColumn::create();
+    auto result_column = DoubleColumn::create();
+    func->serialize_to_column(local_ctx.get(), state1->state(), serde_column.get());
+    func->merge(local_ctx.get(), serde_column.get(), state2->state(), 0);
+    func->finalize_to_column(local_ctx.get(), state2->state(), result_column.get());
+
+    ASSERT_EQ(3, result_column->get_data()[0]);
 }
 
 TEST_F(AggregateTest, test_intersect_count) {
     const AggregateFunction* group_concat_function =
             get_aggregate_function("intersect_count", TYPE_INT, TYPE_BIGINT, false);
-    std::unique_ptr<ManagedAggregateState> state = ManagedAggregateState::Make(group_concat_function);
+    auto state = ManagedAggrState::create(ctx, group_concat_function);
 
     auto data_column = BitmapColumn::create();
     auto int_column = Int32Column::create();
@@ -785,11 +1181,10 @@ TEST_F(AggregateTest, test_intersect_count) {
     ctx->impl()->set_constant_columns(const_columns);
 
     // test update
-    group_concat_function->update_batch_single_state(ctx, data_column->size(), raw_columns.data(),
-                                                     state->mutable_data());
+    group_concat_function->update_batch_single_state(ctx, data_column->size(), raw_columns.data(), state->state());
 
     auto result_column = Int64Column::create();
-    group_concat_function->finalize_to_column(ctx, state->data(), result_column.get());
+    group_concat_function->finalize_to_column(ctx, state->state(), result_column.get());
 
     ASSERT_EQ(1, result_column->get_data()[0]);
 }
@@ -797,7 +1192,7 @@ TEST_F(AggregateTest, test_intersect_count) {
 TEST_F(AggregateTest, test_bitmap_intersect) {
     const AggregateFunction* group_concat_function =
             get_aggregate_function("bitmap_intersect", TYPE_OBJECT, TYPE_OBJECT, false);
-    std::unique_ptr<ManagedAggregateState> state = ManagedAggregateState::Make(group_concat_function);
+    auto state = ManagedAggrState::create(ctx, group_concat_function);
 
     auto data_column = BitmapColumn::create();
 
@@ -818,18 +1213,48 @@ TEST_F(AggregateTest, test_bitmap_intersect) {
     const Column* row_column = data_column.get();
 
     // test update
-    group_concat_function->update_batch_single_state(ctx, data_column->size(), &row_column, state->mutable_data());
+    group_concat_function->update_batch_single_state(ctx, data_column->size(), &row_column, state->state());
 
     auto result_column = BitmapColumn::create();
-    group_concat_function->finalize_to_column(ctx, state->data(), result_column.get());
+    group_concat_function->finalize_to_column(ctx, state->state(), result_column.get());
 
     ASSERT_EQ("1", result_column->get_pool()[0].to_string());
+}
+
+TEST_F(AggregateTest, test_histogram) {
+    const AggregateFunction* histogram_function = get_aggregate_function("histogram", TYPE_BIGINT, TYPE_VARCHAR, true);
+    auto state = ManagedAggrState::create(ctx, histogram_function);
+
+    auto data_column = gen_input_column1<int64_t>();
+    auto const1 = ColumnHelper::create_const_column<TYPE_INT>(data_column->size(), data_column->size());
+    auto const2 = ColumnHelper::create_const_column<TYPE_INT>(data_column->size(), data_column->size());
+    auto const3 = ColumnHelper::create_const_column<TYPE_INT>(10, data_column->size());
+
+    std::vector<const Column*> raw_columns;
+    raw_columns.resize(4);
+    raw_columns[0] = data_column.get();
+    raw_columns[1] = const1.get();
+    raw_columns[2] = const2.get();
+    raw_columns[3] = const3.get();
+    for (int i = 0; i < data_column->size(); ++i) {
+        histogram_function->update(ctx, raw_columns.data(), state->state(), i);
+    }
+
+    auto result_column = NullableColumn::create(BinaryColumn::create(), NullColumn::create());
+    histogram_function->finalize_to_column(ctx, state->state(), result_column.get());
+    ASSERT_EQ(
+            "['{ \"buckets\" : "
+            "[[\"0\",\"101\",\"102\",\"1\"],[\"102\",\"203\",\"204\",\"1\"],[\"204\",\"305\",\"306\",\"1\"],[\"306\","
+            "\"407\",\"408\",\"1\"],[\"408\",\"509\",\"510\",\"1\"],[\"510\",\"611\",\"612\",\"1\"],[\"612\",\"713\","
+            "\"714\",\"1\"],[\"714\",\"815\",\"816\",\"1\"],[\"816\",\"917\",\"918\",\"1\"],[\"918\",\"1019\",\"1020\","
+            "\"1\"],[\"1020\",\"200\",\"1026\",\"1\"]] }']",
+            result_column->debug_string());
 }
 
 TEST_F(AggregateTest, test_bitmap_intersect_nullable) {
     const AggregateFunction* group_concat_function =
             get_aggregate_function("bitmap_intersect", TYPE_OBJECT, TYPE_OBJECT, true);
-    std::unique_ptr<ManagedAggregateState> state = ManagedAggregateState::Make(group_concat_function);
+    auto state = ManagedAggrState::create(ctx, group_concat_function);
 
     auto data_column = BitmapColumn::create();
     auto null_column = NullColumn::create();
@@ -855,15 +1280,82 @@ TEST_F(AggregateTest, test_bitmap_intersect_nullable) {
     const Column* row_column = column.get();
 
     // test update
-    group_concat_function->update_batch_single_state(ctx, column->size(), &row_column, state->mutable_data());
+    group_concat_function->update_batch_single_state(ctx, column->size(), &row_column, state->state());
 
     auto result_column = NullableColumn::create(BitmapColumn::create(), NullColumn::create());
-    group_concat_function->finalize_to_column(ctx, state->data(), result_column.get());
+    group_concat_function->finalize_to_column(ctx, state->state(), result_column.get());
 
     const Column& result_data_column = result_column->data_column_ref();
     const auto& result_data = static_cast<const BitmapColumn&>(result_data_column);
 
     ASSERT_EQ("1", result_data.get_pool()[0].to_string());
+}
+
+template <typename T, typename TResult>
+void test_non_deterministic_agg_function(FunctionContext* ctx, const AggregateFunction* func) {
+    using ResultColumn = typename ColumnTraits<TResult>::ColumnType;
+    using ExpeactedResultColumnType = typename ColumnTraits<T>::ColumnType;
+    auto state = ManagedAggrState::create(ctx, func);
+    // update input column 1
+    auto result_column1 = ResultColumn::create();
+    ColumnPtr column = gen_input_column1<T>();
+    const Column* row_column = column.get();
+    func->update_batch_single_state(ctx, row_column->size(), &row_column, state->state());
+    func->finalize_to_column(ctx, state->state(), result_column1.get());
+
+    auto expected_column1 = down_cast<const ExpeactedResultColumnType&>(row_column[0]);
+    ASSERT_EQ(expected_column1.get_data()[0], result_column1->get_data()[0]);
+
+    // update input column 2
+    auto result_column2 = ResultColumn::create();
+    auto state2 = ManagedAggrState::create(ctx, func);
+    ColumnPtr column2 = gen_input_column2<T>();
+    row_column = column2.get();
+    func->update_batch_single_state(ctx, row_column->size(), &row_column, state2->state());
+    func->finalize_to_column(ctx, state2->state(), result_column2.get());
+
+    auto expected_column2 = down_cast<const ExpeactedResultColumnType&>(row_column[0]);
+    ASSERT_EQ(expected_column2.get_data()[0], result_column2->get_data()[0]);
+
+    // merge column 1 and column 2
+    auto final_result_column = ResultColumn::create();
+    func->serialize_to_column(ctx, state->state(), final_result_column.get());
+    func->merge(ctx, final_result_column.get(), state2->state(), 0);
+    func->finalize_to_column(ctx, state2->state(), final_result_column.get());
+
+    ASSERT_EQ(final_result_column->get_data()[0], result_column1->get_data()[0]);
+}
+
+TEST_F(AggregateTest, test_any_value) {
+    const AggregateFunction* func = get_aggregate_function("any_value", TYPE_SMALLINT, TYPE_SMALLINT, false);
+    test_non_deterministic_agg_function<int16_t, int16_t>(ctx, func);
+
+    func = get_aggregate_function("any_value", TYPE_INT, TYPE_INT, false);
+    test_non_deterministic_agg_function<int32_t, int32_t>(ctx, func);
+
+    func = get_aggregate_function("any_value", TYPE_BIGINT, TYPE_BIGINT, false);
+    test_non_deterministic_agg_function<int64_t, int64_t>(ctx, func);
+
+    func = get_aggregate_function("any_value", TYPE_LARGEINT, TYPE_LARGEINT, false);
+    test_non_deterministic_agg_function<int128_t, int128_t>(ctx, func);
+
+    func = get_aggregate_function("any_value", TYPE_FLOAT, TYPE_FLOAT, false);
+    test_non_deterministic_agg_function<float, float>(ctx, func);
+
+    func = get_aggregate_function("any_value", TYPE_DOUBLE, TYPE_DOUBLE, false);
+    test_non_deterministic_agg_function<double, double>(ctx, func);
+
+    func = get_aggregate_function("any_value", TYPE_VARCHAR, TYPE_VARCHAR, false);
+    test_non_deterministic_agg_function<Slice, Slice>(ctx, func);
+
+    func = get_aggregate_function("any_value", TYPE_DECIMALV2, TYPE_DECIMALV2, false);
+    test_non_deterministic_agg_function<DecimalV2Value, DecimalV2Value>(ctx, func);
+
+    func = get_aggregate_function("any_value", TYPE_DATETIME, TYPE_DATETIME, false);
+    test_non_deterministic_agg_function<TimestampValue, TimestampValue>(ctx, func);
+
+    func = get_aggregate_function("any_value", TYPE_DATE, TYPE_DATE, false);
+    test_non_deterministic_agg_function<DateValue, DateValue>(ctx, func);
 }
 
 } // namespace starrocks::vectorized

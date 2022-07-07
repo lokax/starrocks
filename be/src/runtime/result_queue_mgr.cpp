@@ -22,12 +22,9 @@
 #include "runtime/result_queue_mgr.h"
 
 #include "common/config.h"
-#include "common/logging.h"
 #include "common/status.h"
-#include "gen_cpp/DorisExternalService_types.h"
+#include "gen_cpp/StarrocksExternalService_types.h"
 #include "gen_cpp/Types_types.h"
-#include "runtime/exec_env.h"
-#include "util/arrow/row_batch.h"
 #include "util/starrocks_metrics.h"
 
 namespace starrocks {
@@ -41,7 +38,7 @@ ResultQueueMgr::ResultQueueMgr() {
     });
 }
 
-ResultQueueMgr::~ResultQueueMgr() {}
+ResultQueueMgr::~ResultQueueMgr() = default;
 
 Status ResultQueueMgr::fetch_result(const TUniqueId& fragment_instance_id, std::shared_ptr<arrow::RecordBatch>* result,
                                     bool* eos) {

@@ -24,7 +24,6 @@ package com.starrocks.common.proc;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Pair;
 import com.starrocks.common.util.Counter;
@@ -33,9 +32,10 @@ import com.starrocks.common.util.RuntimeProfile;
 import com.starrocks.proto.PTriggerProfileReportResult;
 import com.starrocks.proto.PUniqueId;
 import com.starrocks.qe.QueryStatisticsItem;
-import com.starrocks.rpc.BackendServiceProxy;
+import com.starrocks.rpc.BackendServiceClient;
 import com.starrocks.rpc.PTriggerProfileReportRequest;
 import com.starrocks.rpc.RpcException;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TStatusCode;
@@ -229,7 +229,7 @@ public class CurrentQueryInfoProvider {
             final PTriggerProfileReportRequest pbRequest =
                     new PTriggerProfileReportRequest(request.getInstanceIds());
             try {
-                futures.add(Pair.create(request, BackendServiceProxy.getInstance().
+                futures.add(Pair.create(request, BackendServiceClient.getInstance().
                         triggerProfileReportAsync(address, pbRequest)));
             } catch (RpcException e) {
                 throw new AnalysisException("Sending request fails for query's execution informations.");
@@ -245,11 +245,11 @@ public class CurrentQueryInfoProvider {
             try {
                 final PTriggerProfileReportResult result
                         = pair.second.get(2, TimeUnit.SECONDS);
-                final TStatusCode code = TStatusCode.findByValue(result.status.status_code);
+                final TStatusCode code = TStatusCode.findByValue(result.status.statusCode);
                 if (code != TStatusCode.OK) {
                     String errMsg = "";
-                    if (result.status.error_msgs != null && !result.status.error_msgs.isEmpty()) {
-                        errMsg = result.status.error_msgs.get(0);
+                    if (result.status.errorMsgs != null && !result.status.errorMsgs.isEmpty()) {
+                        errMsg = result.status.errorMsgs.get(0);
                     }
                     throw new AnalysisException(reasonPrefix + " backend:" + pair.first.getAddress()
                             + " reason:" + errMsg);
@@ -263,7 +263,7 @@ public class CurrentQueryInfoProvider {
     }
 
     private TNetworkAddress toBrpcHost(TNetworkAddress host) throws AnalysisException {
-        final Backend backend = Catalog.getCurrentSystemInfo().getBackendWithBePort(
+        final Backend backend = GlobalStateMgr.getCurrentSystemInfo().getBackendWithBePort(
                 host.getHostname(), host.getPort());
         if (backend == null) {
             throw new AnalysisException(new StringBuilder("Backend ")

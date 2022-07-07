@@ -89,7 +89,7 @@ public class ShowRoutineLoadTaskStmt extends ShowStmt {
             }
             dbFullName = analyzer.getDefaultDb();
         } else {
-            dbFullName = ClusterNamespace.getFullName(analyzer.getClusterName(), dbName);
+            dbFullName = ClusterNamespace.getFullName(dbName);
         }
     }
 
@@ -150,7 +150,7 @@ public class ShowRoutineLoadTaskStmt extends ShowStmt {
 
     @Override
     public RedirectStatus getRedirectStatus() {
-        return RedirectStatus.FORWARD_NO_SYNC;
+        return RedirectStatus.FORWARD_WITH_SYNC;
     }
 
     public static List<String> getTitleNames() {

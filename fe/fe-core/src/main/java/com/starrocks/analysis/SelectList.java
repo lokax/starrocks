@@ -21,13 +21,11 @@
 
 package com.starrocks.analysis;
 
-import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
-import com.starrocks.common.AnalysisException;
-import com.starrocks.rewrite.ExprRewriter;
 
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Select list items plus distinct clause.
@@ -94,26 +92,17 @@ public class SelectList {
         }
     }
 
-    public void rewriteExprs(ExprRewriter rewriter, Analyzer analyzer)
-            throws AnalysisException {
-        for (SelectListItem item : items) {
-            if (item.isStar()) {
-                continue;
-            }
-            // equal subquery in select list
-            if (item.getExpr().contains(Predicates.instanceOf(Subquery.class))) {
-                List<Subquery> subqueryExprs = Lists.newArrayList();
-                item.getExpr().collect(Subquery.class, subqueryExprs);
-                for (Subquery s : subqueryExprs) {
-                    s.getStatement().rewriteExprs(rewriter);
-                }
-            }
-            item.setExpr(rewriter.rewrite(item.getExpr(), analyzer));
-        }
-    }
-
     @Override
     public SelectList clone() {
         return new SelectList(this);
+    }
+
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder("SelectList{");
+        sb.append("isDistinct=").append(isDistinct);
+        sb.append(", selectItems=").append(items.stream().map(v -> v.toSql()).collect(Collectors.toList()));
+        sb.append("}");
+        return sb.toString();
     }
 }

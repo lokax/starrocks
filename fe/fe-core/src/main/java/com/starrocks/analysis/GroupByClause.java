@@ -21,10 +21,12 @@
 
 package com.starrocks.analysis;
 
+import com.clearspring.analytics.util.Lists;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Predicates;
-import com.starrocks.catalog.Type;
+import com.google.common.collect.HashBasedTable;
+import com.google.common.collect.Table;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.sql.ast.AstVisitor;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -47,22 +49,18 @@ import java.util.stream.Collectors;
  * GROUPING SETS produce a single result set that is equivalent to a UNION ALL of differently grouped rows.
  * In this class we produce the rule of generating rows base on the group by clause.
  */
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public class GroupByClause implements ParseNode {
     private static final Logger LOG = LogManager.getLogger(GroupByClause.class);
-
-    // max num of distinct sets in grouping sets clause
-    private static final int MAX_GROUPING_SETS_NUM = 64;
-    // max num of distinct expressions
-    private boolean analyzed_ = false;
     private boolean exprGenerated = false;
     private GroupingType groupingType;
     private ArrayList<Expr> groupingExprs;
     private ArrayList<Expr> oriGroupingExprs;
     // reserve this info for toSQL
     private List<ArrayList<Expr>> groupingSetList;
+
+    private Table<Integer, Integer, Integer> groupingSetIndexToGroupingExprs;
+
+    protected boolean needToSql = false;
 
     public GroupByClause(List<ArrayList<Expr>> groupingSetList, GroupingType type) {
         this.groupingType = type;
@@ -102,7 +100,6 @@ public class GroupByClause implements ParseNode {
 
     public void reset() {
         groupingExprs = new ArrayList<>();
-        analyzed_ = false;
         exprGenerated = false;
         if (oriGroupingExprs != null) {
             Expr.resetList(oriGroupingExprs);
@@ -156,64 +153,32 @@ public class GroupByClause implements ParseNode {
                 throw new AnalysisException("The expresions in GROUPINGING SETS can not be empty");
             }
             // collect all Expr elements
-            Set<Expr> groupingExprSet = new LinkedHashSet<>();
-            for (ArrayList<Expr> list : groupingSetList) {
-                groupingExprSet.addAll(list);
+            groupingSetIndexToGroupingExprs = HashBasedTable.create();
+            groupingExprs = new ArrayList<>();
+            for (int i = 0; i < groupingSetList.size(); i++) {
+                for (int j = 0; j < groupingSetList.get(i).size(); j++) {
+                    if (!groupingExprs.contains(groupingSetList.get(i).get(j))) {
+                        groupingSetIndexToGroupingExprs.put(i, j, groupingExprs.size());
+                        groupingExprs.add(groupingSetList.get(i).get(j));
+                    } else {
+                        groupingSetIndexToGroupingExprs.put(i, j, groupingExprs.indexOf(groupingSetList.get(i).get(j)));
+                    }
+                }
             }
-            groupingExprs = new ArrayList<>(groupingExprSet);
         }
         exprGenerated = true;
     }
 
     @Override
     public void analyze(Analyzer analyzer) throws AnalysisException {
-        if (analyzed_) {
-            return;
-        }
-        genGroupingExprs();
-
-        // disallow subqueries in the GROUP BY clause
-        for (Expr expr : groupingExprs) {
-            if (expr.contains(Predicates.instanceOf(Subquery.class))) {
-                throw new AnalysisException(
-                        "Subqueries are not supported in the GROUP BY clause.");
-            }
-        }
-        //TODO add the analysis for grouping and grouping_id functions
-        for (Expr groupingExpr : groupingExprs) {
-            groupingExpr.analyze(analyzer);
-            if (groupingExpr.contains(Expr.isAggregatePredicate())) {
-                // reference the original expr in the error msg
-                throw new AnalysisException(
-                        "GROUP BY expression must not contain aggregate functions: "
-                                + groupingExpr.toSql());
-            }
-            if (groupingExpr.contains(AnalyticExpr.class)) {
-                // reference the original expr in the error msg
-                throw new AnalysisException(
-                        "GROUP BY expression must not contain analytic expressions: "
-                                + groupingExpr.toSql());
-            }
-
-            if (groupingExpr.type.isOnlyMetricType()) {
-                throw new AnalysisException(Type.OnlyMetricTypeErrorMsg);
-            }
-        }
-
-        if (isGroupByExtension() && groupingExprs != null && groupingExprs.size() > MAX_GROUPING_SETS_NUM) {
-            throw new AnalysisException("Too many sets in GROUP BY clause, the max grouping sets item is "
-                    + MAX_GROUPING_SETS_NUM);
-        }
-        analyzed_ = true;
-    }
-
-    // check if group by clause is contain grouping set/rollup/cube
-    public boolean isGroupByExtension() {
-        return groupingType != GroupingType.GROUP_BY;
     }
 
     @Override
     public String toSql() {
+        if (needToSql) {
+            return toViewSql();
+        }
+
         StringBuilder strBuilder = new StringBuilder();
         switch (groupingType) {
             case GROUP_BY:
@@ -270,6 +235,54 @@ public class GroupByClause implements ParseNode {
         return strBuilder.toString();
     }
 
+    private String toViewSql() {
+        StringBuilder strBuilder = new StringBuilder();
+        switch (groupingType) {
+            case GROUP_BY:
+                if (groupingExprs != null) {
+                    strBuilder.append(groupingExprs.stream().map(Expr::toSql).collect(Collectors.joining(", ")));
+                }
+                break;
+            case GROUPING_SETS:
+                if (groupingSetList != null) {
+                    Preconditions.checkState(groupingSetIndexToGroupingExprs != null);
+                    strBuilder.append("GROUPING SETS (");
+                    List<String> allExprs = Lists.newArrayList();
+                    List<String> rows = Lists.newArrayList();
+                    for (int i = 0; i < groupingSetList.size(); i++) {
+                        rows.clear();
+                        for (int j = 0; j < groupingSetList.get(i).size(); j++) {
+                            Expr e = groupingExprs.get(groupingSetIndexToGroupingExprs.get(i, j));
+                            rows.add(e.toSql());
+                        }
+                        allExprs.add("(" + String.join(", ", rows) + ")");
+                    }
+                    strBuilder.append(String.join(", ", allExprs));
+                    strBuilder.append(")");
+                }
+                break;
+            case CUBE:
+                if (groupingExprs != null) {
+                    strBuilder.append("CUBE (");
+                    strBuilder.append(groupingExprs.stream().filter(e -> !(e instanceof VirtualSlotRef))
+                            .map(Expr::toSql).collect(Collectors.joining(", ")));
+                    strBuilder.append(")");
+                }
+                break;
+            case ROLLUP:
+                if (groupingExprs != null) {
+                    strBuilder.append("ROLLUP (");
+                    strBuilder.append(groupingExprs.stream().filter(e -> !(e instanceof VirtualSlotRef))
+                            .map(Expr::toSql).collect(Collectors.joining(", ")));
+                    strBuilder.append(")");
+                }
+                break;
+            default:
+                break;
+        }
+        return strBuilder.toString();
+    }
+
     @Override
     public GroupByClause clone() {
         return new GroupByClause(this);
@@ -293,5 +306,10 @@ public class GroupByClause implements ParseNode {
         GROUPING_SETS,
         ROLLUP,
         CUBE
+    }
+
+    @Override
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
+        return visitor.visitGroupByClause(this, context);
     }
 }

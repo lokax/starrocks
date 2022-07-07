@@ -19,17 +19,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_QUERY_EXPRS_EXPR_CONTEXT_H
-#define STARROCKS_BE_SRC_QUERY_EXPRS_EXPR_CONTEXT_H
+#pragma once
 
 #include <memory>
 
-#include "column/chunk.h"
-#include "column/column.h"
+#include "column/vectorized_fwd.h"
 #include "common/status.h"
-#include "exprs/expr_value.h"
 #include "udf/udf.h"
 #include "udf/udf_internal.h" // for ArrayVal
+// Only include column/vectorized_fwd.h in this file, you need include what you need
+// in the source files. Please NOT add unnecessary includes in this file.
 
 #undef USING_STARROCKS_UDF
 #define USING_STARROCKS_UDF using namespace starrocks_udf
@@ -47,9 +46,7 @@ class Expr;
 class MemPool;
 class MemTracker;
 class RuntimeState;
-class RowDescriptor;
 class TColumnValue;
-class TupleRow;
 
 using vectorized::ColumnPtr;
 
@@ -57,6 +54,7 @@ using vectorized::ColumnPtr;
 /// the FunctionContexts necessary for the expr tree. This allows for multi-threaded
 /// expression evaluation, as a given tree can be evaluated using multiple ExprContexts
 /// concurrently. A single ExprContext is not thread-safe.
+
 class ExprContext {
 public:
     ExprContext(Expr* root);
@@ -64,14 +62,13 @@ public:
 
     /// Prepare expr tree for evaluation.
     /// Allocations from this context will be counted against 'tracker'.
-    Status prepare(RuntimeState* state, const RowDescriptor& row_desc, MemTracker* tracker);
+    Status prepare(RuntimeState* state);
 
     /// Must be called after calling Prepare(). Does not need to be called on clones.
     /// Idempotent (this allows exprs to be opened multiple times in subplans without
     /// reinitializing function state).
     Status open(RuntimeState* state);
 
-    //TODO chenhao
     static Status open(std::vector<ExprContext*> input_evals, RuntimeState* state);
 
     /// Creates a copy of this ExprContext. Open() must be called first. The copy contains
@@ -86,33 +83,6 @@ public:
 
     /// Closes all FunctionContexts. Must be called on every ExprContext, including clones.
     void close(RuntimeState* state);
-
-    /// Calls the appropriate Get*Val() function on this context's expr tree and stores the
-    /// result in result_.
-    void* get_value(TupleRow* row);
-
-    /// Convenience function: extract value into col_val and sets the
-    /// appropriate __isset flag.
-    /// If the value is NULL and as_ascii is false, nothing is set.
-    /// If 'as_ascii' is true, writes the value in ascii into stringVal
-    /// (nulls turn into "NULL");
-    /// if it is false, the specific field in col_val that receives the value is
-    /// based on the type of the expr:
-    /// TYPE_BOOLEAN: boolVal
-    /// TYPE_TINYINT/SMALLINT/INT: intVal
-    /// TYPE_BIGINT: longVal
-    /// TYPE_FLOAT/DOUBLE: doubleVal
-    /// TYPE_STRING: stringVal
-    /// TYPE_TIMESTAMP: stringVal
-    /// Note: timestamp is converted to string via RawValue::PrintValue because HiveServer2
-    /// requires timestamp in a string format.
-    void get_value(TupleRow* row, bool as_ascii, TColumnValue* col_val);
-
-    /// Convenience functions: print value into 'str' or 'stream'.  NULL turns into "NULL".
-    void print_value(TupleRow* row, std::string* str);
-    void print_value(void* value, std::string* str);
-    void print_value(void* value, std::stringstream* stream);
-    void print_value(TupleRow* row, std::stringstream* stream);
 
     /// Creates a FunctionContext, and returns the index that's passed to fn_context() to
     /// retrieve the created context. Exprs that need a FunctionContext should call this in
@@ -133,38 +103,7 @@ public:
 
     bool closed() { return _closed; }
 
-    bool is_nullable();
-
-    /// Calls Get*Val on _root
-    BooleanVal get_boolean_val(TupleRow* row);
-    TinyIntVal get_tiny_int_val(TupleRow* row);
-    SmallIntVal get_small_int_val(TupleRow* row);
-    IntVal get_int_val(TupleRow* row);
-    BigIntVal get_big_int_val(TupleRow* row);
-    FloatVal get_float_val(TupleRow* row);
-    DoubleVal get_double_val(TupleRow* row);
-    StringVal get_string_val(TupleRow* row);
-    // TODO(zc):
-    // ArrayVal GetArrayVal(TupleRow* row);
-    DateTimeVal get_datetime_val(TupleRow* row);
-    DecimalVal get_decimal_val(TupleRow* row);
-    DecimalV2Val get_decimalv2_val(TupleRow* row);
-
-    /// Frees all local allocations made by fn_contexts_. This can be called when result
-    /// data from this context is no longer needed.
-    void free_local_allocations();
-    static void free_local_allocations(const std::vector<ExprContext*>& ctxs);
-    static void free_local_allocations(const std::vector<FunctionContext*>& ctxs);
-
     bool opened() { return _opened; }
-
-    /// If 'expr' is constant, evaluates it with no input row argument and returns the
-    /// result in 'const_val'. Sets 'const_val' to NULL if the argument is not constant.
-    /// The returned AnyVal and associated varlen data is owned by this evaluator. This
-    /// should only be called after Open() has been called on this expr. Returns an error
-    /// if there was an error evaluating the expression or if memory could not be allocated
-    /// for the expression result.
-    Status get_const_value(RuntimeState* state, Expr& expr, AnyVal** const_val);
 
     /// Returns an error status if there was any error in evaluating the expression
     /// or its sub-expressions. 'start_idx' and 'end_idx' correspond to the range
@@ -172,15 +111,14 @@ public:
     /// The default parameters correspond to the entire expr 'root_'.
     Status get_error(int start_idx, int end_idx) const;
 
+    Status get_udf_error();
+
     std::string get_error_msg() const;
 
-    // when you reused this expr context, you maybe need clear the error status and message.
-    void clear_error_msg();
-
     // vector query engine
-    ColumnPtr evaluate(vectorized::Chunk* chunk);
+    StatusOr<ColumnPtr> evaluate(vectorized::Chunk* chunk);
 
-    ColumnPtr evaluate(Expr* expr, vectorized::Chunk* chunk);
+    StatusOr<ColumnPtr> evaluate(Expr* expr, vectorized::Chunk* chunk);
 
 private:
     friend class Expr;
@@ -206,24 +144,31 @@ private:
     /// The expr tree this context is for.
     Expr* _root;
 
-    /// Stores the result of the root expr. This is used in interpreted code when we need a
-    /// void*.
-    ExprValue _result;
-
     /// True if this context came from a Clone() call. Used to manage FunctionStateScope.
     bool _is_clone;
 
     /// Variables keeping track of current state.
     bool _prepared;
     bool _opened;
+    RuntimeState* _runtime_state = nullptr;
     // In operator, the ExprContext::close method will be called concurrently
     std::atomic<bool> _closed;
-
-    /// Calls the appropriate Get*Val() function on 'e' and stores the result in result_.
-    /// This is used by Exprs to call GetValue() on a child expr, rather than root_.
-    void* get_value(Expr* e, TupleRow* row);
 };
 
-} // namespace starrocks
+#define RETURN_IF_HAS_ERROR(expr_ctxs)             \
+    do {                                           \
+        for (auto* ctx : expr_ctxs) {              \
+            RETURN_IF_ERROR(ctx->get_udf_error()); \
+        }                                          \
+    } while (false)
 
-#endif
+#define EVALUATE_NULL_IF_ERROR(ctx, expr, chunk)                                                         \
+    [](ExprContext* c, Expr* e, vectorized::Chunk* ptr) {                                                \
+        auto st = c->evaluate(e, ptr);                                                                   \
+        if (st.ok()) {                                                                                   \
+            return st.value();                                                                           \
+        }                                                                                                \
+        return vectorized::ColumnHelper::create_const_null_column(ptr == nullptr ? 1 : ptr->num_rows()); \
+    }(ctx, expr, chunk)
+
+} // namespace starrocks

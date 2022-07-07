@@ -23,21 +23,22 @@ package com.starrocks.consistency;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.LocalTablet;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
 import com.starrocks.catalog.MetaObject;
 import com.starrocks.catalog.OlapTable;
+import com.starrocks.catalog.OlapTable.OlapTableState;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Table.TableType;
-import com.starrocks.catalog.Tablet;
 import com.starrocks.common.Config;
 import com.starrocks.common.util.MasterDaemon;
 import com.starrocks.common.util.TimeUtils;
 import com.starrocks.consistency.CheckConsistencyJob.JobState;
 import com.starrocks.persist.ConsistencyCheckInfo;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.task.CheckConsistencyTask;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -231,14 +232,14 @@ public class ConsistencyChecker extends MasterDaemon {
      * we use a priority queue to sort db/table/partition/index/tablet by 'lastCheckTime'.
      * chose a tablet which has the smallest 'lastCheckTime'.
      */
-    private List<Long> chooseTablets() {
-        Catalog catalog = Catalog.getCurrentCatalog();
+    protected List<Long> chooseTablets() {
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
         MetaObject chosenOne = null;
 
         List<Long> chosenTablets = Lists.newArrayList();
 
         // sort dbs
-        List<Long> dbIds = catalog.getDbIds();
+        List<Long> dbIds = globalStateMgr.getDbIds();
         if (dbIds.isEmpty()) {
             return chosenTablets;
         }
@@ -248,7 +249,7 @@ public class ConsistencyChecker extends MasterDaemon {
                 // skip 'information_schema' database
                 continue;
             }
-            Database db = catalog.getDb(dbId);
+            Database db = globalStateMgr.getDb(dbId);
             if (db == null) {
                 continue;
             }
@@ -266,7 +267,12 @@ public class ConsistencyChecker extends MasterDaemon {
                     List<Table> tables = db.getTables();
                     Queue<MetaObject> tableQueue = new PriorityQueue<>(Math.max(tables.size(), 1), COMPARATOR);
                     for (Table table : tables) {
-                        if (table.getType() != TableType.OLAP) {
+                        // Only check the OLAP table who is in NORMAL state.
+                        // Because some tablets of the not NORMAL table may just a temporary presence in memory,
+                        // if we check those tablets and log FinishConsistencyCheck to bdb,
+                        // it will throw NullPointerException when replaying the log.
+                        if (table.getType() != TableType.OLAP
+                                || ((OlapTable) table).getState() != OlapTableState.NORMAL) {
                             continue;
                         }
                         tableQueue.add(table);
@@ -279,6 +285,11 @@ public class ConsistencyChecker extends MasterDaemon {
                         Queue<MetaObject> partitionQueue =
                                 new PriorityQueue<>(Math.max(table.getAllPartitions().size(), 1), COMPARATOR);
                         for (Partition partition : table.getPartitions()) {
+                            if (partition.isUseStarOS()) {
+                                // replicas are managed by StarOS and cloud storage.
+                                continue;
+                            }
+
                             // check partition's replication num. if 1 replication. skip
                             if (table.getPartitionInfo().getReplicationNum(partition.getId()) == (short) 1) {
                                 LOG.debug("partition[{}]'s replication num is 1. ignore", partition.getId());
@@ -313,7 +324,7 @@ public class ConsistencyChecker extends MasterDaemon {
                                 tabletQueue.addAll(index.getTablets());
 
                                 while ((chosenOne = tabletQueue.poll()) != null) {
-                                    Tablet tablet = (Tablet) chosenOne;
+                                    LocalTablet tablet = (LocalTablet) chosenOne;
                                     long chosenTabletId = tablet.getId();
 
                                     if (this.jobs.containsKey(chosenTabletId)) {
@@ -321,12 +332,10 @@ public class ConsistencyChecker extends MasterDaemon {
                                     }
 
                                     // check if version has already been checked
-                                    if (partition.getVisibleVersion() == tablet.getCheckedVersion()
-                                            && partition.getVisibleVersionHash() == tablet.getCheckedVersionHash()) {
+                                    if (partition.getVisibleVersion() == tablet.getCheckedVersion()) {
                                         if (tablet.isConsistent()) {
                                             LOG.debug("tablet[{}]'s version[{}-{}] has been checked. ignore",
-                                                    chosenTabletId, tablet.getCheckedVersion(),
-                                                    tablet.getCheckedVersionHash());
+                                                    chosenTabletId, tablet.getCheckedVersion());
                                         }
                                     } else {
                                         LOG.info("chose tablet[{}-{}-{}-{}-{}] to check consistency", db.getId(),
@@ -366,14 +375,14 @@ public class ConsistencyChecker extends MasterDaemon {
         job.handleFinishedReplica(backendId, checksum);
     }
 
-    public void replayFinishConsistencyCheck(ConsistencyCheckInfo info, Catalog catalog) {
-        Database db = catalog.getDb(info.getDbId());
+    public void replayFinishConsistencyCheck(ConsistencyCheckInfo info, GlobalStateMgr globalStateMgr) {
+        Database db = globalStateMgr.getDb(info.getDbId());
         db.writeLock();
         try {
             OlapTable table = (OlapTable) db.getTable(info.getTableId());
             Partition partition = table.getPartition(info.getPartitionId());
             MaterializedIndex index = partition.getIndex(info.getIndexId());
-            Tablet tablet = index.getTablet(info.getTabletId());
+            LocalTablet tablet = (LocalTablet) index.getTablet(info.getTabletId());
 
             long lastCheckTime = info.getLastCheckTime();
             db.setLastCheckTime(lastCheckTime);
@@ -381,7 +390,7 @@ public class ConsistencyChecker extends MasterDaemon {
             partition.setLastCheckTime(lastCheckTime);
             index.setLastCheckTime(lastCheckTime);
             tablet.setLastCheckTime(lastCheckTime);
-            tablet.setCheckedVersion(info.getCheckedVersion(), info.getCheckedVersionHash());
+            tablet.setCheckedVersion(info.getCheckedVersion());
 
             tablet.setIsConsistent(info.isConsistent());
         } finally {

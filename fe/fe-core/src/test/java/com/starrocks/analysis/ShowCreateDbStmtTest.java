@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/analysis/ShowCreateDbStmtTest.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -48,9 +44,9 @@ public class ShowCreateDbStmtTest {
     public void testNormal() throws AnalysisException, UserException {
         ShowCreateDbStmt stmt = new ShowCreateDbStmt("testDb");
         stmt.analyze(AccessTestUtil.fetchAdminAnalyzer(true));
-        Assert.assertEquals("testCluster:testDb", stmt.getDb());
+        Assert.assertEquals("default_cluster:testDb", stmt.getDb());
         Assert.assertEquals(2, stmt.getMetaData().getColumnCount());
-        Assert.assertEquals("SHOW CREATE DATABASE `testCluster:testDb`", stmt.toString());
+        Assert.assertEquals("SHOW CREATE DATABASE `default_cluster:testDb`", stmt.toString());
     }
 
     @Test(expected = AnalysisException.class)

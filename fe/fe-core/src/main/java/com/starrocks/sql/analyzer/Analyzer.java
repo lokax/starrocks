@@ -1,165 +1,320 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.analyzer;
 
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
-import com.starrocks.analysis.AnalyzeStmt;
-import com.starrocks.analysis.CreateAnalyzeJobStmt;
+import com.starrocks.analysis.AdminSetConfigStmt;
+import com.starrocks.analysis.AdminSetReplicaStatusStmt;
+import com.starrocks.analysis.AdminShowConfigStmt;
+import com.starrocks.analysis.AdminShowReplicaDistributionStmt;
+import com.starrocks.analysis.AdminShowReplicaStatusStmt;
+import com.starrocks.analysis.AlterDatabaseQuotaStmt;
+import com.starrocks.analysis.AlterDatabaseRename;
+import com.starrocks.analysis.AlterSystemStmt;
+import com.starrocks.analysis.AlterTableStmt;
+import com.starrocks.analysis.AlterWorkGroupStmt;
+import com.starrocks.analysis.BaseViewStmt;
+import com.starrocks.analysis.CreateDbStmt;
+import com.starrocks.analysis.CreateMaterializedViewStmt;
+import com.starrocks.analysis.CreateTableAsSelectStmt;
+import com.starrocks.analysis.CreateTableStmt;
+import com.starrocks.analysis.CreateWorkGroupStmt;
+import com.starrocks.analysis.DeleteStmt;
+import com.starrocks.analysis.DropDbStmt;
+import com.starrocks.analysis.DropMaterializedViewStmt;
+import com.starrocks.analysis.DropTableStmt;
 import com.starrocks.analysis.InsertStmt;
-import com.starrocks.analysis.QueryStmt;
+import com.starrocks.analysis.LimitElement;
+import com.starrocks.analysis.RecoverDbStmt;
+import com.starrocks.analysis.SetStmt;
+import com.starrocks.analysis.ShowStmt;
 import com.starrocks.analysis.StatementBase;
-import com.starrocks.analysis.TableName;
-import com.starrocks.catalog.Catalog;
-import com.starrocks.catalog.Column;
-import com.starrocks.catalog.Database;
-import com.starrocks.catalog.OlapTable;
-import com.starrocks.catalog.Table;
-import com.starrocks.cluster.ClusterNamespace;
+import com.starrocks.analysis.UpdateStmt;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.sql.analyzer.relation.Relation;
-import com.starrocks.sql.common.MetaUtils;
-import com.starrocks.statistic.AnalyzeJob;
-import com.starrocks.statistic.StatisticUtils;
-import org.apache.commons.lang3.StringUtils;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
-
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.stream.Collectors;
-
-import static com.starrocks.sql.common.UnsupportedException.unsupportedException;
+import com.starrocks.qe.OriginStatement;
+import com.starrocks.qe.SessionVariable;
+import com.starrocks.sql.ast.AlterMaterializedViewStatement;
+import com.starrocks.sql.ast.AnalyzeStmt;
+import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.ast.BaseGrantRevokeImpersonateStmt;
+import com.starrocks.sql.ast.BaseGrantRevokeRoleStmt;
+import com.starrocks.sql.ast.CreateAnalyzeJobStmt;
+import com.starrocks.sql.ast.CreateCatalogStmt;
+import com.starrocks.sql.ast.CreateMaterializedViewStatement;
+import com.starrocks.sql.ast.DropCatalogStmt;
+import com.starrocks.sql.ast.DropHistogramStmt;
+import com.starrocks.sql.ast.ExecuteAsStmt;
+import com.starrocks.sql.ast.QueryRelation;
+import com.starrocks.sql.ast.QueryStatement;
+import com.starrocks.sql.ast.RefreshMaterializedViewStatement;
+import com.starrocks.sql.ast.RefreshTableStmt;
+import com.starrocks.sql.ast.ShowCatalogsStmt;
+import com.starrocks.sql.ast.SubmitTaskStmt;
 
 public class Analyzer {
-    private static final Logger LOG = LogManager.getLogger(Analyzer.class);
-
-    private final Catalog catalog;
-    private final ConnectContext session;
-
-    public Analyzer(Catalog catalog, ConnectContext session) {
-        this.catalog = catalog;
-        this.session = session;
+    public static void analyze(StatementBase statement, ConnectContext session) {
+        new AnalyzerVisitor().analyze(statement, session);
     }
 
-    public Relation analyze(StatementBase node) {
-        node.setClusterName(session.getClusterName());
-        if (node instanceof QueryStmt) {
-            return new QueryAnalyzer(catalog, session)
-                    .transformQueryStmt((QueryStmt) node, new Scope(RelationId.anonymous(), new RelationFields()));
-        } else if (node instanceof InsertStmt) {
-            return new InsertAnalyzer(catalog, session).transformInsertStmt((InsertStmt) node);
-        } else if (node instanceof AnalyzeStmt) {
-            return analyzeAnalyzeStmt((AnalyzeStmt) node);
-        } else if (node instanceof CreateAnalyzeJobStmt) {
-            return analyzeCreateAnalyzeStmt((CreateAnalyzeJobStmt) node);
-        } else {
-            throw unsupportedException("New Planner only support Query Statement");
-        }
-    }
-
-    private Relation analyzeAnalyzeStmt(AnalyzeStmt node) {
-        MetaUtils.normalizationTableName(session, node.getTableName());
-        Table analyzeTable = MetaUtils.getStarRocksTable(session, node.getTableName());
-
-        if (StatisticUtils.statisticDatabaseBlackListCheck(node.getTableName().getDb())) {
-            throw new SemanticException("Forbidden collect database: %s", node.getTableName().getDb());
-        }
-        if (analyzeTable.getType() != Table.TableType.OLAP) {
-            throw new SemanticException("Table '%s' is not a OLAP table", analyzeTable.getName());
+    private static class AnalyzerVisitor extends AstVisitor<Void, ConnectContext> {
+        public void analyze(StatementBase statement, ConnectContext session) {
+            visit(statement, session);
         }
 
-        // Analyze columns mentioned in the statement.
-        Set<String> mentionedColumns = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
-
-        List<String> columnNames = node.getColumnNames();
-        if (columnNames == null || columnNames.isEmpty()) {
-            node.setColumnNames(
-                    analyzeTable.getBaseSchema().stream().map(Column::getName).collect(Collectors.toList()));
-        } else {
-            for (String colName : columnNames) {
-                Column col = analyzeTable.getColumn(colName);
-                if (col == null) {
-                    throw new SemanticException("Unknown column '%s' in '%s'", colName, analyzeTable.getName());
-                }
-                if (!mentionedColumns.add(colName)) {
-                    throw new SemanticException("Column '%s' specified twice", colName);
-                }
-            }
-        }
-
-        Map<String, String> properties = node.getProperties();
-
-        if (null == properties) {
-            node.setProperties(Maps.newHashMap());
+        @Override
+        public Void visitCreateTableStatement(CreateTableStmt statement, ConnectContext context) {
+            CreateTableAnalyzer.analyze(statement, context);
             return null;
         }
 
-        for (String key : AnalyzeJob.NUMBER_PROP_KEY_LIST) {
-            if (properties.containsKey(key) && !StringUtils.isNumeric(properties.get(key))) {
-                throw new SemanticException("Property '%s' value must be numeric", key);
-            }
-        }
-
-        return null;
-    }
-
-    private Relation analyzeCreateAnalyzeStmt(CreateAnalyzeJobStmt node) {
-        if (null != node.getTableName()) {
-            TableName tbl = node.getTableName();
-
-            if (null != tbl.getDb() && null == tbl.getTbl()) {
-                tbl.setDb(ClusterNamespace.getFullName(node.getClusterName(), tbl.getDb()));
-                Database db = MetaUtils.getStarRocks(session, node.getTableName());
-
-                if (StatisticUtils.statisticDatabaseBlackListCheck(node.getTableName().getDb())) {
-                    throw new SemanticException("Forbidden collect database: %s", node.getTableName().getDb());
-                }
-
-                node.setDbId(db.getId());
-            } else if (null != node.getTableName().getTbl()) {
-                MetaUtils.normalizationTableName(session, node.getTableName());
-                Database db = MetaUtils.getStarRocks(session, node.getTableName());
-                Table table = MetaUtils.getStarRocksTable(session, node.getTableName());
-
-                if (!(table instanceof OlapTable)) {
-                    throw new SemanticException("Table '%s' is not a OLAP table", table.getName());
-                }
-
-                // Analyze columns mentioned in the statement.
-                Set<String> mentionedColumns = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
-
-                List<String> columnNames = node.getColumnNames();
-                if (columnNames != null && !columnNames.isEmpty()) {
-                    for (String colName : columnNames) {
-                        Column col = table.getColumn(colName);
-                        if (col == null) {
-                            throw new SemanticException("Unknown column '%s' in '%s'", colName, table.getName());
-                        }
-                        if (!mentionedColumns.add(colName)) {
-                            throw new SemanticException("Column '%s' specified twice", colName);
-                        }
-                    }
-                }
-
-                node.setDbId(db.getId());
-                node.setTableId(table.getId());
-            }
-        }
-
-        Map<String, String> properties = node.getProperties();
-
-        if (null == properties) {
-            node.setProperties(Maps.newHashMap());
+        @Override
+        public Void visitAlterTableStatement(AlterTableStmt statement, ConnectContext context) {
+            AlterTableStatementAnalyzer.analyze(statement, context);
             return null;
         }
 
-        for (String key : AnalyzeJob.NUMBER_PROP_KEY_LIST) {
-            if (properties.containsKey(key) && !StringUtils.isNumeric(properties.get(key))) {
-                throw new SemanticException("Property '%s' value must be numeric", key);
-            }
+        @Override
+        public Void visitAlterWorkGroupStatement(AlterWorkGroupStmt statement, ConnectContext session) {
+            statement.analyze();
+            return null;
         }
 
-        return null;
+        @Override
+        public Void visitAdminSetReplicaStatusStatement(AdminSetReplicaStatusStmt statement, ConnectContext session) {
+            AdminStmtAnalyzer.analyze(statement, session);
+            return null;
+        }
+
+        @Override
+        public Void visitAdminShowReplicaStatusStatement(AdminShowReplicaStatusStmt statement, ConnectContext session) {
+            AdminStmtAnalyzer.analyze(statement, session);
+            return null;
+        }
+
+        @Override
+        public Void visitAdminShowReplicaDistributionStatement(AdminShowReplicaDistributionStmt statement,
+                                                               ConnectContext session) {
+            AdminStmtAnalyzer.analyze(statement, session);
+            return null;
+        }
+
+        @Override
+        public Void visitBaseViewStatement(BaseViewStmt statement, ConnectContext session) {
+            ViewAnalyzer.analyze(statement, session);
+            return null;
+        }
+
+        @Override
+        public Void visitCreateTableAsSelectStatement(CreateTableAsSelectStmt statement, ConnectContext session) {
+            // this phrase do not analyze insertStmt, insertStmt will analyze in
+            // StmtExecutor.handleCreateTableAsSelectStmt because planner will not do meta operations
+            CTASAnalyzer.analyze(statement, session);
+            return null;
+        }
+
+        @Override
+        public Void visitSubmitTaskStmt(SubmitTaskStmt statement, ConnectContext context) {
+            CreateTableAsSelectStmt createTableAsSelectStmt = statement.getCreateTableAsSelectStmt();
+            QueryStatement queryStatement = createTableAsSelectStmt.getQueryStatement();
+            Analyzer.analyze(queryStatement, context);
+            OriginStatement origStmt = statement.getOrigStmt();
+            String sqlText = origStmt.originStmt.substring(statement.getSqlBeginIndex());
+            statement.setSqlText(sqlText);
+            TaskAnalyzer.analyzeSubmitTaskStmt(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitCreateWorkGroupStatement(CreateWorkGroupStmt statement, ConnectContext session) {
+            statement.analyze();
+            return null;
+        }
+
+        @Override
+        public Void visitInsertStatement(InsertStmt statement, ConnectContext session) {
+            InsertAnalyzer.analyze(statement, session);
+            return null;
+        }
+
+        @Override
+        public Void visitShowStatement(ShowStmt statement, ConnectContext session) {
+            ShowStmtAnalyzer.analyze(statement, session);
+            return null;
+        }
+
+        @Override
+        public Void visitAdminSetConfigStatement(AdminSetConfigStmt adminSetConfigStmt, ConnectContext session) {
+            AdminStmtAnalyzer.analyze(adminSetConfigStmt, session);
+            return null;
+        }
+
+        @Override
+        public Void visitSetStatement(SetStmt stmt, ConnectContext session) {
+            stmt.analyze();
+            return null;
+        }
+
+        @Override
+        public Void visitAdminShowConfigStatement(AdminShowConfigStmt adminShowConfigStmt, ConnectContext session) {
+            AdminStmtAnalyzer.analyze(adminShowConfigStmt, session);
+            return null;
+        }
+
+        @Override
+        public Void visitDropTableStmt(DropTableStmt statement, ConnectContext session) {
+            DropStmtAnalyzer.analyze(statement, session);
+            return null;
+        }
+
+        @Override
+        public Void visitQueryStatement(QueryStatement stmt, ConnectContext session) {
+            new QueryAnalyzer(session).analyze(stmt);
+
+            QueryRelation queryRelation = stmt.getQueryRelation();
+            long selectLimit = session.getSessionVariable().getSqlSelectLimit();
+            if (!queryRelation.hasLimit() && selectLimit != SessionVariable.DEFAULT_SELECT_LIMIT) {
+                queryRelation.setLimit(new LimitElement(selectLimit));
+            }
+            return null;
+        }
+
+        @Override
+        public Void visitUpdateStatement(UpdateStmt node, ConnectContext context) {
+            UpdateAnalyzer.analyze(node, context);
+            return null;
+        }
+
+        @Override
+        public Void visitDeleteStatement(DeleteStmt node, ConnectContext context) {
+            DeleteAnalyzer.analyze(node, context);
+            return null;
+        }
+
+        @Override
+        public Void visitGrantRevokeRoleStatement(BaseGrantRevokeRoleStmt stmt, ConnectContext session) {
+            PrivilegeStmtAnalyzer.analyze(stmt, session);
+            return null;
+        }
+
+        @Override
+        public Void visitGrantRevokeImpersonateStatement(BaseGrantRevokeImpersonateStmt stmt, ConnectContext session) {
+            PrivilegeStmtAnalyzer.analyze(stmt, session);
+            return null;
+        }
+
+        @Override
+        public Void visitExecuteAsStatement(ExecuteAsStmt stmt, ConnectContext session) {
+            PrivilegeStmtAnalyzer.analyze(stmt, session);
+            return null;
+        }
+
+        @Override
+        public Void visitCreateMaterializedViewStatement(CreateMaterializedViewStatement statement,
+                                                         ConnectContext context) {
+            MaterializedViewAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitCreateMaterializedViewStmt(CreateMaterializedViewStmt statement, ConnectContext context) {
+            CreateMaterializedViewStmt.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitDropMaterializedViewStatement(DropMaterializedViewStmt statement, ConnectContext context) {
+            MaterializedViewAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitAlterMaterializedViewStatement(AlterMaterializedViewStatement statement, ConnectContext context) {
+            MaterializedViewAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitRefreshMaterializedViewStatement(RefreshMaterializedViewStatement statement, ConnectContext context) {
+            MaterializedViewAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitAlterSystemStmt(AlterSystemStmt statement, ConnectContext context) {
+            AlterSystemStmtAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitCreateCatalogStatement(CreateCatalogStmt statement, ConnectContext context) {
+            CatalogAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitDropCatalogStatement(DropCatalogStmt statement, ConnectContext context) {
+            CatalogAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitShowCatalogsStmt(ShowCatalogsStmt statement, ConnectContext context) {
+            CatalogAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitRefreshTableStatement(RefreshTableStmt statement, ConnectContext context) {
+            RefreshTableStatementAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitAlterDbQuotaStmt(AlterDatabaseQuotaStmt statement, ConnectContext context) {
+            AlterDbQuotaAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitCreateDbStatement(CreateDbStmt statement, ConnectContext context) {
+            CreateDbAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitDropDbStatement(DropDbStmt statement, ConnectContext context) {
+            DropStmtAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitAlterDatabaseRename(AlterDatabaseRename statement, ConnectContext context) {
+            AlterDatabaseRenameAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        @Override
+        public Void visitRecoverDbStmt(RecoverDbStmt statement, ConnectContext context) {
+            RecoverDbAnalyzer.analyze(statement, context);
+            return null;
+        }
+
+        // ------------------------------------------- Analyze Statement ---------------------------------------------------
+
+        @Override
+        public Void visitAnalyzeStatement(AnalyzeStmt statement, ConnectContext session) {
+            AnalyzeStmtAnalyzer.analyze(statement, session);
+            return null;
+        }
+
+        @Override
+        public Void visitCreateAnalyzeJobStatement(CreateAnalyzeJobStmt statement, ConnectContext session) {
+            AnalyzeStmtAnalyzer.analyze(statement, session);
+            return null;
+        }
+
+        @Override
+        public Void visitDropHistogramStatement(DropHistogramStmt statement, ConnectContext session) {
+            AnalyzeStmtAnalyzer.analyze(statement, session);
+            return null;
+        }
     }
 }

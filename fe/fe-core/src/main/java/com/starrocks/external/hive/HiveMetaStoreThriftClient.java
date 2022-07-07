@@ -75,6 +75,7 @@ import org.apache.hadoop.hive.metastore.api.NoSuchLockException;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 import org.apache.hadoop.hive.metastore.api.NoSuchTxnException;
 import org.apache.hadoop.hive.metastore.api.NotNullConstraintsRequest;
+import org.apache.hadoop.hive.metastore.api.NotificationEventRequest;
 import org.apache.hadoop.hive.metastore.api.NotificationEventResponse;
 import org.apache.hadoop.hive.metastore.api.NotificationEventsCountRequest;
 import org.apache.hadoop.hive.metastore.api.NotificationEventsCountResponse;
@@ -146,6 +147,7 @@ import org.apache.thrift.transport.TSocket;
 import org.apache.thrift.transport.TTransport;
 import org.apache.thrift.transport.TTransportException;
 
+import javax.security.auth.login.LoginException;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.ByteBuffer;
@@ -157,10 +159,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.Random;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import javax.security.auth.login.LoginException;
 
 import static org.apache.hadoop.hive.metastore.utils.MetaStoreUtils.getDefaultCatalog;
 
@@ -300,7 +301,7 @@ public class HiveMetaStoreThriftClient implements IMetaStoreClient, AutoCloseabl
             if (MetastoreConf.getVar(conf, ConfVars.THRIFT_URI_SELECTION).equalsIgnoreCase("RANDOM")) {
                 List<URI> uriList = Arrays.asList(metastoreUris);
                 Collections.shuffle(uriList);
-                metastoreUris = (URI[]) uriList.toArray();
+                metastoreUris = uriList.toArray(metastoreUris);
             }
         } catch (IllegalArgumentException e) {
             throw (e);
@@ -337,8 +338,7 @@ public class HiveMetaStoreThriftClient implements IMetaStoreClient, AutoCloseabl
         if (metastoreUris.length <= 1) {
             return;
         }
-        Random rng = new Random();
-        int index = rng.nextInt(metastoreUris.length - 1) + 1;
+        int index = ThreadLocalRandom.current().nextInt(metastoreUris.length - 1) + 1;
         URI tmp = metastoreUris[0];
         metastoreUris[0] = metastoreUris[index];
         metastoreUris[index] = tmp;
@@ -692,6 +692,20 @@ public class HiveMetaStoreThriftClient implements IMetaStoreClient, AutoCloseabl
         return client.get_partitions_statistics_req(rqst).getPartStats();
     }
 
+    @Override
+    public NotificationEventResponse getNextNotification(long lastEventId, int maxEvents, NotificationFilter filter)
+            throws TException {
+        NotificationEventRequest eventRequest = new NotificationEventRequest();
+        eventRequest.setMaxEvents(maxEvents);
+        eventRequest.setLastEvent(lastEventId);
+        return client.get_next_notification(eventRequest);
+    }
+
+    @Override
+    public CurrentNotificationEventId getCurrentNotificationEventId() throws TException {
+        return client.get_current_notificationEventId();
+    }
+
     public void setMetaConf(String key, String value) throws MetaException, TException {
 
         throw new TException("method not implemented");
@@ -706,6 +720,12 @@ public class HiveMetaStoreThriftClient implements IMetaStoreClient, AutoCloseabl
     public void createCatalog(Catalog catalog)
             throws AlreadyExistsException, InvalidObjectException, MetaException, TException {
 
+        throw new TException("method not implemented");
+    }
+
+    @Override
+    public void alterCatalog(String s, Catalog catalog) throws NoSuchObjectException, InvalidObjectException,
+            MetaException, TException {
         throw new TException("method not implemented");
     }
 
@@ -738,7 +758,7 @@ public class HiveMetaStoreThriftClient implements IMetaStoreClient, AutoCloseabl
 
     @Override
     public List<String> getAllDatabases() throws MetaException, TException {
-        throw new TException("method not implemented");
+        return client.get_all_databases();
     }
 
     @Override
@@ -796,7 +816,7 @@ public class HiveMetaStoreThriftClient implements IMetaStoreClient, AutoCloseabl
 
     @Override
     public List<String> getAllTables(String dbName) throws MetaException, TException, UnknownDBException {
-        throw new TException("method not implemented");
+        return client.get_all_tables(dbName);
     }
 
     @Override
@@ -892,7 +912,7 @@ public class HiveMetaStoreThriftClient implements IMetaStoreClient, AutoCloseabl
 
     @Override
     public Database getDatabase(String databaseName) throws NoSuchObjectException, MetaException, TException {
-        throw new TException("method not implemented");
+        return client.get_database(databaseName);
     }
 
     @Override
@@ -914,8 +934,7 @@ public class HiveMetaStoreThriftClient implements IMetaStoreClient, AutoCloseabl
     }
 
     @Override
-    public Map<String, Materialization> getMaterializationsInvalidationInfo(String dbName, List<String> viewNames)
-            throws MetaException, InvalidOperationException, UnknownDBException, TException {
+    public Materialization getMaterializationInvalidationInfo(CreationMetadata creationMetadata, String s) throws MetaException, InvalidOperationException, UnknownDBException, TException {
         throw new TException("method not implemented");
     }
 
@@ -1565,8 +1584,7 @@ public class HiveMetaStoreThriftClient implements IMetaStoreClient, AutoCloseabl
     }
 
     @Override
-    public boolean refresh_privileges(HiveObjectRef objToRefresh, PrivilegeBag grantPrivileges)
-            throws MetaException, TException {
+    public boolean refresh_privileges(HiveObjectRef hiveObjectRef, String s, PrivilegeBag privilegeBag) throws MetaException, TException {
         throw new TException("method not implemented");
     }
 
@@ -1867,17 +1885,6 @@ public class HiveMetaStoreThriftClient implements IMetaStoreClient, AutoCloseabl
     @Override
     public void insertTable(Table table, boolean overwrite) throws MetaException {
         throw new MetaException("method not implemented");
-    }
-
-    @Override
-    public NotificationEventResponse getNextNotification(long lastEventId, int maxEvents, NotificationFilter filter)
-            throws TException {
-        throw new TException("method not implemented");
-    }
-
-    @Override
-    public CurrentNotificationEventId getCurrentNotificationEventId() throws TException {
-        throw new TException("method not implemented");
     }
 
     @Override

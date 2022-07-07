@@ -1,8 +1,10 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "column/array_column.h"
 
 #include <gtest/gtest.h>
+
+#include <cstdint>
 
 #include "column/column_helper.h"
 #include "column/const_column.h"
@@ -21,6 +23,78 @@ PARALLEL_TEST(ArrayColumnTest, test_create) {
     ASSERT_TRUE(column->is_array());
     ASSERT_FALSE(column->is_nullable());
     ASSERT_EQ(0, column->size());
+}
+
+// NOLINTNEXTLINE
+PARALLEL_TEST(ArrayColumnTest, test_array_column_update_if_overflow) {
+    // normal
+    auto offsets = UInt32Column::create();
+    auto elements = BinaryColumn::create();
+    auto column = ArrayColumn::create(elements, offsets);
+
+    elements->append("1");
+    elements->append("2");
+    offsets->append(2);
+    auto ret = column->upgrade_if_overflow();
+    ASSERT_TRUE(ret.ok());
+    ASSERT_TRUE(ret.value() == nullptr);
+    ASSERT_EQ(column->size(), 1);
+    auto array = column->get(0).get_array();
+    ASSERT_EQ(array[0].get_slice(), Slice("1"));
+    ASSERT_EQ(array[1].get_slice(), Slice("2"));
+
+#ifdef NDEBUG
+    /*
+    // the test case case will use a lot of memory, so temp comment it
+    // upgrade
+    offsets = UInt32Column::create();
+    elements = BinaryColumn::create();
+    column = ArrayColumn::create(elements, offsets);
+    size_t item_count = 1<<30;
+    for (size_t i = 0; i < item_count; i++) {
+        elements->append(std::to_string(i));
+    }
+    offsets->resize(item_count + 1);
+    for (size_t i = 0; i < item_count; i++) {
+        offsets->get_data()[i + 1] = i + 1;
+    }
+    ret = column->upgrade_if_overflow();
+    ASSERT_TRUE(ret.ok());
+    ASSERT_TRUE(ret.value() == nullptr);
+    ASSERT_TRUE(column->elements_column()->is_large_binary());
+    */
+#endif
+}
+
+// NOLINTNEXTLINE
+PARALLEL_TEST(ArrayColumnTest, test_array_column_downgrade) {
+    auto offsets = UInt32Column::create();
+    auto elements = BinaryColumn::create();
+    elements->append("1");
+    elements->append("2");
+    offsets->append(2);
+    auto column = ArrayColumn::create(elements, offsets);
+    ASSERT_FALSE(column->has_large_column());
+    auto ret = column->downgrade();
+    ASSERT_TRUE(ret.ok());
+    ASSERT_TRUE(ret.value() == nullptr);
+
+    offsets = UInt32Column::create();
+    auto large_elements = LargeBinaryColumn::create();
+    column = ArrayColumn::create(large_elements, offsets);
+    for (size_t i = 0; i < 10; i++) {
+        large_elements->append(std::to_string(i));
+        offsets->append(i + 1);
+    }
+    ASSERT_TRUE(column->has_large_column());
+    ret = column->downgrade();
+    ASSERT_TRUE(ret.ok());
+    ASSERT_TRUE(ret.value() == nullptr);
+    ASSERT_FALSE(column->has_large_column());
+    ASSERT_EQ(column->size(), 10);
+    for (size_t i = 0; i < 10; i++) {
+        ASSERT_EQ(column->get(i).get_array()[0].get_slice(), Slice(std::to_string(i)));
+    }
 }
 
 // NOLINTNEXTLINE
@@ -70,6 +144,10 @@ PARALLEL_TEST(ArrayColumnTest, test_byte_size) {
     // offset 0 with 4 bytes.
     ASSERT_EQ(16, column->byte_size(0, 1));
     ASSERT_EQ(16, column->byte_size(0));
+
+    // elements 1 with 12 bytes.
+    // offset 1 with 4 bytes.
+    ASSERT_EQ(16, column->byte_size(1, 1));
 }
 
 // NOLINTNEXTLINE
@@ -438,36 +516,6 @@ PARALLEL_TEST(ArrayColumnTest, test_compare_at) {
 }
 
 // NOLINTNEXTLINE
-PARALLEL_TEST(ArrayColumnTest, test_serde) {
-    auto offsets = UInt32Column::create();
-    auto elements = Int32Column::create();
-    auto column = ArrayColumn::create(elements, offsets);
-
-    // insert [1, 2, 3], [4, 5, 6]
-    elements->append(1);
-    elements->append(2);
-    elements->append(3);
-    offsets->append(3);
-
-    elements->append(4);
-    elements->append(5);
-    elements->append(6);
-    offsets->append(6);
-
-    std::vector<uint8_t> buffer;
-    buffer.resize(column->serialize_size());
-    column->serialize_column(buffer.data());
-
-    auto offsets_2 = UInt32Column::create();
-    auto elements_2 = Int32Column::create();
-    auto column_2 = ArrayColumn::create(elements, offsets_2);
-    column_2->deserialize_column(buffer.data());
-
-    ASSERT_EQ("[1, 2, 3]", column_2->debug_item(0));
-    ASSERT_EQ("[4, 5, 6]", column_2->debug_item(1));
-}
-
-// NOLINTNEXTLINE
 PARALLEL_TEST(ArrayColumnTest, test_multi_dimension_array) {
     auto offsets = UInt32Column::create();
     auto elements = Int32Column::create();
@@ -773,6 +821,170 @@ PARALLEL_TEST(ArrayColumnTest, test_clone_column) {
     ASSERT_EQ(0, cloned_column->size());
     ASSERT_EQ(0, down_cast<ArrayColumn*>(cloned_column.get())->elements_column()->size());
     ASSERT_EQ(1, down_cast<ArrayColumn*>(cloned_column.get())->offsets_column()->size());
+}
+
+PARALLEL_TEST(ArrayColumnTest, test_array_hash) {
+    auto c0 = ArrayColumn::create(Int32Column::create(), UInt32Column::create());
+
+    auto* offsets = down_cast<UInt32Column*>(c0->offsets_column().get());
+    auto* elements = down_cast<Int32Column*>(c0->elements_column().get());
+
+    // insert [1, 2, 3], [4, 5, 6]
+    size_t array_size_1 = 3;
+    elements->append(1);
+    elements->append(2);
+    elements->append(3);
+    offsets->append(3);
+
+    size_t array_size_2 = 3;
+    elements->append(4);
+    elements->append(5);
+    elements->append(6);
+    offsets->append(6);
+
+    uint32_t hash_value[2] = {0, 0};
+    c0->crc32_hash(hash_value, 0, 2);
+
+    uint32_t hash_value_1 = HashUtil::zlib_crc_hash(&array_size_1, sizeof(array_size_1), 0);
+    for (int i = 0; i < 3; ++i) {
+        elements->crc32_hash(&hash_value_1 - i, i, i + 1);
+    }
+    uint32_t hash_value_2 = HashUtil::zlib_crc_hash(&array_size_2, sizeof(array_size_2), 0);
+    for (int i = 3; i < 6; ++i) {
+        elements->crc32_hash(&hash_value_2 - i, i, i + 1);
+    }
+    ASSERT_EQ(hash_value_1, hash_value[0]);
+    ASSERT_EQ(hash_value_2, hash_value[1]);
+
+    uint32_t hash_value_fnv[2] = {0, 0};
+    c0->fnv_hash(hash_value_fnv, 0, 2);
+    uint32_t hash_value_1_fnv = HashUtil::fnv_hash(&array_size_1, sizeof(array_size_1), 0);
+    for (int i = 0; i < 3; ++i) {
+        elements->fnv_hash(&hash_value_1_fnv - i, i, i + 1);
+    }
+    uint32_t hash_value_2_fnv = HashUtil::fnv_hash(&array_size_2, sizeof(array_size_2), 0);
+    for (int i = 3; i < 6; ++i) {
+        elements->fnv_hash(&hash_value_2_fnv - i, i, i + 1);
+    }
+
+    ASSERT_EQ(hash_value_1_fnv, hash_value_fnv[0]);
+    ASSERT_EQ(hash_value_2_fnv, hash_value_fnv[1]);
+
+    // overflow test
+    for (int i = 0; i < 100000; ++i) {
+        elements->append(i);
+    }
+    offsets->append(elements->size());
+    uint32_t hash_value_overflow_test[3] = {0, 0, 0};
+    c0->crc32_hash(hash_value_overflow_test, 0, 3);
+
+    auto& offset_values = offsets->get_data();
+    size_t sz = offset_values[offset_values.size() - 1] - offset_values[offset_values.size() - 2];
+
+    uint32_t hash_value_overflow = HashUtil::zlib_crc_hash(&sz, sizeof(sz), 0);
+    for (int i = 0; i < 100000; ++i) {
+        uint32_t value = i;
+        hash_value_overflow = HashUtil::zlib_crc_hash(&value, sizeof(value), hash_value_overflow);
+    }
+
+    ASSERT_EQ(hash_value_overflow, hash_value_overflow_test[2]);
+}
+
+PARALLEL_TEST(ArrayColumnTest, test_xor_checksum) {
+    auto c0 = ArrayColumn::create(Int32Column::create(), UInt32Column::create());
+
+    auto* offsets = down_cast<UInt32Column*>(c0->offsets_column().get());
+    auto* elements = down_cast<Int32Column*>(c0->elements_column().get());
+
+    // insert [1, 2, 3], [4, 5, 6, 7]
+    elements->append(1);
+    elements->append(2);
+    elements->append(3);
+    offsets->append(3);
+
+    elements->append(4);
+    elements->append(5);
+    elements->append(6);
+    elements->append(7);
+    elements->append(8);
+    offsets->append(8);
+
+    int64_t checksum = c0->xor_checksum(0, 2);
+    int64_t expected_checksum = 14;
+
+    ASSERT_EQ(checksum, expected_checksum);
+}
+
+PARALLEL_TEST(ArrayColumnTest, test_update_rows) {
+    auto offsets = UInt32Column::create();
+    auto elements = Int32Column::create();
+    auto column = ArrayColumn::create(elements, offsets);
+
+    // insert [1, 2, 3], [4, 5, 6]
+    elements->append(1);
+    elements->append(2);
+    elements->append(3);
+    offsets->append(3);
+
+    elements->append(4);
+    elements->append(5);
+    elements->append(6);
+    offsets->append(6);
+
+    // append [7, 8, 9]
+    elements->append(7);
+    elements->append(8);
+    elements->append(9);
+    offsets->append(9);
+
+    // append [10, 11, 12]
+    elements->append(10);
+    elements->append(11);
+    elements->append(12);
+    offsets->append(12);
+
+    auto offset_col1 = UInt32Column::create();
+    auto element_col1 = Int32Column::create();
+    auto replace_col1 = ArrayColumn::create(element_col1, offset_col1);
+
+    // insert [101, 102], [103, 104]
+    element_col1->append(101);
+    element_col1->append(102);
+    offset_col1->append(2);
+
+    element_col1->append(103);
+    element_col1->append(104);
+    offset_col1->append(4);
+
+    std::vector<uint32_t> replace_idxes = {1, 3};
+    ASSERT_TRUE(column->update_rows(*replace_col1.get(), replace_idxes.data()).ok());
+
+    ASSERT_EQ(4, column->size());
+    ASSERT_EQ("[1, 2, 3]", column->debug_item(0));
+    ASSERT_EQ("[101, 102]", column->debug_item(1));
+    ASSERT_EQ("[7, 8, 9]", column->debug_item(2));
+    ASSERT_EQ("[103, 104]", column->debug_item(3));
+
+    auto offset_col2 = UInt32Column::create();
+    auto element_col2 = Int32Column::create();
+    auto replace_col2 = ArrayColumn::create(element_col2, offset_col2);
+
+    // insert [201, 202], [203, 204]
+    element_col2->append(201);
+    element_col2->append(202);
+    offset_col2->append(2);
+
+    element_col2->append(203);
+    element_col2->append(204);
+    offset_col2->append(4);
+
+    ASSERT_TRUE(column->update_rows(*replace_col2.get(), replace_idxes.data()).ok());
+
+    ASSERT_EQ(4, column->size());
+    ASSERT_EQ("[1, 2, 3]", column->debug_item(0));
+    ASSERT_EQ("[201, 202]", column->debug_item(1));
+    ASSERT_EQ("[7, 8, 9]", column->debug_item(2));
+    ASSERT_EQ("[203, 204]", column->debug_item(3));
 }
 
 } // namespace starrocks::vectorized

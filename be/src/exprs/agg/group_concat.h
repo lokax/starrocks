@@ -1,8 +1,8 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
-#include <math.h>
+#include <cmath>
 
 #include "column/column_helper.h"
 #include "column/type_traits.h"
@@ -35,11 +35,11 @@ public:
         this->data(state).initial = false;
     }
 
-    void update(FunctionContext* ctx, const Column** columns, AggDataPtr state, size_t row_num) const override {
+    void update(FunctionContext* ctx, const Column** columns, AggDataPtr __restrict state,
+                size_t row_num) const override {
         DCHECK(columns[0]->is_binary());
         if (ctx->get_num_args() > 1) {
-            auto const_column_sep = ctx->get_constant_column(1);
-            if (const_column_sep == nullptr) {
+            if (!ctx->is_notnull_constant_column(1)) {
                 const InputColumnType* column_val = down_cast<const InputColumnType*>(columns[0]);
                 const InputColumnType* column_sep = down_cast<const InputColumnType*>(columns[1]);
 
@@ -59,6 +59,7 @@ public:
                     result.append(sep.get_data(), sep.get_size()).append(val.get_data(), val.get_size());
                 }
             } else {
+                auto const_column_sep = ctx->get_constant_column(1);
                 const InputColumnType* column_val = down_cast<const InputColumnType*>(columns[0]);
                 std::string& result = this->data(state).intermediate_string;
 
@@ -97,24 +98,31 @@ public:
         }
     }
 
-    void update_batch_single_state(FunctionContext* ctx, size_t batch_size, const Column** columns,
-                                   AggDataPtr state) const override {
+    void update_batch_single_state(FunctionContext* ctx, size_t chunk_size, const Column** columns,
+                                   AggDataPtr __restrict state) const override {
         if (ctx->get_num_args() > 1) {
             const InputColumnType* column_val = down_cast<const InputColumnType*>(columns[0]);
-            const InputColumnType* column_sep = down_cast<const InputColumnType*>(columns[1]);
-            this->data(state).intermediate_string.reserve(column_val->get_bytes().size() +
-                                                          column_sep->get_bytes().size());
+            if (!ctx->is_notnull_constant_column(1)) {
+                const InputColumnType* column_sep = down_cast<const InputColumnType*>(columns[1]);
+                this->data(state).intermediate_string.reserve(column_val->get_bytes().size() +
+                                                              column_sep->get_bytes().size());
+            } else {
+                auto const_column_sep = ctx->get_constant_column(1);
+                Slice sep = ColumnHelper::get_const_value<TYPE_VARCHAR>(const_column_sep);
+                this->data(state).intermediate_string.reserve(column_val->get_bytes().size() +
+                                                              sep.get_size() * chunk_size);
+            }
         } else {
             const InputColumnType* column_val = down_cast<const InputColumnType*>(columns[0]);
-            this->data(state).intermediate_string.reserve(column_val->get_bytes().size() + 2 * batch_size);
+            this->data(state).intermediate_string.reserve(column_val->get_bytes().size() + 2 * chunk_size);
         }
 
-        for (size_t i = 0; i < batch_size; ++i) {
+        for (size_t i = 0; i < chunk_size; ++i) {
             update(ctx, columns, state, i);
         }
     }
 
-    void update_batch_single_state(FunctionContext* ctx, AggDataPtr state, const Column** columns,
+    void update_batch_single_state(FunctionContext* ctx, AggDataPtr __restrict state, const Column** columns,
                                    int64_t peer_group_start, int64_t peer_group_end, int64_t frame_start,
                                    int64_t frame_end) const override {
         for (size_t i = frame_start; i < frame_end; ++i) {
@@ -122,7 +130,7 @@ public:
         }
     }
 
-    void merge(FunctionContext* ctx, const Column* column, AggDataPtr state, size_t row_num) const override {
+    void merge(FunctionContext* ctx, const Column* column, AggDataPtr __restrict state, size_t row_num) const override {
         Slice slice = column->get(row_num).get_slice();
         char* data = slice.data;
         uint32_t size_value = *reinterpret_cast<uint32_t*>(data);
@@ -138,7 +146,7 @@ public:
         }
     }
 
-    void serialize_to_column(FunctionContext* ctx, ConstAggDataPtr state, Column* to) const override {
+    void serialize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
         DCHECK(to->is_binary());
 
         auto* column = down_cast<BinaryColumn*>(to);
@@ -175,7 +183,8 @@ public:
         return old_size;
     }
 
-    void convert_to_serialize_format(const Columns& src, size_t chunk_size, ColumnPtr* dst) const override {
+    void convert_to_serialize_format(FunctionContext* ctx, const Columns& src, size_t chunk_size,
+                                     ColumnPtr* dst) const override {
         if (src.size() > 1) {
             auto* dst_column = down_cast<BinaryColumn*>((*dst).get());
             Bytes& bytes = dst_column->get_bytes();
@@ -245,14 +254,13 @@ public:
                     uint32_t size_value = value.get_size();
 
                     old_size = serialize_sep_and_value(bytes, old_size, size_value, size_sep, sep, value.get_data());
-                    ;
                     dst_column->get_offset()[i + 1] = old_size;
                 }
             }
         }
     }
 
-    void finalize_to_column(FunctionContext* ctx, ConstAggDataPtr state, Column* to) const override {
+    void finalize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
         const std::string& value = this->data(state).intermediate_string;
         // Remove first sep_length.
         const char* data = value.data();

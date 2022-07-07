@@ -1,8 +1,32 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exec/pipeline/fragment_context.h"
-namespace starrocks {
-namespace pipeline {
+
+#include "exec/pipeline/pipeline_driver_executor.h"
+#include "runtime/data_stream_mgr.h"
+#include "runtime/exec_env.h"
+
+namespace starrocks::pipeline {
+
+void FragmentContext::set_final_status(const Status& status) {
+    if (_final_status.load() != nullptr) {
+        return;
+    }
+    Status* old_status = nullptr;
+    if (_final_status.compare_exchange_strong(old_status, &_s_status)) {
+        _s_status = status;
+        if (_final_status.load()->is_cancelled()) {
+            LOG(WARNING) << "[Driver] Canceled, query_id=" << print_id(_query_id)
+                         << ", instance_id=" << print_id(_fragment_instance_id)
+                         << ", reason=" << final_status().to_string();
+            DriverExecutor* executor = enable_resource_group() ? _runtime_state->exec_env()->wg_driver_executor()
+                                                               : _runtime_state->exec_env()->driver_executor();
+            for (auto& driver : _drivers) {
+                executor->cancel(driver.get());
+            }
+        }
+    }
+}
 
 FragmentContext* FragmentContextManager::get_or_register(const TUniqueId& fragment_id) {
     std::lock_guard<std::mutex> lock(_lock);
@@ -17,6 +41,16 @@ FragmentContext* FragmentContextManager::get_or_register(const TUniqueId& fragme
     }
 }
 
+void FragmentContextManager::register_ctx(const TUniqueId& fragment_id, FragmentContextPtr fragment_ctx) {
+    std::lock_guard<std::mutex> lock(_lock);
+
+    if (_fragment_contexts.find(fragment_id) != _fragment_contexts.end()) {
+        return;
+    }
+
+    _fragment_contexts.emplace(fragment_id, std::move(fragment_ctx));
+}
+
 FragmentContextPtr FragmentContextManager::get(const TUniqueId& fragment_id) {
     std::lock_guard<std::mutex> lock(_lock);
     auto it = _fragment_contexts.find(fragment_id);
@@ -29,15 +63,26 @@ FragmentContextPtr FragmentContextManager::get(const TUniqueId& fragment_id) {
 
 void FragmentContextManager::unregister(const TUniqueId& fragment_id) {
     std::lock_guard<std::mutex> lock(_lock);
-    _fragment_contexts.erase(fragment_id);
+    auto it = _fragment_contexts.find(fragment_id);
+    if (it != _fragment_contexts.end()) {
+        it->second->_finish_promise.set_value();
+        _fragment_contexts.erase(it);
+    }
 }
 
 void FragmentContextManager::cancel(const Status& status) {
     std::lock_guard<std::mutex> lock(_lock);
-    for (auto ctx_it = _fragment_contexts.begin(); ctx_it != _fragment_contexts.end(); ++ctx_it) {
-        ctx_it->second->cancel(status);
+    for (auto& _fragment_context : _fragment_contexts) {
+        _fragment_context.second->cancel(status);
+    }
+}
+void FragmentContext::prepare_pass_through_chunk_buffer() {
+    _runtime_state->exec_env()->stream_mgr()->prepare_pass_through_chunk_buffer(_query_id);
+}
+void FragmentContext::destroy_pass_through_chunk_buffer() {
+    if (_runtime_state) {
+        _runtime_state->exec_env()->stream_mgr()->destroy_pass_through_chunk_buffer(_query_id);
     }
 }
 
-} // namespace pipeline
-} // namespace starrocks
+} // namespace starrocks::pipeline

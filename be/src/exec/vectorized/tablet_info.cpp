@@ -1,23 +1,26 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exec/vectorized/tablet_info.h"
 
 #include "column/binary_column.h"
 #include "column/chunk.h"
 #include "column/column_helper.h"
-#include "column/fixed_length_column.h"
+#include "exprs/expr.h"
 #include "runtime/mem_pool.h"
-#include "runtime/mem_tracker.h"
+#include "types/constexpr.h"
 #include "util/string_parser.hpp"
 
 namespace starrocks {
+
+class RuntimeState;
+
 namespace vectorized {
 
 OlapTablePartitionParam::OlapTablePartitionParam(std::shared_ptr<OlapTableSchemaParam> schema,
                                                  const TOlapTablePartitionParam& t_param)
         : _schema(std::move(schema)), _t_param(t_param) {}
 
-OlapTablePartitionParam::~OlapTablePartitionParam() {}
+OlapTablePartitionParam::~OlapTablePartitionParam() = default;
 
 Status OlapTablePartitionParam::init() {
     std::map<std::string, SlotDescriptor*> slots_map;
@@ -50,9 +53,12 @@ Status OlapTablePartitionParam::init() {
     }
     _distributed_columns.resize(_distributed_slot_descs.size());
 
+    if (_t_param.__isset.partition_exprs) {
+        RETURN_IF_ERROR(Expr::create_expr_trees(&_obj_pool, _t_param.partition_exprs, &_partitions_expr_ctxs));
+    }
+
     // initial partitions
-    for (int i = 0; i < _t_param.partitions.size(); ++i) {
-        const TOlapTablePartition& t_part = _t_param.partitions[i];
+    for (auto& t_part : _t_param.partitions) {
         OlapTablePartition* part = _obj_pool.add(new OlapTablePartition());
         part->id = t_part.id;
         if (t_part.__isset.start_keys) {
@@ -93,6 +99,20 @@ Status OlapTablePartitionParam::init() {
     }
 
     return Status::OK();
+}
+
+Status OlapTablePartitionParam::prepare(RuntimeState* state) {
+    RETURN_IF_ERROR(Expr::prepare(_partitions_expr_ctxs, state));
+    return Status::OK();
+}
+
+Status OlapTablePartitionParam::open(RuntimeState* state) {
+    RETURN_IF_ERROR(Expr::open(_partitions_expr_ctxs, state));
+    return Status::OK();
+}
+
+void OlapTablePartitionParam::close(RuntimeState* state) {
+    Expr::close(_partitions_expr_ctxs, state);
 }
 
 Status OlapTablePartitionParam::_create_partition_keys(const std::vector<TExprNode>& t_exprs, ChunkRow* part_key) {
@@ -174,9 +194,9 @@ Status OlapTablePartitionParam::_create_partition_keys(const std::vector<TExprNo
     return Status::OK();
 }
 
-void OlapTablePartitionParam::find_tablets(Chunk* chunk, std::vector<OlapTablePartition*>* partitions,
-                                           std::vector<uint32_t>* indexes, std::vector<uint8_t>* selection,
-                                           int* invalid_row_index) {
+Status OlapTablePartitionParam::find_tablets(Chunk* chunk, std::vector<OlapTablePartition*>* partitions,
+                                             std::vector<uint32_t>* indexes, std::vector<uint8_t>* selection,
+                                             int* invalid_row_index) {
     size_t num_rows = chunk->num_rows();
     partitions->resize(num_rows);
 
@@ -184,9 +204,15 @@ void OlapTablePartitionParam::find_tablets(Chunk* chunk, std::vector<OlapTablePa
 
     if (!_partition_columns.empty()) {
         Columns partition_columns(_partition_slot_descs.size());
-        for (size_t i = 0; i < partition_columns.size(); ++i) {
-            partition_columns[i] = chunk->get_column_by_slot_id(_partition_slot_descs[i]->id());
-            DCHECK(partition_columns[i] != nullptr);
+        if (!_partitions_expr_ctxs.empty()) {
+            for (size_t i = 0; i < partition_columns.size(); ++i) {
+                ASSIGN_OR_RETURN(partition_columns[i], _partitions_expr_ctxs[i]->evaluate(chunk));
+            }
+        } else {
+            for (size_t i = 0; i < partition_columns.size(); ++i) {
+                partition_columns[i] = chunk->get_column_by_slot_id(_partition_slot_descs[i]->id());
+                DCHECK(partition_columns[i] != nullptr);
+            }
         }
 
         ChunkRow row;
@@ -224,6 +250,7 @@ void OlapTablePartitionParam::find_tablets(Chunk* chunk, std::vector<OlapTablePa
             }
         }
     }
+    return Status::OK();
 }
 
 void OlapTablePartitionParam::_compute_hashes(Chunk* chunk, std::vector<uint32_t>* indexes) {

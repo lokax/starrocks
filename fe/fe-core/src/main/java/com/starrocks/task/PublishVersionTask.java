@@ -22,9 +22,9 @@
 package com.starrocks.task;
 
 import com.google.common.collect.Sets;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Replica;
 import com.starrocks.catalog.TabletInvertedIndex;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TPartitionVersionInfo;
 import com.starrocks.thrift.TPublishVersionRequest;
 import com.starrocks.thrift.TTaskType;
@@ -41,20 +41,25 @@ public class PublishVersionTask extends AgentTask {
     private long transactionId;
     private List<TPartitionVersionInfo> partitionVersionInfos;
     private List<Long> errorTablets;
-    private boolean isFinished;
+    private long commitTimestamp;
+    private String traceParent;
 
-    public PublishVersionTask(long backendId, long transactionId, long dbId,
-                              List<TPartitionVersionInfo> partitionVersionInfos, long createTime) {
+    public PublishVersionTask(long backendId, long transactionId, long dbId, long commitTimestamp,
+                              List<TPartitionVersionInfo> partitionVersionInfos, String traceParent, long createTime) {
         super(null, backendId, TTaskType.PUBLISH_VERSION, dbId, -1L, -1L, -1L, -1L, transactionId, createTime);
         this.transactionId = transactionId;
         this.partitionVersionInfos = partitionVersionInfos;
         this.errorTablets = new ArrayList<Long>();
         this.isFinished = false;
+        this.commitTimestamp = commitTimestamp;
+        this.traceParent = traceParent;
     }
 
     public TPublishVersionRequest toThrift() {
         TPublishVersionRequest publishVersionRequest = new TPublishVersionRequest(transactionId,
                 partitionVersionInfos);
+        publishVersionRequest.setCommit_timestamp(commitTimestamp);
+        publishVersionRequest.setTxn_trace_parent(traceParent);
         return publishVersionRequest;
     }
 
@@ -88,7 +93,7 @@ public class PublishVersionTask extends AgentTask {
 
     // collect all failed replicas for publish version task
     public Set<Long> collectErrorReplicas() {
-        TabletInvertedIndex tablets = Catalog.getCurrentInvertedIndex();
+        TabletInvertedIndex tablets = GlobalStateMgr.getCurrentInvertedIndex();
         Set<Long> errorReplicas = Sets.newHashSet();
         List<Long> errorTablets = this.getErrorTablets();
         if (errorTablets != null && !errorTablets.isEmpty()) {

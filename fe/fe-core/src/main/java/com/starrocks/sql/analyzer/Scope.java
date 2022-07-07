@@ -1,10 +1,10 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.analyzer;
 
+import com.google.common.collect.Maps;
 import com.starrocks.analysis.SlotRef;
-import com.starrocks.sql.analyzer.relation.QueryRelation;
+import com.starrocks.sql.ast.CTERelation;
 
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -15,10 +15,9 @@ import java.util.Optional;
  */
 public class Scope {
     private Scope parent;
-    private RelationId relationId;
-    private RelationFields relationFields;
-
-    private Map<String, QueryRelation> namedQueries = new HashMap<>();
+    private final RelationId relationId;
+    private final RelationFields relationFields;
+    private final Map<String, CTERelation> cteQueries = Maps.newLinkedHashMap();
 
     public Scope(RelationId relationId, RelationFields relation) {
         this.relationId = relationId;
@@ -34,48 +33,33 @@ public class Scope {
     }
 
     public Optional<ResolvedField> tryResolveFeild(SlotRef expression) {
-        return resolveField(expression, 0);
+        return resolveField(expression, 0, RelationId.anonymous());
     }
 
     public ResolvedField resolveField(SlotRef expression) {
-        Optional<ResolvedField> resolvedField = resolveField(expression, 0);
+        return resolveField(expression, RelationId.anonymous());
+    }
+
+    public ResolvedField resolveField(SlotRef expression, RelationId outerRelationId) {
+        Optional<ResolvedField> resolvedField = resolveField(expression, 0, outerRelationId);
         if (!resolvedField.isPresent()) {
             throw new SemanticException("Column '%s' cannot be resolved", expression.toSql());
         }
         return resolvedField.get();
     }
 
-    private Optional<ResolvedField> resolveField(SlotRef expression, int fieldIndexOffset) {
+    private Optional<ResolvedField> resolveField(SlotRef expression, int fieldIndexOffset, RelationId outerRelationId) {
         List<Field> matchFields = relationFields.resolveFields(expression);
         if (matchFields.size() > 1) {
-
-            boolean sameField = true;
-            for (int i = 0; i < matchFields.size() - 1; ++i) {
-                if (matchFields.get(i).getOriginExpression() != null &&
-                        matchFields.get(i + 1).getOriginExpression() != null) {
-                    if (!matchFields.get(i).getOriginExpression()
-                            .equals(matchFields.get(i + 1).getOriginExpression())) {
-                        sameField = false;
-                    }
-                }
-
-                if (matchFields.get(i).getRelationAlias() != null &&
-                        matchFields.get(i + 1).getRelationAlias() != null) {
-                    if (!matchFields.get(i).getRelationAlias().equals(matchFields.get(i + 1).getRelationAlias())) {
-                        sameField = false;
-                    }
-                }
-            }
-            if (sameField) {
-                return Optional.of(asResolvedField(matchFields.get(0), fieldIndexOffset));
-            }
-
             throw new SemanticException("Column '%s' is ambiguous", expression.getColumnName());
         } else if (matchFields.size() == 1) {
             return Optional.of(asResolvedField(matchFields.get(0), fieldIndexOffset));
         } else {
-            if (parent != null) {
-                return parent.resolveField(expression, fieldIndexOffset + relationFields.getAllFields().size());
+            if (parent != null
+                    //Correlated subqueries currently only support accessing properties in the first level outer layer
+                    && !relationId.equals(outerRelationId)) {
+                return parent.resolveField(expression, fieldIndexOffset + relationFields.getAllFields().size(),
+                        outerRelationId);
             }
             return Optional.empty();
         }
@@ -86,17 +70,17 @@ public class Scope {
         return new ResolvedField(this, field, hierarchyFieldIndex);
     }
 
-    public void addNamedQueries(String name, QueryRelation view) {
-        namedQueries.put(name, view);
+    public void addCteQueries(String name, CTERelation view) {
+        cteQueries.put(name, view);
     }
 
-    public Optional<QueryRelation> getNamedQueries(String name) {
-        if (namedQueries.containsKey(name)) {
-            return Optional.of(namedQueries.get(name));
+    public Optional<CTERelation> getCteQueries(String name) {
+        if (cteQueries.containsKey(name)) {
+            return Optional.of(cteQueries.get(name));
         }
 
         if (parent != null) {
-            return parent.getNamedQueries(name);
+            return parent.getCteQueries(name);
         }
 
         return Optional.empty();

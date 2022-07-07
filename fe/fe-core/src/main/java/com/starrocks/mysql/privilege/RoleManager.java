@@ -35,6 +35,7 @@ import com.starrocks.mysql.privilege.Auth.PrivLevel;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -127,6 +128,16 @@ public class RoleManager implements Writable {
         for (Role role : roles.values()) {
             role.dropUser(userIdentity);
         }
+    }
+
+    public List<String> getRoleNamesByUser(UserIdentity userIdentity) {
+        List<String> ret = new ArrayList<>();
+        for (Role role : roles.values()) {
+            if (role.getUsers().contains(userIdentity)) {
+                ret.add(role.getRoleName());
+            }
+        }
+        return ret;
     }
 
     public void getRoleInfo(List<List<String>> results) {

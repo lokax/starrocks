@@ -29,12 +29,15 @@ import com.starrocks.common.ErrorReport;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.CatalogMgr;
+import com.starrocks.sql.analyzer.SemanticException;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 
 public class TableName implements Writable {
+    private String catalog;
     private String tbl;
     private String db;
 
@@ -43,11 +46,20 @@ public class TableName implements Writable {
     }
 
     public TableName(String db, String tbl) {
+        this(null, db, tbl);
+    }
+
+    public TableName(String catalog, String db, String tbl) {
+        this.catalog = catalog;
         this.db = db;
         this.tbl = tbl;
     }
 
     public void analyze(Analyzer analyzer) throws AnalysisException {
+        if (Strings.isNullOrEmpty(catalog)) {
+            catalog = analyzer.getDefaultCatalog();
+        }
+
         if (Strings.isNullOrEmpty(db)) {
             db = analyzer.getDefaultDb();
             if (Strings.isNullOrEmpty(db)) {
@@ -57,7 +69,10 @@ public class TableName implements Writable {
             if (Strings.isNullOrEmpty(analyzer.getClusterName())) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_CLUSTER_NAME_NULL);
             }
-            db = ClusterNamespace.getFullName(analyzer.getClusterName(), db);
+
+            if (CatalogMgr.isInternalCatalog(catalog)) {
+                db = ClusterNamespace.getFullName(db);
+            }
         }
 
         if (Strings.isNullOrEmpty(tbl)) {
@@ -65,21 +80,35 @@ public class TableName implements Writable {
         }
     }
 
-    public void normalization(ConnectContext connectContext) throws AnalysisException {
-        if (Strings.isNullOrEmpty(db)) {
-            db = connectContext.getDatabase();
-            if (Strings.isNullOrEmpty(db)) {
-                ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
+    public void normalization(ConnectContext connectContext) {
+        try {
+            if (Strings.isNullOrEmpty(catalog)) {
+                if (Strings.isNullOrEmpty(connectContext.getCurrentCatalog())) {
+                    ErrorReport.reportAnalysisException(ErrorCode.ERR_BAD_CATALOG_ERROR, catalog);
+                }
+                catalog = connectContext.getCurrentCatalog();
             }
-        } else {
-            if (Strings.isNullOrEmpty(connectContext.getClusterName())) {
-                ErrorReport.reportAnalysisException(ErrorCode.ERR_CLUSTER_NAME_NULL);
-            }
-            db = ClusterNamespace.getFullName(connectContext.getClusterName(), db);
-        }
 
-        if (Strings.isNullOrEmpty(tbl)) {
-            throw new AnalysisException("Table name is null");
+            if (Strings.isNullOrEmpty(db)) {
+                db = connectContext.getDatabase();
+                if (Strings.isNullOrEmpty(db)) {
+                    ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
+                }
+            } else {
+                if (Strings.isNullOrEmpty(connectContext.getClusterName())) {
+                    ErrorReport.reportAnalysisException(ErrorCode.ERR_CLUSTER_NAME_NULL);
+                }
+
+                if (CatalogMgr.isInternalCatalog(catalog)) {
+                    db = ClusterNamespace.getFullName(db);
+                }
+            }
+
+            if (Strings.isNullOrEmpty(tbl)) {
+                throw new SemanticException("Table name is null");
+            }
+        } catch (AnalysisException e) {
+            throw new SemanticException(e.getMessage());
         }
     }
 
@@ -93,6 +122,14 @@ public class TableName implements Writable {
 
     public String getTbl() {
         return tbl;
+    }
+
+    public String getCatalog() {
+        return catalog;
+    }
+
+    public void setCatalog(String catalog) {
+        this.catalog = catalog;
     }
 
     public boolean isEmpty() {
@@ -142,8 +179,16 @@ public class TableName implements Writable {
 
     public String toSql() {
         StringBuilder stringBuilder = new StringBuilder();
+        if (catalog != null && !CatalogMgr.isInternalCatalog(catalog)) {
+            stringBuilder.append("`").append(catalog).append("`.");
+        }
         if (db != null) {
-            stringBuilder.append("`").append(db).append("`.");
+            String dbName = ClusterNamespace.getNameFromFullName(db);
+            if (dbName == null) {
+                stringBuilder.append("`").append(db).append("`.");
+            } else {
+                stringBuilder.append("`").append(dbName).append("`.");
+            }
         }
         stringBuilder.append("`").append(tbl).append("`");
         return stringBuilder.toString();

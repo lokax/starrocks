@@ -1,29 +1,39 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
 #include <unordered_map>
 
 #include "exec/exec_node.h"
-#include "exec/pipeline/morsel.h"
+#include "exec/pipeline/driver_limiter.h"
 #include "exec/pipeline/pipeline.h"
 #include "exec/pipeline/pipeline_driver.h"
 #include "exec/pipeline/pipeline_fwd.h"
+#include "exec/pipeline/runtime_filter_types.h"
+#include "exec/pipeline/scan/morsel.h"
 #include "gen_cpp/FrontendService.h"
 #include "gen_cpp/HeartbeatService.h"
 #include "gen_cpp/InternalService_types.h"
 #include "gen_cpp/PlanNodes_types.h"
 #include "gen_cpp/QueryPlanExtra_types.h"
 #include "gen_cpp/Types_types.h"
+#include "runtime/runtime_filter_worker.h"
 #include "runtime/runtime_state.h"
 #include "util/hash_util.hpp"
+
 namespace starrocks {
-class MemTracker;
 namespace pipeline {
+
+using RuntimeFilterPort = starrocks::RuntimeFilterPort;
 class FragmentContext {
+    friend FragmentContextManager;
+
 public:
-    FragmentContext() : _cancel_flag(false) {}
+    FragmentContext() {}
     ~FragmentContext() {
+        _runtime_filter_hub.close_all_in_filters(_runtime_state.get());
+        _drivers.clear();
+        close_all_pipelines();
         if (_plan != nullptr) {
             _plan->close(_runtime_state.get());
         }
@@ -35,13 +45,17 @@ public:
         _fragment_instance_id = fragment_instance_id;
     }
     void set_fe_addr(const TNetworkAddress& fe_addr) { _fe_addr = fe_addr; }
-    TNetworkAddress fe_addr() { return _fe_addr; }
-    MemTracker* mem_tracker() const { return _mem_tracker.get(); }
-    void set_mem_tracker(std::unique_ptr<MemTracker> mem_tracker) { _mem_tracker = std::move(mem_tracker); }
+    const TNetworkAddress& fe_addr() { return _fe_addr; }
+    void set_report_profile() { _is_report_profile = true; }
+    bool is_report_profile() { return _is_report_profile; }
+    void set_profile_level(const TPipelineProfileLevel::type& profile_level) { _profile_level = profile_level; }
+    const TPipelineProfileLevel::type& profile_level() { return _profile_level; }
+    FragmentFuture finish_future() { return _finish_promise.get_future(); }
     RuntimeState* runtime_state() const { return _runtime_state.get(); }
+    std::shared_ptr<RuntimeState> runtime_state_ptr() { return _runtime_state; }
     void set_runtime_state(std::shared_ptr<RuntimeState>&& runtime_state) { _runtime_state = std::move(runtime_state); }
-    ExecNode* plan() const { return _plan; }
-    void set_plan(ExecNode* plan) { _plan = plan; }
+    ExecNode*& plan() { return _plan; }
+
     Pipelines& pipelines() { return _pipelines; }
     void set_pipelines(Pipelines&& pipelines) { _pipelines = std::move(pipelines); }
     Drivers& drivers() { return _drivers; }
@@ -51,22 +65,10 @@ public:
         _final_status.store(nullptr);
     }
 
+    int num_drivers() const { return _num_drivers.load(); }
     bool count_down_drivers() { return _num_drivers.fetch_sub(1) == 1; }
 
-    void set_num_root_drivers(size_t num_root_drivers) { _num_root_drivers.store(num_root_drivers); }
-
-    bool count_down_root_drivers() { return _num_root_drivers.fetch_sub(1) == 1; }
-
-    void set_final_status(const Status& status) {
-        if (_final_status.load() != nullptr) {
-            return;
-        }
-        Status* old_status = nullptr;
-        static Status s_status;
-        if (_final_status.compare_exchange_strong(old_status, &s_status)) {
-            s_status = status;
-        }
-    }
+    void set_final_status(const Status& status);
 
     Status final_status() {
         auto* status = _final_status.load();
@@ -74,15 +76,41 @@ public:
     }
 
     void cancel(const Status& status) {
-        _cancel_flag.store(true, std::memory_order_release);
+        _runtime_state->set_is_cancelled(true);
         set_final_status(status);
     }
 
     void finish() { cancel(Status::OK()); }
 
-    bool is_canceled() { return _cancel_flag.load(std::memory_order_acquire) == true; }
+    bool is_canceled() { return _runtime_state->is_cancelled(); }
 
-    MorselQueueMap& morsel_queues() { return _morsel_queues; }
+    MorselQueueFactoryMap& morsel_queue_factories() { return _morsel_queue_factories; }
+
+    Status prepare_all_pipelines() {
+        for (auto& pipe : _pipelines) {
+            RETURN_IF_ERROR(pipe->prepare(_runtime_state.get()));
+        }
+        return Status::OK();
+    }
+
+    void close_all_pipelines() {
+        for (auto& pipe : _pipelines) {
+            pipe->close(_runtime_state.get());
+        }
+    }
+
+    RuntimeFilterHub* runtime_filter_hub() { return &_runtime_filter_hub; }
+
+    RuntimeFilterPort* runtime_filter_port() { return _runtime_state->runtime_filter_port(); }
+
+    void prepare_pass_through_chunk_buffer();
+    void destroy_pass_through_chunk_buffer();
+
+    void set_enable_resource_group() { _enable_resource_group = true; }
+
+    bool enable_resource_group() const { return _enable_resource_group; }
+
+    void set_driver_token(DriverLimiter::TokenPtr driver_token) { _driver_token = std::move(driver_token); }
 
 private:
     // Id of this query
@@ -91,26 +119,35 @@ private:
     TUniqueId _fragment_instance_id;
     TNetworkAddress _fe_addr;
 
-    std::unique_ptr<MemTracker> _mem_tracker = nullptr;
+    bool _is_report_profile = false;
+    // Level of profile
+    TPipelineProfileLevel::type _profile_level;
+
+    // promise used to determine whether fragment finished its execution
+    FragmentPromise _finish_promise;
+
+    // never adjust the order of _runtime_state, _plan, _pipelines and _drivers, since
+    // _plan depends on _runtime_state and _drivers depends on _runtime_state.
     std::shared_ptr<RuntimeState> _runtime_state = nullptr;
     ExecNode* _plan = nullptr; // lives in _runtime_state->obj_pool()
     Pipelines _pipelines;
     Drivers _drivers;
-    // _morsel_queues is mapping from an source_id to its corresponding
-    // MorselQueue that is shared among drivers created from the same pipeline,
-    // drivers contend for Morsels from MorselQueue.
-    MorselQueueMap _morsel_queues;
-    // when _num_root_drivers counts down to zero, means that all the root drivers are finished,
-    // the fragment instance produces the entire result required, all the outstanding drivers
-    // should finish computation.
-    std::atomic<size_t> _num_root_drivers;
+
+    RuntimeFilterHub _runtime_filter_hub;
+
+    MorselQueueFactoryMap _morsel_queue_factories;
     // when _num_drivers counts down to zero, means all drivers has finished, then BE
     // can notify FE via reportExecStatus that fragment instance is done after which
     // FragmentContext can be unregistered safely.
     std::atomic<size_t> _num_drivers;
     std::atomic<Status*> _final_status;
-    std::atomic<bool> _cancel_flag;
+    Status _s_status;
+
+    bool _enable_resource_group = false;
+
+    DriverLimiter::TokenPtr _driver_token = nullptr;
 };
+
 class FragmentContextManager {
 public:
     FragmentContextManager() = default;
@@ -123,7 +160,10 @@ public:
 
     FragmentContext* get_or_register(const TUniqueId& fragment_id);
     FragmentContextPtr get(const TUniqueId& fragment_id);
+
+    void register_ctx(const TUniqueId& fragment_id, FragmentContextPtr fragment_ctx);
     void unregister(const TUniqueId& fragment_id);
+
     void cancel(const Status& status);
 
 private:

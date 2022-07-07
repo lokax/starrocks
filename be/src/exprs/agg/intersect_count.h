@@ -1,8 +1,8 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
-#include <math.h>
+#include <cmath>
 
 #include "column/column_helper.h"
 #include "column/object_column.h"
@@ -10,9 +10,9 @@
 #include "column/vectorized_fwd.h"
 #include "exprs/agg/aggregate.h"
 #include "gutil/casts.h"
+#include "types/bitmap_value.h"
 #include "udf/udf.h"
 #include "util/bitmap_intersect.h"
-#include "util/bitmap_value.h"
 
 namespace starrocks::vectorized {
 template <PrimitiveType PT, typename = guard::Guard>
@@ -53,7 +53,8 @@ public:
 
     void reset(FunctionContext* ctx, const Columns& args, AggDataPtr state) const override {}
 
-    void update(FunctionContext* ctx, const Column** columns, AggDataPtr state, size_t row_num) const override {
+    void update(FunctionContext* ctx, const Column** columns, AggDataPtr __restrict state,
+                size_t row_num) const override {
         DCHECK(columns[0]->is_object());
 
         auto& intersect = this->data(state).intersect;
@@ -87,13 +88,13 @@ public:
         }
     }
 
-    void merge(FunctionContext* ctx, const Column* column, AggDataPtr state, size_t row_num) const override {
+    void merge(FunctionContext* ctx, const Column* column, AggDataPtr __restrict state, size_t row_num) const override {
         auto& intersect = this->data(state).intersect;
         Slice slice = column->get(row_num).get_slice();
         intersect.merge(BitmapIntersect<T>((char*)slice.data));
     }
 
-    void serialize_to_column(FunctionContext* ctx, ConstAggDataPtr state, Column* to) const override {
+    void serialize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
         DCHECK(to->is_binary());
         auto& intersect = this->data(state).intersect;
 
@@ -109,7 +110,8 @@ public:
         column->get_offset().emplace_back(new_size);
     }
 
-    void convert_to_serialize_format(const Columns& src, size_t chunk_size, ColumnPtr* dst) const override {
+    void convert_to_serialize_format(FunctionContext* ctx, const Columns& src, size_t chunk_size,
+                                     ColumnPtr* dst) const override {
         DCHECK(src[0]->is_object());
 
         // initial keys in BitmapIntersect.
@@ -167,7 +169,7 @@ public:
         }
     }
 
-    void finalize_to_column(FunctionContext* ctx, ConstAggDataPtr state, Column* to) const override {
+    void finalize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
         auto& intersect = this->data(state).intersect;
         down_cast<ResultColumnType*>(to)->append(intersect.intersect_count());
     }

@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_RUNTIME_PLAN_FRAGMENT_EXECUTOR_H
-#define STARROCKS_BE_RUNTIME_PLAN_FRAGMENT_EXECUTOR_H
+#pragma once
 
 #include <condition_variable>
 #include <functional>
@@ -38,7 +37,6 @@ namespace starrocks {
 
 class ExecNode;
 class RowDescriptor;
-class RowBatch;
 class DataSink;
 class DataStreamMgr;
 class RuntimeProfile;
@@ -78,7 +76,7 @@ public:
 
     // if report_status_cb is not empty, is used to report the accumulated profile
     // information periodically during execution (open() or get_next()).
-    PlanFragmentExecutor(ExecEnv* exec_env, const report_status_callback& report_status_cb);
+    PlanFragmentExecutor(ExecEnv* exec_env, report_status_callback report_status_cb);
 
     // Closes the underlying plan fragment and frees up all resources allocated
     // in open()/get_next().
@@ -106,13 +104,6 @@ public:
     // time when open() returns, and the status-reporting thread will have been stopped.
     Status open();
 
-    // Return results through 'batch'. Sets '*batch' to NULL if no more results.
-    // '*batch' is owned by PlanFragmentExecutor and must not be deleted.
-    // When *batch == NULL, get_next() should not be called anymore. Also, report_status_cb
-    // will have been called for the final time and the status-reporting thread
-    // will have been stopped.
-    Status get_next(RowBatch** batch);
-
     Status get_next(vectorized::ChunkPtr* chunk);
 
     // Closes the underlying plan fragment and frees up all resources allocated
@@ -126,7 +117,10 @@ public:
     void release_thread_token();
 
     // call these only after prepare()
-    RuntimeState* runtime_state() { return _runtime_state.get(); }
+    RuntimeState* runtime_state() { return _runtime_state; }
+
+    void set_runtime_state(RuntimeState* runtime_state) { _runtime_state = runtime_state; }
+
     const RowDescriptor& row_desc();
 
     // Profile information for plan and output sink.
@@ -141,7 +135,6 @@ public:
     void set_is_report_on_cancel(bool val) { _is_report_on_cancel = val; }
 
 private:
-    bool _is_vectorized = false;
     ExecEnv* _exec_env;        // not owned
     ExecNode* _plan = nullptr; // lives in _runtime_state->obj_pool()
     TUniqueId _query_id;
@@ -180,12 +173,11 @@ private:
 
     // note that RuntimeState should be constructed before and destructed after `_sink' and `_row_batch',
     // therefore we declare it before `_sink' and `_row_batch'
-    std::unique_ptr<RuntimeState> _runtime_state;
+    RuntimeState* _runtime_state = nullptr;
     // Output sink for rows sent to this fragment. May not be set, in which case rows are
     // returned via get_next's row batch
     // Created in prepare (if required), owned by this object.
     std::unique_ptr<DataSink> _sink;
-    std::unique_ptr<RowBatch> _row_batch;
 
     vectorized::ChunkPtr _chunk;
 
@@ -222,18 +214,7 @@ private:
     // sends a final report.
     void update_status(const Status& status);
 
-    // Executes open() logic and returns resulting status. Does not set _status.
-    // If this plan fragment has no sink, open_internal() does nothing.
-    // If this plan fragment has a sink and open_internal() returns without an
-    // error condition, all rows will have been sent to the sink, the sink will
-    // have been closed, a final report will have been sent and the report thread will
-    // have been stopped. _sink will be set to NULL after successful execution.
-    Status open_internal();
-
     Status _open_internal_vectorized();
-
-    // Executes get_next() logic and returns resulting status.
-    Status get_next_internal(RowBatch** batch);
 
     Status _get_next_internal_vectorized(vectorized::ChunkPtr* chunk);
 
@@ -243,5 +224,3 @@ private:
 };
 
 } // namespace starrocks
-
-#endif

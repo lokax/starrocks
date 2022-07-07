@@ -24,6 +24,7 @@ namespace java com.starrocks.thrift
 
 include "Status.thrift"
 include "Types.thrift"
+include "Partitions.thrift"
 include "InternalService.thrift"
 include "PlanNodes.thrift"
 include "Planner.thrift"
@@ -53,6 +54,10 @@ struct TColumnDesc {
   4: optional i32 columnPrecision
   5: optional i32 columnScale
   20: optional string columnKey
+  21: optional bool key
+  22: optional string aggregationType
+  23: optional string dbName
+  24: optional string tableName
 }
 
 // A column definition; used by CREATE TABLE and DESCRIBE <table> statements. A column
@@ -63,7 +68,7 @@ struct TColumnDef {
   2: optional string comment
 }
 
-// Arguments to DescribeTable, which returns a list of column descriptors for a 
+// Arguments to DescribeTable, which returns a list of column descriptors for a
 // given table
 struct TDescribeTableParams {
   1: optional string db
@@ -71,6 +76,7 @@ struct TDescribeTableParams {
   3: optional string user   // deprecated
   4: optional string user_ip    // deprecated
   5: optional Types.TUserIdentity current_user_ident // to replace the user and user ip
+  6: optional i64 limit
 }
 
 // Results of a call to describeTable()
@@ -295,18 +301,19 @@ struct TGetDbsResult {
   1: list<string> dbs
 }
 
-// Arguments to getTableNames, which returns a list of tables that match an 
+// Arguments to getTableNames, which returns a list of tables that match an
 // optional pattern.
 struct TGetTablesParams {
   // If not set, match tables in all DBs
-  1: optional string db 
+  1: optional string db
 
   // If not set, match every table
-  2: optional string pattern 
+  2: optional string pattern
   3: optional string user   // deprecated
   4: optional string user_ip    // deprecated
   5: optional Types.TUserIdentity current_user_ident // to replace the user and user ip
   20: optional Types.TTableType type // getting a certain type of tables
+  21: optional i64 limit
 }
 
 struct TTableStatus {
@@ -317,10 +324,50 @@ struct TTableStatus {
     5: optional i64 last_check_time
     6: optional i64 create_time
     20: optional string ddl_sql
+    // id for materialized view
+    21: optional string id
+    // row_count for materialized view
+    22: optional string rows
 }
 
 struct TListTableStatusResult {
     1: required list<TTableStatus> tables
+}
+
+// Arguments to showTasks/ShowTaskRuns
+struct TGetTasksParams {
+    1: optional string db
+    2: optional Types.TUserIdentity current_user_ident
+}
+
+struct TTaskInfo {
+    1: optional string task_name
+    2: optional i64 create_time
+    3: optional string schedule
+    4: optional string database
+    5: optional string definition
+    6: optional i64 expire_time
+}
+
+struct TGetTaskInfoResult {
+    1: required list<TTaskInfo> tasks
+}
+
+struct TTaskRunInfo {
+    1: optional string query_id
+    2: optional string task_name
+    3: optional i64 create_time
+    4: optional i64 finish_time
+    5: optional string state
+    6: optional string database
+    7: optional string definition
+    8: optional i64 expire_time
+    9: optional i32 error_code
+    10: optional string error_message
+}
+
+struct TGetTaskRunInfoResult {
+    1: optional list<TTaskRunInfo> task_runs
 }
 
 // getTableNames returns a list of unqualified table names
@@ -338,7 +385,7 @@ enum FrontendServiceVersion {
   V1
 }
 
-// The results of an INSERT query, sent to the coordinator as part of 
+// The results of an INSERT query, sent to the coordinator as part of
 // TReportExecStatusParams
 struct TReportExecStatusParams {
   1: required FrontendServiceVersion protocol_version
@@ -364,9 +411,9 @@ struct TReportExecStatusParams {
   // cumulative profile
   // required in V1
   7: optional RuntimeProfile.TRuntimeProfileTree profile
-  
+
   // New errors that have not been reported to the coordinator
-  // optional in V1 
+  // optional in V1
   9: optional list<string> error_log
 
   // URL of files need to load
@@ -376,7 +423,7 @@ struct TReportExecStatusParams {
   12: optional string tracking_url
 
   // export files
-  13: optional list<string> export_files 
+  13: optional list<string> export_files
 
   14: optional list<Types.TTabletCommitInfo> commitInfos
 
@@ -399,7 +446,7 @@ struct TUpdateMiniEtlTaskStatusRequest {
 struct TMasterOpRequest {
     1: required string user
     2: required string db
-    3: required string sql 
+    3: required string sql
     4: optional Types.TResourceInfo resourceInfo
     5: optional string cluster
     6: optional i64 execMemLimit // deprecated, move into query_options
@@ -519,6 +566,9 @@ struct TStreamLoadPutRequest {
     24: optional string jsonpaths
     25: optional i64 thrift_rpc_timeout_ms
     26: optional string json_root
+    27: optional bool partial_update
+    28: optional string transmission_compression_type
+    29: optional i32 load_dop
     // only valid when file type is CSV
     50: optional string rowDelimiter
 }
@@ -551,7 +601,7 @@ struct TMiniLoadTxnCommitAttachment {
     1: required i64 loadedRows
     2: required i64 filteredRows
     3: optional string errorLogUrl
-} 
+}
 
 struct TManualLoadTxnCommitAttachment {
     1: optional i64 loadedRows
@@ -559,12 +609,12 @@ struct TManualLoadTxnCommitAttachment {
     3: optional string errorLogUrl
     4: optional i64 receivedBytes
     5: optional i64 loadedBytes
-} 
+}
 
 struct TTxnCommitAttachment {
     1: required Types.TLoadType loadType
     2: optional TRLTaskTxnCommitAttachment rlTaskTxnCommitAttachment
-    3: optional TMiniLoadTxnCommitAttachment mlTxnCommitAttachment 
+    3: optional TMiniLoadTxnCommitAttachment mlTxnCommitAttachment
     10: optional TManualLoadTxnCommitAttachment manualLoadTxnCommitAttachment
 }
 
@@ -664,9 +714,243 @@ struct TRefreshTableRequest {
   1: optional string db_name
   2: optional string table_name
   3: optional list<string> partitions
+  4: optional string catalog_name
 }
 
 struct TRefreshTableResponse {
+    1: required Status.TStatus status
+}
+
+struct TGetTableMetaRequest {
+    1: optional string db_name
+    2: optional string table_name
+    3: optional TAuthenticateParams auth_info
+}
+
+struct TBackendMeta {
+    1: optional i64 backend_id
+    2: optional string host
+    3: optional i32 be_port
+    4: optional i32 rpc_port
+    5: optional i32 http_port
+    6: optional bool alive
+    7: optional i32  state
+}
+
+struct TReplicaMeta {
+    1: optional i64 replica_id
+    2: optional i64 backend_id
+    3: optional i32 schema_hash
+    4: optional i64 version
+    5: optional i64 version_hash // Deprecated
+    6: optional i64 data_size
+    7: optional i64 row_count
+    8: optional string state
+    9: optional i64 last_failed_version
+    10: optional i64 last_failed_version_hash // Deprecated
+    11: optional i64 last_failed_time
+    12: optional i64 last_success_version
+    13: optional i64 last_success_version_hash // Deprecated
+    14: optional i64 version_count
+    15: optional i64 path_hash
+    16: optional bool bad
+}
+
+struct TTabletMeta {
+    1: optional i64 tablet_id
+    2: optional i64 db_id
+    3: optional i64 table_id
+    4: optional i64 partition_id
+    5: optional i64 index_id
+    6: optional Types.TStorageMedium storage_medium
+    7: optional i32 old_schema_hash
+    8: optional i32 new_schema_hash
+    9: optional i64 checked_version
+    10: optional i64 checked_version_hash // Deprecated
+    11: optional bool consistent
+    12: optional list<TReplicaMeta> replicas
+}
+
+struct TIndexInfo {
+    1: optional string index_name
+    2: optional list<string> columns
+    3: optional string index_type
+    4: optional string comment
+}
+
+struct TColumnMeta {
+  1: optional string columnName
+  2: optional Types.TTypeDesc columnType
+  3: optional i32 columnLength
+  4: optional i32 columnPrecision
+  5: optional i32 columnScale
+  6: optional string columnKey
+  7: optional bool key
+  8: optional string aggregationType
+  9: optional string comment
+  10: optional bool allowNull
+  11: optional string defaultValue
+}
+
+struct TSchemaMeta {
+    1: optional list<TColumnMeta> columns
+    2: optional i32 schema_version
+    3: optional i32 schema_hash
+    4: optional i16 short_key_col_count
+    5: optional Types.TStorageType storage_type
+    6: optional string keys_type
+}
+
+enum TIndexState {
+    NORMAL,
+    SHADOW,
+}
+
+struct TIndexMeta {
+    1: optional i64 index_id
+    2: optional i64 partition_id
+    3: optional TIndexState index_state
+    4: optional i64 row_count
+    5: optional i64 rollup_index_id
+    6: optional i64 rollup_finished_version
+    7: optional TSchemaMeta schema_meta
+    8: optional list<TTabletMeta> tablets
+}
+
+struct TDataProperty {
+    1: optional Types.TStorageMedium storage_medium
+    2: optional i64 cold_time
+}
+
+struct TBasePartitionDesc {
+    1: optional map<i64, i16> replica_num_map
+    2: optional map<i64, bool> in_memory_map
+    3: optional map<i64, TDataProperty> data_property
+}
+
+struct TSinglePartitionDesc {
+    1: optional TBasePartitionDesc base_desc
+}
+
+// one single partition range
+struct TRange {
+    1: optional i64 partition_id
+    2: optional TBasePartitionDesc base_desc
+    3: optional binary start_key
+    4: optional binary end_key
+}
+
+struct TRangePartitionDesc {
+    // partition keys
+    1: optional list<TColumnMeta> columns
+    // partition ranges
+    2: optional map<i64, TRange> ranges
+}
+
+struct TPartitionInfo {
+    1: optional Partitions.TPartitionType type
+    2: optional TSinglePartitionDesc single_partition_desc
+    3: optional TRangePartitionDesc  range_partition_desc
+}
+
+struct TPartitionMeta {
+    1: optional i64 partition_id
+    2: optional string partition_name
+    3: optional string state
+    4: optional i64 commit_version_hash // Deprecated
+    5: optional i64 visible_version
+    6: optional i64 visible_version_hash // Deprecated
+    7: optional i64 visible_time
+    8: optional i64 next_version
+    9: optional i64 next_version_hash // Deprecated
+}
+
+struct THashDistributionInfo {
+    1: optional i32 bucket_num
+    2: optional list<string> distribution_columns
+}
+
+struct TRandomDistributionInfo {
+    1: optional i32 bucket_num
+}
+
+struct TDistributionDesc {
+    1: optional string distribution_type
+    2: optional THashDistributionInfo hash_distribution
+    3: optional TRandomDistributionInfo random_distribution
+}
+
+struct TTableMeta {
+    1: optional i64 table_id
+    2: optional string table_name
+    3: optional i64 db_id
+    4: optional string db_name
+    5: optional i32 cluster_id
+    6: optional string state
+    7: optional double bloomfilter_fpp
+    8: optional i64 base_index_id
+    9: optional string key_type
+    10: optional TDistributionDesc distribution_desc
+    11: optional map<string, string> properties
+    12: optional list<TIndexMeta> indexes
+    13: optional TPartitionInfo partition_info
+    14: optional list<TPartitionMeta> partitions
+    15: optional list<TIndexInfo> index_infos
+    16: optional string colocate_group
+    17: optional list<string> bloomfilter_columns
+}
+
+struct TGetTableMetaResponse {
+    1: optional Status.TStatus status
+    2: optional TTableMeta table_meta
+    3: optional list<TBackendMeta> backends
+}
+
+struct TBeginRemoteTxnRequest {
+    1: optional i64 db_id
+    2: optional list<i64> table_ids
+    3: optional string label
+    4: optional i32 source_type
+    5: optional i64 timeout_second
+    6: optional TAuthenticateParams auth_info
+}
+
+struct TBeginRemoteTxnResponse {
+    1: optional Status.TStatus status
+    2: optional string txn_label
+    3: optional i64 txn_id
+}
+
+struct TCommitRemoteTxnRequest {
+    1: optional i64 txn_id
+    2: optional i64 db_id
+    3: optional TAuthenticateParams auth_info
+    4: optional i32 commit_timeout_ms
+    5: optional list<Types.TTabletCommitInfo> commit_infos
+    6: optional TTxnCommitAttachment commit_attachment
+}
+
+struct TCommitRemoteTxnResponse {
+    1: optional Status.TStatus status
+}
+
+struct TAbortRemoteTxnRequest {
+    1: optional i64 txn_id
+    2: optional i64 db_id
+    3: optional string error_msg
+    4: optional TAuthenticateParams auth_info
+}
+
+struct TAbortRemoteTxnResponse {
+    1: optional Status.TStatus status
+}
+
+struct TSetConfigRequest {
+    1: optional list<string> keys
+    2: optional list<string> values
+}
+
+struct TSetConfigResponse {
     1: required Status.TStatus status
 }
 
@@ -677,20 +961,27 @@ service FrontendService {
     TGetUserPrivsResult getUserPrivs(1:TGetUserPrivsParams params)
     TGetDBPrivsResult getDBPrivs(1:TGetDBPrivsParams params)
     TGetTablePrivsResult getTablePrivs(1:TGetTablePrivsParams params)
-    
+
     TDescribeTableResult describeTable(1:TDescribeTableParams params)
     TShowVariableResult showVariables(1:TShowVariableRequest params)
     TReportExecStatusResult reportExecStatus(1:TReportExecStatusParams params)
 
     MasterService.TMasterResult finishTask(1:MasterService.TFinishTaskRequest request)
     MasterService.TMasterResult report(1:MasterService.TReportRequest request)
-    MasterService.TFetchResourceResult fetchResource()
     
+    // Deprecated
+    MasterService.TFetchResourceResult fetchResource()
+
+    //NOTE: Do not add numbers to the parameters, otherwise it will cause compatibility problems
     TFeResult isMethodSupported(TIsMethodSupportedRequest request)
 
+    //NOTE: Do not add numbers to the parameters, otherwise it will cause compatibility problems
     TMasterOpResult forward(TMasterOpRequest params)
 
     TListTableStatusResult listTableStatus(1:TGetTablesParams params)
+
+    TGetTaskInfoResult getTasks(1:TGetTasksParams params)
+    TGetTaskRunInfoResult getTaskRuns(1:TGetTasksParams params)
 
     TFeResult updateExportTaskStatus(1:TUpdateExportTaskStatusRequest request)
 
@@ -703,5 +994,13 @@ service FrontendService {
     Status.TStatus snapshotLoaderReport(1: TSnapshotLoaderReportRequest request)
 
     TRefreshTableResponse refreshTable(1:TRefreshTableRequest request)
+
+    TGetTableMetaResponse getTableMeta(1: TGetTableMetaRequest request)
+
+    TBeginRemoteTxnResponse  beginRemoteTxn(1: TBeginRemoteTxnRequest request)
+    TCommitRemoteTxnResponse commitRemoteTxn(1: TCommitRemoteTxnRequest request)
+    TAbortRemoteTxnResponse  abortRemoteTxn(1: TAbortRemoteTxnRequest request)
+
+    TSetConfigResponse setConfig(1: TSetConfigRequest request)
 }
 

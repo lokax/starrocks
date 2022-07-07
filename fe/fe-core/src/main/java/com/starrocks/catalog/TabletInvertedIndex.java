@@ -30,6 +30,8 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Table;
 import com.starrocks.catalog.Replica.ReplicaState;
 import com.starrocks.common.Pair;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.system.Backend;
 import com.starrocks.thrift.TPartitionVersionInfo;
 import com.starrocks.thrift.TStorageMedium;
 import com.starrocks.thrift.TTablet;
@@ -54,7 +56,7 @@ import java.util.stream.Collectors;
  * this class stores a inverted index
  * key is tablet id. value is the related ids of this tablet
  * Checkpoint thread is no need to modify this inverted index, because this inverted index will not be wrote
- * into images, all meta data are in catalog, and the inverted index will be rebuild when FE restart.
+ * into images, all meta data are in globalStateMgr, and the inverted index will be rebuild when FE restart.
  */
 public class TabletInvertedIndex {
     private static final Logger LOG = LogManager.getLogger(TabletInvertedIndex.class);
@@ -71,17 +73,6 @@ public class TabletInvertedIndex {
 
     // replica id -> tablet id
     private Map<Long, Long> replicaToTabletMap = Maps.newHashMap();
-
-    /*
-     *  we use this to save memory.
-     *  we do not need create TabletMeta instance for each tablet,
-     *  cause tablets in one (Partition-MaterializedIndex) has same parent info
-     *      (dbId, tableId, partitionId, indexId, schemaHash)
-     *  we use 'tabletMetaTable' to do the update things
-     *      (eg. update schema hash in TabletMeta)
-     *  partition id -> (index id -> tablet meta)
-     */
-    private Table<Long, Long, TabletMeta> tabletMetaTable = HashBasedTable.create();
 
     // tablet id -> (backend id -> replica)
     private Table<Long, Long, Replica> replicaMetaTable = HashBasedTable.create();
@@ -116,6 +107,7 @@ public class TabletInvertedIndex {
                              Map<Long, TTabletInfo> foundTabletsWithInvalidSchema,
                              ListMultimap<TStorageMedium, Long> tabletMigrationMap,
                              Map<Long, ListMultimap<Long, TPartitionVersionInfo>> transactionsToPublish,
+                             Map<Long, Long> transactionsToCommitTime,
                              ListMultimap<Long, Long> transactionsToClear,
                              ListMultimap<Long, Long> tabletRecoveryMap,
                              Set<Pair<Long, Integer>> tabletWithoutPartitionId) {
@@ -126,6 +118,12 @@ public class TabletInvertedIndex {
                     tabletWithoutPartitionId.add(new Pair<>(tabletInfo.getTablet_id(), tabletInfo.getSchema_hash()));
                 }
             }
+        }
+
+        int backendStorageTypeCnt = -1;
+        Backend be = GlobalStateMgr.getCurrentSystemInfo().getBackend(backendId);
+        if (be != null) {
+            backendStorageTypeCnt = be.getAvailableBackendStorageTypeCnt();
         }
 
         readLock();
@@ -139,6 +137,10 @@ public class TabletInvertedIndex {
                     long tabletId = entry.getKey();
                     Preconditions.checkState(tabletMetaMap.containsKey(tabletId));
                     TabletMeta tabletMeta = tabletMetaMap.get(tabletId);
+
+                    if (tabletMeta.isUseStarOS()) {
+                        continue;
+                    }
 
                     if (backendTablets.containsKey(tabletId)) {
                         TTablet backendTablet = backendTablets.get(tabletId);
@@ -167,11 +169,10 @@ public class TabletInvertedIndex {
 
                                 if (needRecover(replica, tabletMeta.getOldSchemaHash(), backendTabletInfo)) {
                                     LOG.warn("replica {} of tablet {} on backend {} need recovery. "
-                                                    + "replica in FE: {}, report version {}-{}, report schema hash: {},"
+                                                    + "replica in FE: {}, report version {}, report schema hash: {},"
                                                     + " is bad: {}, is version missing: {}",
                                             replica.getId(), tabletId, backendId, replica,
                                             backendTabletInfo.getVersion(),
-                                            backendTabletInfo.getVersion_hash(),
                                             backendTabletInfo.getSchema_hash(),
                                             backendTabletInfo.isSetUsed() ? backendTabletInfo.isUsed() : "unknown",
                                             backendTabletInfo.isSetVersion_miss() ? backendTabletInfo.isVersion_miss() :
@@ -183,8 +184,16 @@ public class TabletInvertedIndex {
                                 long partitionId = tabletMeta.getPartitionId();
                                 TStorageMedium storageMedium = storageMediumMap.get(partitionId);
                                 if (storageMedium != null && backendTabletInfo.isSetStorage_medium()) {
+                                    // If storage medium is less than 1, there is no need to send migration tasks to BE.
+                                    // Because BE will ignore this request.
                                     if (storageMedium != backendTabletInfo.getStorage_medium()) {
-                                        tabletMigrationMap.put(storageMedium, tabletId);
+                                        if (backendStorageTypeCnt <= 1) {
+                                            LOG.debug("available storage medium type count is less than 1, " +
+                                                            "no need to send migrate task. tabletId={}, backendId={}.",
+                                                    tabletId, backendId);
+                                        } else {
+                                            tabletMigrationMap.put(storageMedium, tabletId);
+                                        }
                                     }
                                     if (storageMedium != tabletMeta.getStorageMedium()) {
                                         tabletMeta.setStorageMedium(storageMedium);
@@ -193,7 +202,8 @@ public class TabletInvertedIndex {
                                 // check if should clear transactions
                                 if (backendTabletInfo.isSetTransaction_ids()) {
                                     List<Long> transactionIds = backendTabletInfo.getTransaction_ids();
-                                    GlobalTransactionMgr transactionMgr = Catalog.getCurrentGlobalTransactionMgr();
+                                    GlobalTransactionMgr transactionMgr =
+                                            GlobalStateMgr.getCurrentGlobalTransactionMgr();
                                     for (Long transactionId : transactionIds) {
                                         TransactionState transactionState =
                                                 transactionMgr.getTransactionState(tabletMeta.getDbId(), transactionId);
@@ -221,14 +231,13 @@ public class TabletInvertedIndex {
                                                  */
                                                 LOG.info(
                                                         "failed to find partition commit info. table: {}, " +
-                                                                "partition: {}, tablet: {}, txn id: {}",
+                                                                "partition: {}, tablet: {}, txn_id: {}",
                                                         tabletMeta.getTableId(), partitionId, tabletId,
                                                         transactionState.getTransactionId());
                                             } else {
                                                 TPartitionVersionInfo versionInfo =
                                                         new TPartitionVersionInfo(tabletMeta.getPartitionId(),
-                                                                partitionCommitInfo.getVersion(),
-                                                                partitionCommitInfo.getVersionHash());
+                                                                partitionCommitInfo.getVersion(), 0);
                                                 ListMultimap<Long, TPartitionVersionInfo> map =
                                                         transactionsToPublish.get(transactionState.getDbId());
                                                 if (map == null) {
@@ -236,6 +245,8 @@ public class TabletInvertedIndex {
                                                     transactionsToPublish.put(transactionState.getDbId(), map);
                                                 }
                                                 map.put(transactionId, versionInfo);
+                                                transactionsToCommitTime.put(transactionId,
+                                                        transactionState.getCommitTime());
                                             }
                                         }
                                     }
@@ -315,14 +326,12 @@ public class TabletInvertedIndex {
         }
 
         long versionInFe = replicaInFe.getVersion();
-        long versionHashInFe = replicaInFe.getVersionHash();
 
         if (backendTabletInfo.getVersion() > versionInFe) {
             // backend replica's version is larger or newer than replica in FE, sync it.
             return true;
         } else if (versionInFe == backendTabletInfo.getVersion() &&
-                versionHashInFe == backendTabletInfo.getVersion_hash()
-                && replicaInFe.isBad()) {
+                replicaInFe.isBad()) {
             // backend replica's version is equal to replica in FE, but replica in FE is bad, while backend replica is good, sync it
             return true;
         }
@@ -352,12 +361,12 @@ public class TabletInvertedIndex {
         }
 
         if (schemaHashInFe != backendTabletInfo.getSchema_hash()
-                || backendTabletInfo.getVersion() == -1 && backendTabletInfo.getVersion_hash() == 0) {
+                || backendTabletInfo.getVersion() == -1) {
             // no data file exist on BE, maybe this is a newly created schema change tablet. no need to recovery
             return false;
         }
 
-        if (replicaInFe.getVersionHash() == 0 && backendTabletInfo.getVersion() == replicaInFe.getVersion() - 1) {
+        if (backendTabletInfo.getVersion() == replicaInFe.getVersion() - 1) {
             /*
              * This is very tricky:
              * 1. Assume that we want to create a replica with version (X, Y), the init version of replica in FE
@@ -382,19 +391,12 @@ public class TabletInvertedIndex {
 
     // always add tablet before adding replicas
     public void addTablet(long tabletId, TabletMeta tabletMeta) {
-        if (Catalog.isCheckpointThread()) {
+        if (GlobalStateMgr.isCheckpointThread()) {
             return;
         }
         writeLock();
         try {
-            if (tabletMetaMap.containsKey(tabletId)) {
-                return;
-            }
-            tabletMetaMap.put(tabletId, tabletMeta);
-            if (!tabletMetaTable.contains(tabletMeta.getPartitionId(), tabletMeta.getIndexId())) {
-                tabletMetaTable.put(tabletMeta.getPartitionId(), tabletMeta.getIndexId(), tabletMeta);
-                LOG.debug("add tablet meta: {}", tabletId);
-            }
+            tabletMetaMap.putIfAbsent(tabletId, tabletMeta);
 
             LOG.debug("add tablet: {}", tabletId);
         } finally {
@@ -403,7 +405,7 @@ public class TabletInvertedIndex {
     }
 
     public void deleteTablet(long tabletId) {
-        if (Catalog.isCheckpointThread()) {
+        if (GlobalStateMgr.isCheckpointThread()) {
             return;
         }
         writeLock();
@@ -418,11 +420,7 @@ public class TabletInvertedIndex {
                     backingReplicaMetaTable.remove(backendId, tabletId);
                 }
             }
-            TabletMeta tabletMeta = tabletMetaMap.remove(tabletId);
-            if (tabletMeta != null) {
-                tabletMetaTable.remove(tabletMeta.getPartitionId(), tabletMeta.getIndexId());
-                LOG.debug("delete tablet meta: {}", tabletId);
-            }
+            tabletMetaMap.remove(tabletId);
 
             LOG.debug("delete tablet: {}", tabletId);
         } finally {
@@ -431,7 +429,7 @@ public class TabletInvertedIndex {
     }
 
     public void addReplica(long tabletId, Replica replica) {
-        if (Catalog.isCheckpointThread()) {
+        if (GlobalStateMgr.isCheckpointThread()) {
             return;
         }
         writeLock();
@@ -448,7 +446,7 @@ public class TabletInvertedIndex {
     }
 
     public void deleteReplica(long tabletId, long backendId) {
-        if (Catalog.isCheckpointThread()) {
+        if (GlobalStateMgr.isCheckpointThread()) {
             return;
         }
         writeLock();
@@ -493,63 +491,6 @@ public class TabletInvertedIndex {
         }
     }
 
-    public void setNewSchemaHash(long partitionId, long indexId, int newSchemaHash) {
-        if (Catalog.isCheckpointThread()) {
-            return;
-        }
-        writeLock();
-        try {
-            Preconditions.checkState(tabletMetaTable.contains(partitionId, indexId));
-            tabletMetaTable.get(partitionId, indexId).setNewSchemaHash(newSchemaHash);
-        } finally {
-            writeUnlock();
-        }
-    }
-
-    public void updateToNewSchemaHash(long partitionId, long indexId) {
-        if (Catalog.isCheckpointThread()) {
-            return;
-        }
-        writeLock();
-        try {
-            Preconditions.checkState(tabletMetaTable.contains(partitionId, indexId));
-            tabletMetaTable.get(partitionId, indexId).updateToNewSchemaHash();
-        } finally {
-            writeUnlock();
-        }
-    }
-
-    public void deleteNewSchemaHash(long partitionId, long indexId) {
-        if (Catalog.isCheckpointThread()) {
-            return;
-        }
-        writeLock();
-        try {
-            TabletMeta tabletMeta = tabletMetaTable.get(partitionId, indexId);
-            if (tabletMeta != null) {
-                tabletMeta.deleteNewSchemaHash();
-            }
-        } finally {
-            writeUnlock();
-        }
-    }
-
-    /**
-     * @return array of pair(partitionId, indexId)
-     */
-    public List<Pair<Long, Long>> getAllPartitionIndex() {
-        List<Pair<Long, Long>> partitionIndexList = new ArrayList<>(tabletMetaTable.size());
-        readLock();
-        try {
-            tabletMetaTable.values().forEach(tabletMeta ->
-                    partitionIndexList.add(new Pair<>(tabletMeta.getPartitionId(), tabletMeta.getIndexId()))
-            );
-        } finally {
-            readUnlock();
-        }
-        return partitionIndexList;
-    }
-
     public List<Long> getTabletIdsByBackendId(long backendId) {
         List<Long> tabletIds = Lists.newArrayList();
         readLock();
@@ -579,12 +520,25 @@ public class TabletInvertedIndex {
         return tabletIds;
     }
 
-    public int getTabletNumByBackendId(long backendId) {
+    public long getTabletNumByBackendId(long backendId) {
         readLock();
         try {
             Map<Long, Replica> replicaMetaWithBackend = backingReplicaMetaTable.row(backendId);
             if (replicaMetaWithBackend != null) {
                 return replicaMetaWithBackend.size();
+            }
+        } finally {
+            readUnlock();
+        }
+        return 0;
+    }
+
+    public long getTabletNumByBackendIdAndPathHash(long backendId, long pathHash) {
+        readLock();
+        try {
+            Map<Long, Replica> replicaMetaWithBackend = backingReplicaMetaTable.row(backendId);
+            if (replicaMetaWithBackend != null) {
+                return replicaMetaWithBackend.values().stream().filter(r -> r.getPathHash() == pathHash).count();
             }
         } finally {
             readUnlock();
@@ -622,16 +576,11 @@ public class TabletInvertedIndex {
         try {
             tabletMetaMap.clear();
             replicaToTabletMap.clear();
-            tabletMetaTable.clear();
             replicaMetaTable.clear();
             backingReplicaMetaTable.clear();
         } finally {
             writeUnlock();
         }
-    }
-
-    public Map<Long, Long> getReplicaToTabletMap() {
-        return replicaToTabletMap;
     }
 }
 

@@ -24,7 +24,6 @@ package com.starrocks.analysis;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.DistributionInfo;
 import com.starrocks.catalog.DistributionInfo.DistributionInfoType;
-import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
@@ -36,14 +35,18 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Set;
 
-public class DistributionDesc implements Writable {
+public class DistributionDesc implements ParseNode, Writable {
     protected DistributionInfoType type;
 
     public DistributionDesc() {
 
     }
 
-    public void analyze(Set<String> colSet) throws AnalysisException {
+    public void analyze(Set<String> colSet) {
+        throw new NotImplementedException();
+    }
+
+    public int getBuckets() {
         throw new NotImplementedException();
     }
 

@@ -16,6 +16,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+MACHINE_TYPE=$(uname -m)
+
 curdir=`dirname "$0"`
 curdir=`cd "$curdir"; pwd`
 
@@ -51,6 +53,11 @@ export LOG_DIR=${STARROCKS_HOME}/log
 export PID_DIR=`cd "$curdir"; pwd`
 
 export_env_from_conf $STARROCKS_HOME/conf/be.conf
+export_mem_limit_from_conf $STARROCKS_HOME/conf/be.conf
+
+if [ $? -ne 0 ]; then
+    exit 1
+fi
 
 if [ -e $STARROCKS_HOME/conf/hadoop_env.sh ]; then
     source $STARROCKS_HOME/conf/hadoop_env.sh
@@ -58,26 +65,46 @@ fi
 
 # NOTE: JAVA_HOME must be configed if using hdfs scan, like hive external table
 # this is only for starting be
+jvm_arch="amd64"
+if [[ "${MACHINE_TYPE}" == "aarch64" ]]; then
+    jvm_arch="aarch64"
+fi
+
 if [ "$JAVA_HOME" = "" ]; then
-    export LD_LIBRARY_PATH=$STARROCKS_HOME/lib/jvm/amd64/server:$STARROCKS_HOME/lib/jvm/amd64:$LD_LIBRARY_PATH
+    export LD_LIBRARY_PATH=$STARROCKS_HOME/lib/jvm/$jvm_arch/server:$STARROCKS_HOME/lib/jvm/$jvm_arch:$LD_LIBRARY_PATH
 else
     java_version=$(jdk_version)
     if [[ $java_version -gt 8 ]]; then
         export LD_LIBRARY_PATH=$JAVA_HOME/lib/server:$JAVA_HOME/lib:$LD_LIBRARY_PATH
     # JAVA_HOME is jdk
     elif [[ -d "$JAVA_HOME/jre"  ]]; then
-        export LD_LIBRARY_PATH=$JAVA_HOME/jre/lib/amd64/server:$JAVA_HOME/jre/lib/amd64:$LD_LIBRARY_PATH
+        export LD_LIBRARY_PATH=$JAVA_HOME/jre/lib/$jvm_arch/server:$JAVA_HOME/jre/lib/$jvm_arch:$LD_LIBRARY_PATH
     # JAVA_HOME is jre
     else
-        export LD_LIBRARY_PATH=$JAVA_HOME/lib/amd64/server:$JAVA_HOME/lib/amd64:$LD_LIBRARY_PATH
+        export LD_LIBRARY_PATH=$JAVA_HOME/lib/$jvm_arch/server:$JAVA_HOME/lib/$jvm_arch:$LD_LIBRARY_PATH
     fi
 fi
 
 export LD_LIBRARY_PATH=$STARROCKS_HOME/lib/hadoop/native:$LD_LIBRARY_PATH
 
+# check java version and choose correct JAVA_OPTS
+JAVA_VERSION=$(jdk_version)
+final_java_opt=$JAVA_OPTS
+if [[ "$JAVA_VERSION" -gt 8 ]]; then
+    if [ -z "$JAVA_OPTS_FOR_JDK_9" ]; then
+        echo "JAVA_OPTS_FOR_JDK_9 is not set in be.conf" >> $LOG_DIR/be.out
+        exit -1
+    fi
+    final_java_opt=$JAVA_OPTS_FOR_JDK_9
+fi
+export LIBHDFS_OPTS=$final_java_opt
+
 # HADOOP_CLASSPATH defined in $STARROCKS_HOME/conf/hadoop_env.sh
 # put $STARROCKS_HOME/conf ahead of $HADOOP_CLASSPATH so that custom config can replace the config in $HADOOP_CLASSPATH
 export CLASSPATH=$STARROCKS_HOME/conf:$HADOOP_CLASSPATH:$CLASSPATH
+# https://github.com/aws/aws-cli/issues/5623
+# https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html
+export AWS_EC2_METADATA_DISABLED=true
 
 if [ ! -d $LOG_DIR ]; then
     mkdir -p $LOG_DIR
@@ -106,6 +133,10 @@ echo "start time: "$(date) >> $LOG_DIR/be.out
 if [[ $(ulimit -n) -lt 60000 ]]; then
   ulimit -n 65535
 fi
+
+# Prevent JVM from handling any internally or externally generated signals.
+# Otherwise, JVM will overwrite the signal handlers for SIGINT and SIGTERM.
+export LIBHDFS_OPTS="$LIBHDFS_OPTS -Xrs"
 
 if [ ${RUN_DAEMON} -eq 1 ]; then
     nohup ${STARROCKS_HOME}/lib/starrocks_be "$@" >> $LOG_DIR/be.out 2>&1 </dev/null &

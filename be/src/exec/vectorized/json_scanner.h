@@ -1,34 +1,27 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
+#include "column/nullable_column.h"
 #include "common/compiler_util.h"
-DIAGNOSTIC_PUSH
-DIAGNOSTIC_IGNORE("-Wclass-memaccess")
-#include <rapidjson/document.h>
-DIAGNOSTIC_POP
-
-#include <rapidjson/error/en.h>
-#include <rapidjson/stringbuffer.h>
-#include <rapidjson/writer.h>
-
-#include "env/env.h"
-#include "env/env_stream_pipe.h"
-#include "env/env_util.h"
 #include "exec/vectorized/file_scanner.h"
+#include "exprs/vectorized/json_functions.h"
+#include "fs/fs.h"
 #include "runtime/stream_load/load_stream_mgr.h"
+#include "simdjson.h"
 #include "util/raw_container.h"
 #include "util/slice.h"
 
 namespace starrocks::vectorized {
 
-struct JsonPath;
+struct SimpleJsonPath;
 class JsonReader;
+class JsonParser;
 class JsonScanner : public FileScanner {
 public:
     JsonScanner(RuntimeState* state, RuntimeProfile* profile, const TBrokerScanRange& scan_range,
                 ScannerCounter* counter);
-    ~JsonScanner();
+    ~JsonScanner() override;
 
     // Open this scanner, will initialize information needed
     Status open() override;
@@ -41,10 +34,10 @@ public:
 private:
     Status _construct_json_types();
     Status _construct_cast_exprs();
-    Status _parse_json_paths(const std::string& jsonpath, std::vector<std::vector<JsonPath>>* path_vecs);
+    Status _parse_json_paths(const std::string& jsonpath, std::vector<std::vector<SimpleJsonPath>>* path_vecs);
     Status _create_src_chunk(ChunkPtr* chunk);
     Status _open_next_reader();
-    ChunkPtr _cast_chunk(ChunkPtr src_chunk);
+    ChunkPtr _cast_chunk(const ChunkPtr& src_chunk);
 
     friend class JsonReader;
 
@@ -62,8 +55,8 @@ private:
     std::vector<Expr*> _cast_exprs;
     ObjectPool _pool;
 
-    std::vector<std::vector<JsonPath>> _json_paths;
-    std::vector<JsonPath> _root_paths;
+    std::vector<std::vector<SimpleJsonPath>> _json_paths;
+    std::vector<SimpleJsonPath> _root_paths;
     bool _strip_outer_array = false;
 };
 
@@ -73,44 +66,60 @@ private:
 // return other error Status if encounter other errors.
 class JsonReader {
 public:
-    JsonReader(RuntimeState* state, ScannerCounter* counter, JsonScanner* scanner,
-               std::shared_ptr<SequentialFile> file);
+    JsonReader(RuntimeState* state, ScannerCounter* counter, JsonScanner* scanner, std::shared_ptr<SequentialFile> file,
+               bool strict_mode, const std::vector<SlotDescriptor*>& slot_descs);
+
     ~JsonReader();
 
-    Status read_chunk(Chunk* chunk, int32_t rows_to_read, const std::vector<SlotDescriptor*>& slot_descs);
+    Status open();
+
+    Status read_chunk(Chunk* chunk, int32_t rows_to_read);
 
     Status close();
 
 private:
+    template <typename ParserType>
+    Status _read_rows(Chunk* chunk, int32_t rows_to_read, int32_t* rows_read);
+
     Status _read_and_parse_json();
-    void _construct_column(const rapidjson::Value& objectValue, Column* column, const TypeDescriptor& type_desc);
+
+    Status _construct_row(simdjson::ondemand::object* row, Chunk* chunk);
+
+    Status _construct_row_in_object_order(simdjson::ondemand::object* row, Chunk* chunk);
+    Status _construct_row_in_slot_order(simdjson::ondemand::object* row, Chunk* chunk);
+
+    Status _construct_column(simdjson::ondemand::value& value, Column* column, const TypeDescriptor& type_desc,
+                             const std::string& col_name);
+
+    // _build_slot_descs builds _slot_descs as the order of first json object and builds _slot_desc_dict;
+    Status _build_slot_descs();
 
 private:
     RuntimeState* _state = nullptr;
     ScannerCounter* _counter = nullptr;
     JsonScanner* _scanner = nullptr;
+    bool _strict_mode = false;
 
     std::shared_ptr<SequentialFile> _file;
-    int _next_line;
-    int _total_lines;
     bool _closed;
-    bool _strip_outer_array;
+    std::vector<SlotDescriptor*> _slot_descs;
+    std::unordered_map<std::string, SlotDescriptor*> _slot_desc_dict;
 
-    std::vector<std::vector<JsonPath>> _json_paths;
-    std::vector<JsonPath> _root_paths;
+    // For performance reason, the simdjson parser should be reused over several files.
+    //https://github.com/simdjson/simdjson/blob/master/doc/performance.md
+    simdjson::ondemand::parser _simdjson_parser;
+    ByteBufferPtr _parser_buf;
+    bool _is_ndjson = false;
 
-    rapidjson::Document _origin_json_doc;  // origin json document object from parsed json string
-    rapidjson::Value* _json_doc = nullptr; // _json_doc equals _final_json_doc iff not set `json_root`
-
+    std::unique_ptr<JsonParser> _parser;
+    bool _empty_parser = true;
     // only used in unit test.
     // TODO: The semantics of Streaming Load And Routine Load is non-consistent.
     //       Import a json library supporting streaming parse.
 #if BE_TEST
     size_t _buf_size = 1048576; // 1MB, the buf size for parsing json in unit test
-#else
-    size_t _buf_size = 104857600; // 100MB, the max size rapidjson can parse
-#endif
     raw::RawVector<char> _buf;
+#endif
 };
 
 } // namespace starrocks::vectorized

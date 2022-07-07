@@ -21,7 +21,6 @@
 
 package com.starrocks.analysis;
 
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.View;
 import com.starrocks.common.AnalysisException;
@@ -30,6 +29,9 @@ import com.starrocks.common.ErrorReport;
 import com.starrocks.common.UserException;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.ast.QueryStatement;
 
 import java.util.List;
 
@@ -38,6 +40,10 @@ public class AlterViewStmt extends BaseViewStmt {
 
     public AlterViewStmt(TableName tbl, List<ColWithComment> cols, QueryStmt queryStmt) {
         super(tbl, cols, queryStmt);
+    }
+
+    public AlterViewStmt(TableName tbl, List<ColWithComment> cols, QueryStatement queryStatement) {
+        super(tbl, cols, queryStatement);
     }
 
     public TableName getTbl() {
@@ -58,7 +64,7 @@ public class AlterViewStmt extends BaseViewStmt {
                     String.format("ALTER VIEW not allowed on a table:%s.%s", getDbName(), getTable()));
         }
 
-        if (!Catalog.getCurrentCatalog().getAuth()
+        if (!GlobalStateMgr.getCurrentState().getAuth()
                 .checkTblPriv(ConnectContext.get(), tableName.getDb(), tableName.getTbl(),
                         PrivPredicate.ALTER)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "ALTER VIEW",
@@ -101,5 +107,15 @@ public class AlterViewStmt extends BaseViewStmt {
     @Override
     public String toString() {
         return toSql();
+    }
+
+    @Override
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
+        return visitor.visitAlterViewStatement(this, context);
+    }
+
+    @Override
+    public boolean isSupportNewPlanner() {
+        return true;
     }
 }

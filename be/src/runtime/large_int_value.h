@@ -19,27 +19,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_RUNTIME_LARGE_INT_VALUE_H
-#define STARROCKS_BE_RUNTIME_LARGE_INT_VALUE_H
+#pragma once
 
 #include <fmt/compile.h>
 #include <fmt/format.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <string>
 
 #include "runtime/decimal_value.h"
-#include "udf/udf.h"
 #include "util/hash_util.hpp"
 
 namespace starrocks {
-
-const __int128 MAX_INT128 = ~((__int128)0x01 << 127);
-const __int128 MIN_INT128 = ((__int128)0x01 << 127);
 
 class LargeIntValue {
 public:
@@ -75,5 +70,3 @@ std::istream& operator>>(std::istream& is, __int128& value);
 std::size_t hash_value(LargeIntValue const& value);
 
 } // namespace starrocks
-
-#endif

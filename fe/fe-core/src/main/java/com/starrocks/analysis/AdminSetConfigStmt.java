@@ -22,14 +22,14 @@
 package com.starrocks.analysis;
 
 import com.google.common.collect.Maps;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.common.ConfigBase;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.UserException;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.AstVisitor;
 
 import java.util.Map;
 
@@ -52,13 +52,6 @@ public class AdminSetConfigStmt extends DdlStmt {
         if (this.configs == null) {
             this.configs = Maps.newHashMap();
         }
-
-        // we have to analyze configs here to determine whether to forward it to master
-        for (String key : this.configs.keySet()) {
-            if (ConfigBase.checkIsMasterOnly(key)) {
-                redirectStatus = RedirectStatus.FORWARD_NO_SYNC;
-            }
-        }
     }
 
     public ConfigType getType() {
@@ -70,14 +63,14 @@ public class AdminSetConfigStmt extends DdlStmt {
     }
 
     @Override
-    public void analyze(Analyzer analyzer) throws AnalysisException, UserException {
+    public void analyze(Analyzer analyzer) throws UserException {
         super.analyze(analyzer);
 
         if (configs.size() != 1) {
             throw new AnalysisException("config parameter size is not equal to 1");
         }
         // check auth
-        if (!Catalog.getCurrentCatalog().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
+        if (!GlobalStateMgr.getCurrentState().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "ADMIN");
         }
 
@@ -89,5 +82,15 @@ public class AdminSetConfigStmt extends DdlStmt {
     @Override
     public RedirectStatus getRedirectStatus() {
         return redirectStatus;
+    }
+
+    @Override
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
+        return visitor.visitAdminSetConfigStatement(this, context);
+    }
+
+    @Override
+    public boolean isSupportNewPlanner() {
+        return true;
     }
 }

@@ -1,14 +1,14 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/info_func.h"
 
+#include "column/chunk.h"
 #include "column/column_helper.h"
 #include "column/const_column.h"
 #include "column/fixed_length_column.h"
 #include "column/nullable_column.h"
 
-namespace starrocks {
-namespace vectorized {
+namespace starrocks::vectorized {
 
 VectorizedInfoFunc::VectorizedInfoFunc(const TExprNode& node) : Expr(node) {
     switch (_type.type) {
@@ -44,7 +44,6 @@ std::string VectorizedInfoFunc::debug_string() const {
     return out.str();
 }
 
-VectorizedInfoFunc::~VectorizedInfoFunc() {}
+VectorizedInfoFunc::~VectorizedInfoFunc() = default;
 
-} // namespace vectorized
-} // namespace starrocks
+} // namespace starrocks::vectorized

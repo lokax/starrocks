@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "gutil/strings/split.h"
 
@@ -10,8 +10,7 @@
 #include "column/column_viewer.h"
 #include "exprs/vectorized/string_functions.h"
 
-namespace starrocks {
-namespace vectorized {
+namespace starrocks::vectorized {
 
 const void* _memchr(const void* big, size_t big_len, const void* little, size_t little_len) {
     return memchr(big, *((char*)little), big_len);
@@ -37,7 +36,7 @@ Status StringFunctions::split_prepare(starrocks_udf::FunctionContext* context,
     auto* state = new SplitState();
     context->set_function_state(scope, state);
 
-    if (context->is_constant_column(0) && context->is_constant_column(1)) {
+    if (context->is_notnull_constant_column(0) && context->is_notnull_constant_column(1)) {
         Slice haystack = ColumnHelper::get_const_value<TYPE_VARCHAR>(context->get_constant_column(0));
         Slice delimiter = ColumnHelper::get_const_value<TYPE_VARCHAR>(context->get_constant_column(1));
         std::vector<std::string> const_split_strings =
@@ -45,7 +44,7 @@ Status StringFunctions::split_prepare(starrocks_udf::FunctionContext* context,
                                StringPiece(delimiter.get_data(), delimiter.get_size()));
 
         state->const_split_strings = const_split_strings;
-    } else if (context->is_constant_column(1)) {
+    } else if (context->is_notnull_constant_column(1)) {
         Slice delimiter = ColumnHelper::get_const_value<TYPE_VARCHAR>(context->get_constant_column(1));
 
         state->delimiter = delimiter;
@@ -91,14 +90,14 @@ ColumnPtr StringFunctions::split(FunctionContext* context, const starrocks::vect
     BinaryColumn::Ptr array_binary_column = BinaryColumn::create();
 
     auto state = reinterpret_cast<SplitState*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
-    if (context->is_constant_column(0) && context->is_constant_column(1)) {
+    if (context->is_notnull_constant_column(0) && context->is_notnull_constant_column(1)) {
         std::vector<std::string> split_string = state->const_split_strings;
         array_binary_column->reserve(row_nums * split_string.size(), haystack_columns->get_bytes().size());
 
         for (int row = 0; row < row_nums; ++row) {
             array_offsets->append(offset);
-            for (int i = 0; i < split_string.size(); ++i) {
-                array_binary_column->append(Slice(split_string[i].c_str()));
+            for (auto& i : split_string) {
+                array_binary_column->append(Slice(i.c_str()));
             }
             offset += split_string.size();
         }
@@ -184,8 +183,8 @@ ColumnPtr StringFunctions::split(FunctionContext* context, const starrocks::vect
             std::vector<std::string> split_string =
                     strings::Split(StringPiece(str.get_data(), str.get_size()),
                                    StringPiece(delimiter.get_data(), delimiter.get_size()));
-            for (int i = 0; i < split_string.size(); ++i) {
-                array_binary_column->append(Slice(split_string[i].c_str()));
+            for (auto& i : split_string) {
+                array_binary_column->append(Slice(i.c_str()));
             }
             offset += split_string.size();
         }
@@ -196,5 +195,4 @@ ColumnPtr StringFunctions::split(FunctionContext* context, const starrocks::vect
     }
 }
 
-} // namespace vectorized
-} // namespace starrocks
+} // namespace starrocks::vectorized

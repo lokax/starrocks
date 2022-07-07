@@ -19,13 +19,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_RUNTIME_BUFFER_CONTROL_BLOCK_H
-#define STARROCKS_BE_RUNTIME_BUFFER_CONTROL_BLOCK_H
+#pragma once
 
 #include <condition_variable>
 #include <deque>
 #include <list>
 #include <mutex>
+#include <utility>
 
 #include "common/status.h"
 #include "common/statusor.h"
@@ -67,9 +67,14 @@ public:
     ~BufferControlBlock();
 
     Status init();
+    // In order not to affect the current implementation of the non-pipeline engine,
+    // this method is reserved and is only used in the non-pipeline engine
     Status add_batch(TFetchDataResult* result);
+    Status add_batch(std::unique_ptr<TFetchDataResult>& result);
+
     // non-blocking version of add_batch
-    StatusOr<bool> try_add_batch(TFetchDataResult* result);
+    StatusOr<bool> try_add_batch(std::unique_ptr<TFetchDataResult>& result);
+    StatusOr<bool> try_add_batch(std::vector<std::unique_ptr<TFetchDataResult>>& results);
 
     // get result from batch, use timeout?
     Status get_batch(TFetchDataResult* result);
@@ -77,25 +82,29 @@ public:
     void get_batch(GetResultBatchCtx* ctx);
 
     // close buffer block, set _status to exec_status and set _is_close to true;
-    // called because data has been read or error happend.
+    // called because data has been read or error happened.
     Status close(Status exec_status);
     // this is called by RPC, called from coordinator
     Status cancel();
 
     const TUniqueId& fragment_id() const { return _fragment_id; }
 
-    void set_query_statistics(std::shared_ptr<QueryStatistics> statistics) { _query_statistics = statistics; }
+    void set_query_statistics(std::shared_ptr<QueryStatistics> statistics) {
+        _query_statistics = std::move(statistics);
+    }
 
     void update_num_written_rows(int64_t num_rows) {
         // _query_statistics may be null when the result sink init failed
         // or some other failure.
         // and the number of written rows is only needed when all things go well.
-        if (_query_statistics.get() != nullptr) {
+        if (_query_statistics != nullptr) {
             _query_statistics->set_returned_rows(num_rows);
         }
     }
 
 private:
+    void _process_batch_without_lock(std::unique_ptr<TFetchDataResult>& result);
+
     typedef std::list<TFetchDataResult*> ResultQueue;
 
     // result's query id
@@ -125,5 +134,3 @@ private:
 };
 
 } // namespace starrocks
-
-#endif

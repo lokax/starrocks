@@ -35,6 +35,7 @@ import com.starrocks.http.action.SystemAction;
 import com.starrocks.http.action.VariableAction;
 import com.starrocks.http.common.StarRocksHttpPostObjectAggregator;
 import com.starrocks.http.meta.ColocateMetaService;
+import com.starrocks.http.meta.GlobalDictMetaService;
 import com.starrocks.http.meta.MetaService.CheckAction;
 import com.starrocks.http.meta.MetaService.DumpAction;
 import com.starrocks.http.meta.MetaService.ImageAction;
@@ -70,6 +71,7 @@ import com.starrocks.http.rest.StorageTypeCheckAction;
 import com.starrocks.http.rest.TableQueryPlanAction;
 import com.starrocks.http.rest.TableRowCountAction;
 import com.starrocks.http.rest.TableSchemaAction;
+import com.starrocks.http.rest.TransactionLoadAction;
 import com.starrocks.master.MetaHelper;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
@@ -115,6 +117,7 @@ public class HttpServer {
     private void registerActions() throws IllegalArgException {
         // add rest action
         LoadAction.registerAction(controller);
+        TransactionLoadAction.registerAction(controller);
         GetLoadInfoAction.registerAction(controller);
         SetConfigAction.registerAction(controller);
         GetDdlStmtAction.registerAction(controller);
@@ -150,6 +153,8 @@ public class HttpServer {
         ColocateMetaService.BucketSeqAction.registerAction(controller);
         ColocateMetaService.ColocateMetaAction.registerAction(controller);
         ColocateMetaService.MarkGroupStableAction.registerAction(controller);
+        ColocateMetaService.MarkGroupUnstableAction.registerAction(controller);
+        GlobalDictMetaService.ForbitTableAction.registerAction(controller);
         ProfileAction.registerAction(controller);
         QueryDetailAction.registerAction(controller);
         ConnectionAction.registerAction(controller);

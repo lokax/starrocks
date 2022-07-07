@@ -1,20 +1,22 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "storage/update_manager.h"
 
 #include <gtest/gtest.h>
 
+#include "fs/fs_util.h"
 #include "runtime/mem_tracker.h"
+#include "storage/chunk_helper.h"
 #include "storage/del_vector.h"
+#include "storage/kv_store.h"
 #include "storage/olap_define.h"
-#include "storage/olap_meta.h"
 #include "storage/rowset/rowset_factory.h"
+#include "storage/rowset/rowset_options.h"
 #include "storage/rowset/rowset_writer.h"
 #include "storage/rowset/rowset_writer_context.h"
-#include "storage/rowset/vectorized/rowset_options.h"
 #include "storage/storage_engine.h"
-#include "storage/vectorized/chunk_helper.h"
-#include "util/file_utils.h"
+#include "storage/tablet_manager.h"
+#include "testutil/assert.h"
 
 using namespace std;
 
@@ -24,11 +26,11 @@ class UpdateManagerTest : public testing::Test {
 public:
     void SetUp() override {
         _root_path = "./ut_dir/olap_update_manager_test";
-        FileUtils::remove_all(_root_path);
-        FileUtils::create_dir(_root_path);
-        _meta.reset(new OlapMeta(_root_path));
+        fs::remove_all(_root_path);
+        fs::create_directories(_root_path);
+        _meta.reset(new KVStore(_root_path));
         ASSERT_TRUE(_meta->init().ok());
-        ASSERT_TRUE(FileUtils::is_dir(_root_path + "/meta"));
+        ASSERT_TRUE(fs::is_directory(_root_path + "/meta").value());
         _root_mem_tracker.reset(new MemTracker(-1, "update"));
         _update_manager.reset(new UpdateManager(_root_mem_tracker.get()));
     }
@@ -40,16 +42,15 @@ public:
         writer_context.tablet_id = _tablet->tablet_id();
         writer_context.tablet_schema_hash = _tablet->schema_hash();
         writer_context.partition_id = 0;
-        writer_context.rowset_type = BETA_ROWSET;
-        writer_context.rowset_path_prefix = _tablet->tablet_path();
+        writer_context.rowset_path_prefix = _tablet->schema_hash_path();
         writer_context.rowset_state = COMMITTED;
         writer_context.tablet_schema = &_tablet->tablet_schema();
         writer_context.version.first = 0;
         writer_context.version.second = 0;
         writer_context.segments_overlap = NONOVERLAPPING;
         std::unique_ptr<RowsetWriter> writer;
-        EXPECT_EQ(OLAP_SUCCESS, RowsetFactory::create_rowset_writer(writer_context, &writer));
-        auto schema = vectorized::ChunkHelper::convert_schema(_tablet->tablet_schema());
+        EXPECT_TRUE(RowsetFactory::create_rowset_writer(writer_context, &writer).ok());
+        auto schema = vectorized::ChunkHelper::convert_schema_to_format_v2(_tablet->tablet_schema());
         auto chunk = vectorized::ChunkHelper::new_chunk(schema, keys.size());
         auto& cols = chunk->columns();
         for (size_t i = 0; i < keys.size(); i++) {
@@ -58,11 +59,11 @@ public:
             cols[2]->append_datum(vectorized::Datum((int32_t)(keys[i] % 1000 + 2)));
         }
         if (one_delete == nullptr) {
-            EXPECT_EQ(OLAP_SUCCESS, writer->flush_chunk(*chunk));
+            CHECK_OK(writer->flush_chunk(*chunk));
         } else {
-            EXPECT_EQ(OLAP_SUCCESS, writer->flush_chunk_with_deletes(*chunk, *one_delete));
+            CHECK_OK(writer->flush_chunk_with_deletes(*chunk, *one_delete));
         }
-        return writer->build();
+        return *writer->build();
     }
 
     void create_tablet(int64_t tablet_id, int32_t schema_hash) {
@@ -94,7 +95,7 @@ public:
         request.tablet_schema.columns.push_back(k3);
         auto st = StorageEngine::instance()->create_tablet(request);
         ASSERT_TRUE(st.ok()) << st.to_string();
-        _tablet = StorageEngine::instance()->tablet_manager()->get_tablet(tablet_id, schema_hash);
+        _tablet = StorageEngine::instance()->tablet_manager()->get_tablet(tablet_id);
         ASSERT_TRUE(_tablet);
     }
 
@@ -102,10 +103,9 @@ public:
         _update_manager.reset();
         _root_mem_tracker.reset();
         _meta.reset();
-        FileUtils::remove_all(_root_path);
+        fs::remove_all(_root_path);
         if (_tablet) {
-            StorageEngine::instance()->tablet_manager()->drop_tablet(_tablet->tablet_id(), _tablet->schema_hash(),
-                                                                     false);
+            StorageEngine::instance()->tablet_manager()->drop_tablet(_tablet->tablet_id());
             _tablet.reset();
         }
     }
@@ -113,7 +113,7 @@ public:
 private:
     std::string _root_path;
     unique_ptr<MemTracker> _root_mem_tracker = nullptr;
-    unique_ptr<OlapMeta> _meta;
+    unique_ptr<KVStore> _meta;
     unique_ptr<UpdateManager> _update_manager;
     TabletSharedPtr _tablet;
 };

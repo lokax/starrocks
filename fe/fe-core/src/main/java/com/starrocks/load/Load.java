@@ -21,6 +21,7 @@
 
 package com.starrocks.load;
 
+import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -46,9 +47,9 @@ import com.starrocks.analysis.StringLiteral;
 import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.backup.BlobStorage;
 import com.starrocks.backup.Status;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.KeysType;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.OlapTable;
@@ -57,19 +58,26 @@ import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.Pair;
 import com.starrocks.common.UserException;
-import com.starrocks.load.LoadJob.JobState;
+import com.starrocks.load.loadv2.JobState;
 import com.starrocks.persist.ReplicaPersistInfo;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TBrokerScanRangeParams;
 import com.starrocks.thrift.TOpType;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 public class Load {
     private static final Logger LOG = LogManager.getLogger(Load.class);
@@ -77,7 +85,7 @@ public class Load {
 
     public static final String LOAD_OP_COLUMN = "__op";
     // load job meta
-    private volatile LoadErrorHub.Param loadErrorHubParam = new LoadErrorHub.Param();
+    private LoadErrorHub.Param loadErrorHubParam = new LoadErrorHub.Param();
 
     public Load() {
     }
@@ -93,11 +101,12 @@ public class Load {
     public static List<ImportColumnDesc> getSchemaChangeShadowColumnDesc(Table tbl, Map<String, Expr> columnExprMap) {
         List<ImportColumnDesc> shadowColumnDescs = Lists.newArrayList();
         for (Column column : tbl.getFullSchema()) {
-            if (!column.isNameWithPrefix(SchemaChangeHandler.SHADOW_NAME_PRFIX)) {
+            if (!column.isNameWithPrefix(SchemaChangeHandler.SHADOW_NAME_PRFIX) &&
+                    !column.isNameWithPrefix(SchemaChangeHandler.SHADOW_NAME_PRFIX_V1)) {
                 continue;
             }
 
-            String originCol = column.getNameWithoutPrefix(SchemaChangeHandler.SHADOW_NAME_PRFIX);
+            String originCol = Column.removeNamePrefix(column.getName());
             if (columnExprMap.containsKey(originCol)) {
                 Expr mappingExpr = columnExprMap.get(originCol);
                 if (mappingExpr != null) {
@@ -135,7 +144,7 @@ public class Load {
         return shadowColumnDescs;
     }
 
-    public static boolean tableSupportsOpColumn(Table tbl) {
+    public static boolean tableSupportOpColumn(Table tbl) {
         return tbl instanceof OlapTable && ((OlapTable) tbl).getKeysType() == KeysType.PRIMARY_KEYS;
     }
 
@@ -179,6 +188,18 @@ public class Load {
                                    Map<String, SlotDescriptor> slotDescByName, TBrokerScanRangeParams params,
                                    boolean needInitSlotAndAnalyzeExprs, boolean useVectorizedLoad,
                                    List<String> columnsFromPath) throws UserException {
+        initColumns(tbl, columnExprs, columnToHadoopFunction, exprsByName, analyzer,
+                srcTupleDesc, slotDescByName, params, needInitSlotAndAnalyzeExprs, useVectorizedLoad,
+                columnsFromPath, false, false);
+    }
+
+    public static void initColumns(Table tbl, List<ImportColumnDesc> columnExprs,
+                                   Map<String, Pair<String, List<String>>> columnToHadoopFunction,
+                                   Map<String, Expr> exprsByName, Analyzer analyzer, TupleDescriptor srcTupleDesc,
+                                   Map<String, SlotDescriptor> slotDescByName, TBrokerScanRangeParams params,
+                                   boolean needInitSlotAndAnalyzeExprs, boolean useVectorizedLoad,
+                                   List<String> columnsFromPath, boolean isStreamLoadJson,
+                                   boolean partialUpdate) throws UserException {
         // check mapping column exist in schema
         // !! all column mappings are in columnExprs !!
         Set<String> importColumnNames = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
@@ -208,7 +229,18 @@ public class Load {
         // to the columnExprs will not affect the original columnExprs.
         List<ImportColumnDesc> copiedColumnExprs = Lists.newArrayList(columnExprs);
 
-        if (tbl instanceof OlapTable && ((OlapTable) tbl).getKeysType() == KeysType.PRIMARY_KEYS) {
+        // If user does not specify the file field names, generate it by using base schema of table.
+        // So that the following process can be unified
+        boolean specifyFileFieldNames = copiedColumnExprs.stream().anyMatch(p -> p.isColumn());
+        if (!specifyFileFieldNames) {
+            List<Column> columns = tbl.getBaseSchema();
+            for (Column column : columns) {
+                ImportColumnDesc columnDesc = new ImportColumnDesc(column.getName());
+                copiedColumnExprs.add(columnDesc);
+            }
+        }
+
+        if (tableSupportOpColumn(tbl)) {
             boolean found = false;
             for (ImportColumnDesc c : copiedColumnExprs) {
                 if (c.getColumnName().equals(Load.LOAD_OP_COLUMN)) {
@@ -229,8 +261,8 @@ public class Load {
                                 throw new AnalysisException("load op type string not supported: " + ops);
                             }
                             c.reset(Load.LOAD_OP_COLUMN, new IntLiteral(op));
-                        } else {
-                            throw new AnalysisException("const load op type column should only be upsert/delete");
+                        } else if (!(expr instanceof IntLiteral)) {
+                            throw new AnalysisException("const load op type column should only be upsert(0)/delete(1)");
                         }
                     }
                     LOG.info("load __op column expr: " + (expr != null ? expr.toSql() : "null"));
@@ -238,21 +270,14 @@ public class Load {
                 }
             }
             if (!found) {
-                copiedColumnExprs
-                        .add(new ImportColumnDesc(Load.LOAD_OP_COLUMN, new IntLiteral(TOpType.UPSERT.getValue())));
+                // stream load json will automatically check __op field in json object iff:
+                // 1. streamload using json
+                // 2. __op is not specified
+                copiedColumnExprs.add(new ImportColumnDesc(Load.LOAD_OP_COLUMN,
+                        isStreamLoadJson ? null : new IntLiteral(TOpType.UPSERT.getValue())));
             }
         }
 
-        // If user does not specify the file field names, generate it by using base schema of table.
-        // So that the following process can be unified
-        boolean specifyFileFieldNames = copiedColumnExprs.stream().anyMatch(p -> p.isColumn());
-        if (!specifyFileFieldNames) {
-            List<Column> columns = tbl.getBaseSchema();
-            for (Column column : columns) {
-                ImportColumnDesc columnDesc = new ImportColumnDesc(column.getName());
-                copiedColumnExprs.add(columnDesc);
-            }
-        }
         // generate a map for checking easily
         // columnExprMap should be case insensitive map, because column list in load sql is case insensitive.
         // for such case:
@@ -274,16 +299,19 @@ public class Load {
             }
         }
 
-        // check default value
-        for (Column column : tbl.getBaseSchema()) {
-            String columnName = column.getName();
-            if (columnExprMap.containsKey(columnName)) {
-                continue;
+        // partial update do not check default value
+        if (!partialUpdate) {
+            // check default value
+            for (Column column : tbl.getBaseSchema()) {
+                String columnName = column.getName();
+                if (columnExprMap.containsKey(columnName)) {
+                    continue;
+                }
+                Column.DefaultValueType defaultValueType = column.getDefaultValueType();
+                if (defaultValueType == Column.DefaultValueType.NULL && !column.isAllowNull()) {
+                    throw new DdlException("Column has no default value. column: " + columnName);
+                }
             }
-            if (column.getDefaultValue() != null || column.isAllowNull()) {
-                continue;
-            }
-            throw new DdlException("Column has no default value. column: " + columnName);
         }
 
         // get shadow column desc when table schema change
@@ -471,6 +499,20 @@ public class Load {
         LOG.debug("after init column, exprMap: {}", exprsByName);
     }
 
+    public static List<Column> getPartialUpateColumns(Table tbl, List<ImportColumnDesc> columnExprs)
+            throws UserException {
+        Set<String> specified = columnExprs.stream().map(desc -> desc.getColumnName()).collect(Collectors.toSet());
+        List<Column> ret = new ArrayList<>();
+        for (Column col : tbl.getBaseSchema()) {
+            if (specified.contains(col.getName())) {
+                ret.add(col);
+            } else if (col.isKey()) {
+                throw new DdlException("key column " + col.getName() + " not in partial update columns");
+            }
+        }
+        return ret;
+    }
+
     /**
      * @param excludedColumns: columns that the type should not be inferred from expr.
      *                         Such as, the type of column from path is VARCHAR, whether it is in expr args or not,
@@ -523,15 +565,17 @@ public class Load {
                     throw new UserException("unknown reference column, column=" + entry.getKey()
                             + ", reference=" + slot.getColumnName());
                 }
-                // set slot desc IsMaterialized true
                 if (useVectorizedLoad) {
                     slotDesc.setIsMaterialized(true);
                 }
                 smap.getLhs().add(slot);
-                smap.getRhs().add(new SlotRef(slotDesc));
+                SlotRef slotRef = new SlotRef(slotDesc);
+                slotRef.setColumnName(slot.getColumnName());
+                smap.getRhs().add(slotRef);
             }
             Expr expr = entry.getValue().clone(smap);
-            expr.analyze(analyzer);
+
+            expr = Expr.analyzeAndCastFold(expr);
 
             // check if contain aggregation
             List<FunctionCallExpr> funcs = Lists.newArrayList();
@@ -551,13 +595,14 @@ public class Load {
             for (SlotRef slot : slots) {
                 SlotDescriptor slotDesc = slotDescByName.get(slot.getColumnName());
                 if (slotDesc != null) {
-                    // set slot desc IsMaterialized true
                     if (useVectorizedLoad) {
                         slotDesc.setIsMaterialized(true);
                     }
                     smap.getLhs().add(slot);
+                    SlotRef slotRef = new SlotRef(slotDesc);
+                    slotRef.setColumnName(slot.getColumnName());
                     smap.getRhs().add(new CastExpr(tbl.getColumn(slot.getColumnName()).getType(),
-                            new SlotRef(slotDesc)));
+                            slotRef));
                 } else if (exprsByName.get(slot.getColumnName()) != null) {
                     smap.getLhs().add(slot);
                     smap.getRhs().add(new CastExpr(tbl.getColumn(slot.getColumnName()).getType(),
@@ -568,12 +613,12 @@ public class Load {
                 }
             }
             Expr expr = entry.getValue().clone(smap);
-            expr.analyze(analyzer);
+            expr = Expr.analyzeAndCastFold(expr);
 
             exprsByName.put(entry.getKey(), expr);
         }
     }
-
+    
     /**
      * This method is used to transform hadoop function.
      * The hadoop function includes: replace_value, strftime, time_format, alignment_timestamp, default_value, now.
@@ -598,7 +643,7 @@ public class Load {
             FunctionCallExpr funcExpr = (FunctionCallExpr) originExpr;
             String funcName = funcExpr.getFnName().getFunction();
 
-            if (funcName.equalsIgnoreCase("replace_value")) {
+            if (funcName.equalsIgnoreCase(FunctionSet.REPLACE_VALUE)) {
                 List<Expr> exprs = Lists.newArrayList();
                 SlotRef slotRef = new SlotRef(null, columnName);
                 // We will convert this to IF(`col` != child0, `col`, child1),
@@ -619,9 +664,13 @@ public class Load {
                     if (funcExpr.hasChild(1)) {
                         exprs.add(funcExpr.getChild(1));
                     } else {
-                        if (column.getDefaultValue() != null) {
-                            exprs.add(new StringLiteral(column.getDefaultValue()));
-                        } else {
+                        Column.DefaultValueType defaultValueType = column.getDefaultValueType();
+                        if (defaultValueType == Column.DefaultValueType.CONST) {
+                            exprs.add(new StringLiteral(column.calculatedDefaultValue()));
+                        } else if (defaultValueType == Column.DefaultValueType.VARY) {
+                            throw new UserException("Column(" + columnName + ") has unsupported default value:"
+                                    + column.getDefaultExpr().getExpr());
+                        } else if (defaultValueType == Column.DefaultValueType.NULL) {
                             if (column.isAllowNull()) {
                                 exprs.add(NullLiteral.create(Type.VARCHAR));
                             } else {
@@ -638,9 +687,13 @@ public class Load {
                     if (funcExpr.hasChild(1)) {
                         innerIfExprs.add(funcExpr.getChild(1));
                     } else {
-                        if (column.getDefaultValue() != null) {
-                            innerIfExprs.add(new StringLiteral(column.getDefaultValue()));
-                        } else {
+                        Column.DefaultValueType defaultValueType = column.getDefaultValueType();
+                        if (defaultValueType == Column.DefaultValueType.CONST) {
+                            innerIfExprs.add(new StringLiteral(column.calculatedDefaultValue()));
+                        } else if (defaultValueType == Column.DefaultValueType.VARY) {
+                            throw new UserException("Column(" + columnName + ") has unsupported default value:"
+                                    + column.getDefaultExpr().getExpr());
+                        } else if (defaultValueType == Column.DefaultValueType.NULL) {
                             if (column.isAllowNull()) {
                                 innerIfExprs.add(NullLiteral.create(Type.VARCHAR));
                             } else {
@@ -656,28 +709,28 @@ public class Load {
                 LOG.debug("replace_value expr: {}", exprs);
                 FunctionCallExpr newFn = new FunctionCallExpr("if", exprs);
                 return newFn;
-            } else if (funcName.equalsIgnoreCase("strftime")) {
+            } else if (funcName.equalsIgnoreCase(FunctionSet.STRFTIME)) {
                 // FROM_UNIXTIME(val)
-                FunctionName fromUnixName = new FunctionName("FROM_UNIXTIME");
+                FunctionName fromUnixName = new FunctionName(FunctionSet.FROM_UNIXTIME);
                 List<Expr> fromUnixArgs = Lists.newArrayList(funcExpr.getChild(1));
                 FunctionCallExpr fromUnixFunc = new FunctionCallExpr(
                         fromUnixName, new FunctionParams(false, fromUnixArgs));
 
                 return fromUnixFunc;
-            } else if (funcName.equalsIgnoreCase("time_format")) {
+            } else if (funcName.equalsIgnoreCase(FunctionSet.TIME_FORMAT)) {
                 // DATE_FORMAT(STR_TO_DATE(dt_str, dt_fmt))
-                FunctionName strToDateName = new FunctionName("STR_TO_DATE");
+                FunctionName strToDateName = new FunctionName(FunctionSet.STR_TO_DATE);
                 List<Expr> strToDateExprs = Lists.newArrayList(funcExpr.getChild(2), funcExpr.getChild(1));
                 FunctionCallExpr strToDateFuncExpr = new FunctionCallExpr(
                         strToDateName, new FunctionParams(false, strToDateExprs));
 
-                FunctionName dateFormatName = new FunctionName("DATE_FORMAT");
+                FunctionName dateFormatName = new FunctionName(FunctionSet.DATE_FORMAT);
                 List<Expr> dateFormatArgs = Lists.newArrayList(strToDateFuncExpr, funcExpr.getChild(0));
                 FunctionCallExpr dateFormatFunc = new FunctionCallExpr(
                         dateFormatName, new FunctionParams(false, dateFormatArgs));
 
                 return dateFormatFunc;
-            } else if (funcName.equalsIgnoreCase("alignment_timestamp")) {
+            } else if (funcName.equalsIgnoreCase(FunctionSet.ALIGNMENT_TIMESTAMP)) {
                 /*
                  * change to:
                  * UNIX_TIMESTAMP(DATE_FORMAT(FROM_UNIXTIME(ts), "%Y-01-01 00:00:00"));
@@ -685,7 +738,7 @@ public class Load {
                  */
 
                 // FROM_UNIXTIME
-                FunctionName fromUnixName = new FunctionName("FROM_UNIXTIME");
+                FunctionName fromUnixName = new FunctionName(FunctionSet.FROM_UNIXTIME);
                 List<Expr> fromUnixArgs = Lists.newArrayList(funcExpr.getChild(1));
                 FunctionCallExpr fromUnixFunc = new FunctionCallExpr(
                         fromUnixName, new FunctionParams(false, fromUnixArgs));
@@ -704,27 +757,34 @@ public class Load {
                 } else {
                     throw new UserException("Unknown precision(" + precision.getStringValue() + ")");
                 }
-                FunctionName dateFormatName = new FunctionName("DATE_FORMAT");
+                FunctionName dateFormatName = new FunctionName(FunctionSet.DATE_FORMAT);
                 List<Expr> dateFormatArgs = Lists.newArrayList(fromUnixFunc, format);
                 FunctionCallExpr dateFormatFunc = new FunctionCallExpr(
                         dateFormatName, new FunctionParams(false, dateFormatArgs));
 
                 // UNIX_TIMESTAMP
-                FunctionName unixTimeName = new FunctionName("UNIX_TIMESTAMP");
+                FunctionName unixTimeName = new FunctionName(FunctionSet.UNIX_TIMESTAMP);
                 List<Expr> unixTimeArgs = Lists.newArrayList();
                 unixTimeArgs.add(dateFormatFunc);
                 FunctionCallExpr unixTimeFunc = new FunctionCallExpr(
                         unixTimeName, new FunctionParams(false, unixTimeArgs));
 
                 return unixTimeFunc;
-            } else if (funcName.equalsIgnoreCase("default_value")) {
+            } else if (funcName.equalsIgnoreCase(FunctionSet.DEFAULT_VALUE)) {
                 return funcExpr.getChild(0);
-            } else if (funcName.equalsIgnoreCase("now")) {
-                FunctionName nowFunctionName = new FunctionName("NOW");
+            } else if (funcName.equalsIgnoreCase(FunctionSet.NOW)) {
+                FunctionName nowFunctionName = new FunctionName(FunctionSet.NOW);
                 FunctionCallExpr newFunc = new FunctionCallExpr(nowFunctionName, new FunctionParams(null));
                 return newFunc;
-            } else if (funcName.equalsIgnoreCase("substitute")) {
+            } else if (funcName.equalsIgnoreCase(FunctionSet.SUBSTITUTE)) {
                 return funcExpr.getChild(0);
+            } else if (funcName.equalsIgnoreCase(FunctionSet.GET_JSON_INT) ||
+                    funcName.equalsIgnoreCase(FunctionSet.GET_JSON_STRING) ||
+                    funcName.equalsIgnoreCase(FunctionSet.GET_JSON_DOUBLE)) {
+                FunctionName jsonFunctionName = new FunctionName(funcName.toLowerCase());
+                List<Expr> getJsonArgs = Lists.newArrayList(funcExpr.getChild(0), funcExpr.getChild(1));
+                return new FunctionCallExpr(
+                        jsonFunctionName, new FunctionParams(false, getJsonArgs));
             }
         }
         return originExpr;
@@ -779,7 +839,7 @@ public class Load {
             }
             properties.remove("name");
 
-            if (!Catalog.getCurrentCatalog().getBrokerMgr().containsBroker(brokerName)) {
+            if (!GlobalStateMgr.getCurrentState().getBrokerMgr().containsBroker(brokerName)) {
                 throw new DdlException("broker does not exist: " + brokerName);
             }
 
@@ -802,7 +862,7 @@ public class Load {
             loadErrorHubParam = LoadErrorHub.Param.createNullParam();
         }
 
-        Catalog.getCurrentCatalog().getEditLog().logSetLoadErrorHub(loadErrorHubParam);
+        GlobalStateMgr.getCurrentState().getEditLog().logSetLoadErrorHub(loadErrorHubParam);
 
         LOG.info("set load error hub info: {}", loadErrorHubParam);
     }
@@ -823,8 +883,8 @@ public class Load {
         }
     }
 
-    public static void replayClearRollupInfo(ReplicaPersistInfo info, Catalog catalog) {
-        Database db = catalog.getDb(info.getDbId());
+    public static void replayClearRollupInfo(ReplicaPersistInfo info, GlobalStateMgr globalStateMgr) {
+        Database db = globalStateMgr.getDb(info.getDbId());
         db.writeLock();
         try {
             OlapTable olapTable = (OlapTable) db.getTable(info.getTableId());
@@ -834,6 +894,60 @@ public class Load {
         } finally {
             db.writeUnlock();
         }
+    }
+
+    public long loadLoadJob(DataInputStream dis, long checksum) throws IOException {
+        // load jobs
+        int jobSize = dis.readInt();
+        long newChecksum = checksum ^ jobSize;
+        Preconditions.checkArgument(jobSize == 0, "Number of jobs must be 0");
+
+        // delete jobs
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_11) {
+            jobSize = dis.readInt();
+            newChecksum ^= jobSize;
+            Preconditions.checkArgument(jobSize == 0, "Number of delete job infos must be 0");
+        }
+
+        // load error hub info
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_24) {
+            LoadErrorHub.Param param = new LoadErrorHub.Param();
+            param.readFields(dis);
+            setLoadErrorHubInfo(param);
+        }
+
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_45) {
+            // 4. load delete jobs
+            int deleteJobSize = dis.readInt();
+            newChecksum ^= deleteJobSize;
+            Preconditions.checkArgument(deleteJobSize == 0, "Number of delete jobs must be 0");
+        }
+
+        LOG.info("finished replay loadJob from image");
+        return newChecksum;
+    }
+
+    public long saveLoadJob(DataOutputStream dos, long checksum) throws IOException {
+        // 1. save load.dbToLoadJob
+        int jobSize = 0;
+        checksum ^= jobSize;
+        dos.writeInt(jobSize);
+
+        // 2. save delete jobs
+        jobSize = 0;
+        checksum ^= jobSize;
+        dos.writeInt(jobSize);
+
+        // 3. load error hub info
+        LoadErrorHub.Param param = getLoadErrorHubInfo();
+        param.write(dos);
+
+        // 4. save delete load job info
+        int deleteJobSize = 0;
+        checksum ^= deleteJobSize;
+        dos.writeInt(deleteJobSize);
+
+        return checksum;
     }
 
 }

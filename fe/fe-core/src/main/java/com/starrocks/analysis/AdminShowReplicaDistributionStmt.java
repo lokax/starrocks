@@ -23,7 +23,7 @@ package com.starrocks.analysis;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
-import com.starrocks.catalog.Catalog;
+import com.starrocks.catalog.CatalogUtils;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.cluster.ClusterNamespace;
@@ -34,6 +34,8 @@ import com.starrocks.common.UserException;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.ShowResultSetMetaData;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.AstVisitor;
 
 // admin show replica distribution from tbl [partition(p1, p2, ...)]
 public class AdminShowReplicaDistributionStmt extends ShowStmt {
@@ -51,7 +53,7 @@ public class AdminShowReplicaDistributionStmt extends ShowStmt {
         super.analyze(analyzer);
 
         // check auth
-        if (!Catalog.getCurrentCatalog().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
+        if (!GlobalStateMgr.getCurrentState().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "ADMIN");
         }
 
@@ -62,14 +64,20 @@ public class AdminShowReplicaDistributionStmt extends ShowStmt {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
             }
         } else {
-            dbName = ClusterNamespace.getFullName(getClusterName(), tblRef.getName().getDb());
+            dbName = ClusterNamespace.getFullName(tblRef.getName().getDb());
         }
 
         tblRef.getName().setDb(dbName);
+
+        CatalogUtils.checkOlapTableHasStarOSPartition(dbName, tblRef.getName().getTbl());
     }
 
     public String getDbName() {
         return tblRef.getName().getDb();
+    }
+
+    public void setDbName(String dbName) {
+        this.tblRef.getName().setDb(dbName);
     }
 
     public String getTblName() {
@@ -96,5 +104,15 @@ public class AdminShowReplicaDistributionStmt extends ShowStmt {
         } else {
             return RedirectStatus.NO_FORWARD;
         }
+    }
+
+    @Override
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
+        return visitor.visitAdminShowReplicaDistributionStatement(this, context);
+    }
+
+    @Override
+    public boolean isSupportNewPlanner() {
+        return true;
     }
 }

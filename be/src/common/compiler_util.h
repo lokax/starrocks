@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_COMMON_COMMON_COMPILER_UTIL_H
-#define STARROCKS_BE_SRC_COMMON_COMMON_COMPILER_UTIL_H
+#pragma once
 
 // Compiler hint that this branch is likely or unlikely to
 // be taken. Take from the "What all programmers should know
@@ -50,6 +49,7 @@
 
 #define ALIGN_CACHE_LINE __attribute__((aligned(CACHE_LINE_SIZE)))
 
+#ifndef DIAGNOSTIC_PUSH
 #ifdef __clang__
 #define DIAGNOSTIC_PUSH _Pragma("clang diagnostic push")
 #define DIAGNOSTIC_POP _Pragma("clang diagnostic pop")
@@ -62,9 +62,10 @@
 #else
 #error("Unknown compiler")
 #endif
+#endif // ifndef DIAGNOSTIC_PUSH
 
+#ifndef DIAGNOSTIC_IGNORE
 #define PRAGMA(TXT) _Pragma(#TXT)
-
 #ifdef __clang__
 #define DIAGNOSTIC_IGNORE(XXX) PRAGMA(clang diagnostic ignored XXX)
 #elif defined(__GNUC__)
@@ -74,5 +75,4 @@
 #else
 #define DIAGNOSTIC_IGNORE(XXX)
 #endif
-
-#endif
+#endif // ifndef DIAGNOSTIC_IGNORE

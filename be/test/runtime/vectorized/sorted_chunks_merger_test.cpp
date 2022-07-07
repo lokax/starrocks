@@ -1,13 +1,15 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
-#include "runtime/vectorized/sorted_chunks_merger.h"
+#include "runtime/sorted_chunks_merger.h"
 
 #include <gtest/gtest.h>
 
+#include "column/chunk.h"
 #include "column/column_helper.h"
 #include "column/datum_tuple.h"
 #include "exprs/expr_context.h"
-#include "exprs/slot_ref.h"
+#include "exprs/vectorized/column_ref.h"
+#include "runtime/runtime_state.h"
 
 namespace starrocks::vectorized {
 
@@ -79,8 +81,8 @@ public:
         Columns columns_2 = {col_cust_key_2, col_nation_2, col_region_2};
         Columns columns_3 = {col_cust_key_3, col_nation_3, col_region_3};
 
-        butil::FlatMap<SlotId, size_t> map;
-        map.init(columns_1.size() * 2);
+        Chunk::SlotHashMap map;
+        map.reserve(columns_1.size() * 2);
         for (int i = 0; i < columns_1.size(); ++i) {
             map[i] = i;
         }
@@ -89,9 +91,9 @@ public:
         _chunk_2 = std::make_shared<Chunk>(columns_2, map);
         _chunk_3 = std::make_shared<Chunk>(columns_3, map);
 
-        auto* expr1 = new SlotRef(TypeDescriptor(TYPE_VARCHAR), 0, 2); // refer to region
-        auto* expr2 = new SlotRef(TypeDescriptor(TYPE_VARCHAR), 0, 1); // refer to nation
-        auto* expr3 = new SlotRef(TypeDescriptor(TYPE_INT), 0, 0);     // refer to cust_key
+        auto* expr1 = new ColumnRef(TypeDescriptor(TYPE_VARCHAR), 2); // refer to region
+        auto* expr2 = new ColumnRef(TypeDescriptor(TYPE_VARCHAR), 1); // refer to nation
+        auto* expr3 = new ColumnRef(TypeDescriptor(TYPE_INT), 0);     // refer to cust_key
         _exprs.push_back(expr1);
         _exprs.push_back(expr2);
         _exprs.push_back(expr3);
@@ -106,6 +108,8 @@ public:
         _is_null_first.push_back(true);
         _is_null_first.push_back(true);
         _is_null_first.push_back(true);
+
+        _runtime_state = _create_runtime_state();
     }
 
     void TearDown() {
@@ -122,6 +126,18 @@ protected:
     std::vector<Expr*> _exprs;
     std::vector<ExprContext*> _sort_exprs;
     std::vector<bool> _is_asc, _is_null_first;
+
+    std::shared_ptr<RuntimeState> _create_runtime_state() {
+        TUniqueId fragment_id;
+        TQueryOptions query_options;
+        query_options.batch_size = config::vector_chunk_size;
+        TQueryGlobals query_globals;
+        auto runtime_state = std::make_shared<RuntimeState>(fragment_id, query_options, query_globals, nullptr);
+        runtime_state->init_instance_mem_tracker();
+        return runtime_state;
+    }
+
+    std::shared_ptr<RuntimeState> _runtime_state;
 };
 
 [[maybe_unused]] static void print_chunk(const ChunkPtr& chunk) {
@@ -161,9 +177,14 @@ TEST_F(SortedChunksMergerTest, one_supplier) {
         }
         return Status::OK();
     };
+    auto probe_supplier = [](Chunk** cnk) -> bool { return false; };
+    auto has_supplier = []() -> bool { return false; };
+
     ChunkSuppliers suppliers = {supplier};
-    SortedChunksMerger merger;
-    merger.init(suppliers, &_sort_exprs, &_is_asc, &_is_null_first);
+    ChunkProbeSuppliers probe_suppliers = {probe_supplier};
+    ChunkHasSuppliers has_suppliers = {has_supplier};
+    SortedChunksMerger merger(_runtime_state.get(), false);
+    merger.init(suppliers, probe_suppliers, has_suppliers, &_sort_exprs, &_is_asc, &_is_null_first);
 
     bool eos = false;
     ChunkPtr page_1, page_2;
@@ -184,6 +205,8 @@ TEST_F(SortedChunksMergerTest, one_supplier) {
 
 TEST_F(SortedChunksMergerTest, two_suppliers) {
     ChunkSuppliers suppliers;
+    ChunkProbeSuppliers probe_suppliers;
+    ChunkHasSuppliers has_suppliers;
     std::vector<ChunkPtr> chunks = {_chunk_1, _chunk_2};
     for (size_t i = 0; i < chunks.size(); ++i) {
         auto supplier = [&chunks, i](Chunk** cnk) -> Status {
@@ -200,11 +223,15 @@ TEST_F(SortedChunksMergerTest, two_suppliers) {
             }
             return Status::OK();
         };
+        auto probe_supplier = [](Chunk** cnk) -> bool { return false; };
+        auto has_supplier = []() -> bool { return false; };
         suppliers.push_back(supplier);
+        probe_suppliers.push_back(probe_supplier);
+        has_suppliers.push_back(has_supplier);
     }
 
-    SortedChunksMerger merger;
-    merger.init(suppliers, &_sort_exprs, &_is_asc, &_is_null_first);
+    SortedChunksMerger merger(_runtime_state.get(), false);
+    merger.init(suppliers, probe_suppliers, has_suppliers, &_sort_exprs, &_is_asc, &_is_null_first);
 
     bool eos = false;
     ChunkPtr page_1, page_2;
@@ -228,6 +255,8 @@ TEST_F(SortedChunksMergerTest, two_suppliers) {
 
 TEST_F(SortedChunksMergerTest, three_suppliers) {
     ChunkSuppliers suppliers;
+    ChunkProbeSuppliers probe_suppliers;
+    ChunkHasSuppliers has_suppliers;
     std::vector<ChunkPtr> chunks = {_chunk_1, _chunk_2, _chunk_3};
     for (size_t i = 0; i < chunks.size(); ++i) {
         auto supplier = [&chunks, i](Chunk** cnk) -> Status {
@@ -244,11 +273,15 @@ TEST_F(SortedChunksMergerTest, three_suppliers) {
             }
             return Status::OK();
         };
+        auto probe_supplier = [](Chunk** cnk) -> bool { return false; };
+        auto has_supplier = []() -> bool { return false; };
         suppliers.push_back(supplier);
+        probe_suppliers.push_back(probe_supplier);
+        has_suppliers.push_back(has_supplier);
     }
 
-    SortedChunksMerger merger;
-    merger.init(suppliers, &_sort_exprs, &_is_asc, &_is_null_first);
+    SortedChunksMerger merger(_runtime_state.get(), false);
+    merger.init(suppliers, probe_suppliers, has_suppliers, &_sort_exprs, &_is_asc, &_is_null_first);
 
     bool eos = false;
     ChunkPtr page_1, page_2;

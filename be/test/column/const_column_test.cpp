@@ -1,33 +1,52 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/test/column/const_column_test.cpp
-
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "column/const_column.h"
 
 #include <gtest/gtest.h>
 
-#include "column/const_column.h"
+#include "column/binary_column.h"
 #include "column/fixed_length_column.h"
 #include "testutil/parallel_test.h"
 
 namespace starrocks::vectorized {
+
+// NOLINTNEXTLINE
+PARALLEL_TEST(ConstColumnTest, test_const_column_upgrade_if_overflow) {
+    auto data_column = Int32Column::create();
+    data_column->append(1);
+
+    auto column = ConstColumn::create(std::move(data_column), 1024);
+    auto ret = column->upgrade_if_overflow();
+    ASSERT_TRUE(ret.ok());
+    ASSERT_TRUE(ret.value() == nullptr);
+
+    data_column = Int32Column::create();
+    data_column->append(1);
+    column = ConstColumn::create(std::move(data_column), 2ul << 32u);
+    ret = column->upgrade_if_overflow();
+    ASSERT_FALSE(ret.ok());
+}
+
+// NOLINTNEXTLINE
+PARALLEL_TEST(ConstColumnTest, test_const_column_downgrade) {
+    auto data_column = BinaryColumn::create();
+    ASSERT_FALSE(data_column->has_large_column());
+    data_column->append_string("1");
+    auto const_column = ConstColumn::create(data_column, 1024);
+    auto ret = const_column->downgrade();
+    ASSERT_TRUE(ret.ok());
+    ASSERT_TRUE(ret.value() == nullptr);
+
+    auto large_data_column = LargeBinaryColumn::create();
+    large_data_column->append_string("1");
+    const_column = ConstColumn::create(large_data_column, 1024);
+    ASSERT_TRUE(const_column->has_large_column());
+    ret = const_column->downgrade();
+    ASSERT_TRUE(ret.ok());
+    ASSERT_TRUE(ret.value() == nullptr);
+    ASSERT_FALSE(const_column->has_large_column());
+    ASSERT_FALSE(const_column->has_large_column());
+}
 
 // NOLINTNEXTLINE
 PARALLEL_TEST(ConstColumnTest, test_basic) {
@@ -68,27 +87,6 @@ PARALLEL_TEST(ConstColumnTest, test_compare_at) {
     ASSERT_EQ(0, c1->compare_at(1, 2, *c1, -1));
     ASSERT_LT(c1->compare_at(1, 9, *c2, -1), 0);
     ASSERT_GT(c2->compare_at(1, 9, *c1, -1), 0);
-}
-
-// NOLINTNEXTLINE
-PARALLEL_TEST(ConstColumnTest, test_serde) {
-    auto create_const_column = [](int32_t value, size_t size) {
-        auto c = Int32Column::create();
-        c->append_numbers(&value, sizeof(value));
-        return ConstColumn::create(c, size);
-    };
-
-    auto c1 = create_const_column(100, 10);
-    auto c2 = create_const_column(101, 10);
-
-    std::vector<uint8_t> buffer;
-    buffer.resize(c1->serialize_size());
-    c1->serialize_column(buffer.data());
-    c2->deserialize_column(buffer.data());
-
-    for (size_t i = 0; i < c1->size(); i++) {
-        ASSERT_EQ(c1->get(i).get_int32(), c2->get(i).get_int32());
-    }
 }
 
 // NOLINTNEXTLINE

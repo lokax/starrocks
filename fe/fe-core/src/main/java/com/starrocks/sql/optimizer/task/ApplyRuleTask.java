@@ -1,14 +1,20 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.task;
 
 import com.google.common.collect.Lists;
 import com.starrocks.common.Pair;
+import com.starrocks.qe.SessionVariable;
 import com.starrocks.sql.optimizer.GroupExpression;
 import com.starrocks.sql.optimizer.OptExpression;
+import com.starrocks.sql.optimizer.Optimizer;
+import com.starrocks.sql.optimizer.OptimizerTraceInfo;
+import com.starrocks.sql.optimizer.OptimizerTraceUtil;
 import com.starrocks.sql.optimizer.operator.pattern.Pattern;
 import com.starrocks.sql.optimizer.rule.Binder;
 import com.starrocks.sql.optimizer.rule.Rule;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.util.List;
 
@@ -26,23 +32,20 @@ import java.util.List;
  */
 
 public class ApplyRuleTask extends OptimizerTask {
+    private static final Logger LOG = LogManager.getLogger(Optimizer.class);
     private final GroupExpression groupExpression;
     private final Rule rule;
-    private final boolean exploreOnly;
 
-    ApplyRuleTask(TaskContext context, GroupExpression groupExpression,
-                  Rule rule, boolean exploreOnly) {
+    ApplyRuleTask(TaskContext context, GroupExpression groupExpression, Rule rule) {
         super(context);
         this.groupExpression = groupExpression;
         this.rule = rule;
-        this.exploreOnly = exploreOnly;
     }
 
     @Override
     public String toString() {
         return "ApplyRuleTask for groupExpression " + groupExpression +
-                "\n rule " + rule +
-                "\n exploreOnly " + exploreOnly;
+                "\n rule " + rule;
     }
 
     @Override
@@ -51,7 +54,7 @@ public class ApplyRuleTask extends OptimizerTask {
                 groupExpression.isUnused()) {
             return;
         }
-
+        SessionVariable sessionVariable = context.getOptimizerContext().getSessionVariable();
         // Apply rule and get all new OptExpressions
         Pattern pattern = rule.getPattern();
         Binder binder = new Binder(pattern, groupExpression);
@@ -62,8 +65,12 @@ public class ApplyRuleTask extends OptimizerTask {
                 extractExpr = binder.next();
                 continue;
             }
+            List<OptExpression> targetExpressions = rule.transform(extractExpr, context.getOptimizerContext());
+            newExpressions.addAll(targetExpressions);
 
-            newExpressions.addAll(rule.transform(extractExpr, context.getOptimizerContext()));
+            OptimizerTraceInfo traceInfo = context.getOptimizerContext().getTraceInfo();
+            OptimizerTraceUtil.logApplyRule(sessionVariable, traceInfo, rule, extractExpr, targetExpressions);
+
             extractExpr = binder.next();
         }
 
@@ -81,9 +88,8 @@ public class ApplyRuleTask extends OptimizerTask {
             GroupExpression newGroupExpression = result.second;
             if (newGroupExpression.getOp().isLogical()) {
                 // For logic newGroupExpression, optimize it
-                pushTask(new OptimizeExpressionTask(context, newGroupExpression, exploreOnly));
-                pushTask(new DeriveStatsTask(context, newGroupExpression,
-                        newGroupExpression.getGroup().getLogicalProperty().getOutputColumns()));
+                pushTask(new OptimizeExpressionTask(context, newGroupExpression));
+                pushTask(new DeriveStatsTask(context, newGroupExpression));
             } else {
                 // For physical newGroupExpression, enforce and cost it,
                 // Optimize its inputs if needed

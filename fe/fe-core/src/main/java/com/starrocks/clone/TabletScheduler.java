@@ -21,19 +21,21 @@
 
 package com.starrocks.clone;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.EvictingQueue;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.ColocateTableIndex;
 import com.starrocks.catalog.ColocateTableIndex.GroupId;
 import com.starrocks.catalog.DataProperty;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.DiskInfo;
 import com.starrocks.catalog.DiskInfo.DiskState;
+import com.starrocks.catalog.LocalTablet;
+import com.starrocks.catalog.LocalTablet.TabletStatus;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.OlapTable.OlapTableState;
@@ -41,8 +43,6 @@ import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Partition.PartitionState;
 import com.starrocks.catalog.Replica;
 import com.starrocks.catalog.Replica.ReplicaState;
-import com.starrocks.catalog.Tablet;
-import com.starrocks.catalog.Tablet.TabletStatus;
 import com.starrocks.catalog.TabletInvertedIndex;
 import com.starrocks.clone.SchedException.Status;
 import com.starrocks.clone.TabletSchedCtx.Priority;
@@ -52,6 +52,7 @@ import com.starrocks.common.Config;
 import com.starrocks.common.Pair;
 import com.starrocks.common.util.MasterDaemon;
 import com.starrocks.persist.ReplicaPersistInfo;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.task.AgentBatchTask;
@@ -126,7 +127,7 @@ public class TabletScheduler extends MasterDaemon {
 
     private long lastSlotAdjustTime = 0;
 
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
     private SystemInfoService infoService;
     private TabletInvertedIndex invertedIndex;
     private ColocateTableIndex colocateTableIndex;
@@ -153,13 +154,14 @@ public class TabletScheduler extends MasterDaemon {
         }
     }
 
-    public TabletScheduler(Catalog catalog, SystemInfoService infoService, TabletInvertedIndex invertedIndex,
+    public TabletScheduler(GlobalStateMgr globalStateMgr, SystemInfoService infoService,
+                           TabletInvertedIndex invertedIndex,
                            TabletSchedulerStat stat) {
         super("tablet scheduler", SCHEDULE_INTERVAL_MS);
-        this.catalog = catalog;
+        this.globalStateMgr = globalStateMgr;
         this.infoService = infoService;
         this.invertedIndex = invertedIndex;
-        this.colocateTableIndex = catalog.getColocateTableIndex();
+        this.colocateTableIndex = globalStateMgr.getColocateTableIndex();
         this.stat = stat;
 
         if (TabletBalancerStrategy.isTabletAndDiskStrategy(Config.tablet_balancer_strategy)) {
@@ -181,7 +183,7 @@ public class TabletScheduler extends MasterDaemon {
      * update working slots at the beginning of each round
      */
     private boolean updateWorkingSlots() {
-        ImmutableMap<Long, Backend> backends = infoService.getBackendsInCluster(null);
+        ImmutableMap<Long, Backend> backends = infoService.getIdToBackend();
         for (Backend backend : backends.values()) {
             if (!backend.hasPathHash() && backend.isAlive()) {
                 // when upgrading, backend may not get path info yet. so return false and wait for next round.
@@ -231,10 +233,17 @@ public class TabletScheduler extends MasterDaemon {
 
     /**
      * add a ready-to-be-scheduled tablet to pendingTablets, if it has not being added before.
-     * if force is true, do not check if tablet is already added before.
      */
     public synchronized AddResult addTablet(TabletSchedCtx tablet, boolean force) {
-        if (!force && containsTablet(tablet.getTabletId())) {
+        // Under no circumstance should we repeatedly add a tablet to pending queue
+        // to schedule, because this will break the scheduling logic. Besides, with current design,
+        // we have to maintain the constraint that `allTabletIds = runningTablets + pendingTablets`.
+        // `allTabletIds` and `runningTablets` are defined as unique container, if we schedule a
+        // tablet with different `TabletSchedCtx` at the same time, the reference in `runningTablets`
+        // can be messed up.
+        // `force` here should only mean that we can exceed the size limit of
+        // `pendingTablets` and `runningTablets` if there is too many tablets to schedule.
+        if (containsTablet(tablet.getTabletId())) {
             return AddResult.ALREADY_IN;
         }
 
@@ -344,14 +353,11 @@ public class TabletScheduler extends MasterDaemon {
      */
     private void updateClusterLoadStatistic() {
         Map<String, ClusterLoadStatistic> newStatisticMap = Maps.newConcurrentMap();
-        Set<String> clusterNames = infoService.getClusterNames();
-        for (String clusterName : clusterNames) {
-            ClusterLoadStatistic clusterLoadStatistic = new ClusterLoadStatistic(clusterName,
-                    infoService, invertedIndex);
-            clusterLoadStatistic.init();
-            newStatisticMap.put(clusterName, clusterLoadStatistic);
-            LOG.info("update cluster {} load statistic:\n{}", clusterName, clusterLoadStatistic.getBrief());
-        }
+        String clusterName = SystemInfoService.DEFAULT_CLUSTER;
+        ClusterLoadStatistic clusterLoadStatistic = new ClusterLoadStatistic(infoService, invertedIndex);
+        clusterLoadStatistic.init();
+        newStatisticMap.put(clusterName, clusterLoadStatistic);
+        LOG.info("update cluster {} load statistic:\n{}", clusterName, clusterLoadStatistic.getBrief());
 
         this.statisticMap = newStatisticMap;
     }
@@ -382,6 +388,16 @@ public class TabletScheduler extends MasterDaemon {
         LOG.info("adjust priority for all tablets. changed: {}, total: {}", changedNum, size);
     }
 
+    private void debugLogPendingTabletsStats() {
+        StringBuilder sb = new StringBuilder();
+        for (Priority prio : Priority.values()) {
+            sb.append(String.format("%s priority tablets count: %d\n",
+                    prio.name(),
+                    pendingTablets.stream().filter(t -> t.getDynamicPriority() == prio).count()));
+        }
+        LOG.debug("pending tablets current count: {}\n{}", pendingTablets.size(), sb);
+    }
+
     /**
      * get at most BATCH_NUM tablets from queue, and try to schedule them.
      * After handle, the tablet info should be
@@ -394,7 +410,10 @@ public class TabletScheduler extends MasterDaemon {
     private void schedulePendingTablets() {
         long start = System.currentTimeMillis();
         List<TabletSchedCtx> currentBatch = getNextTabletCtxBatch();
-        LOG.debug("get {} tablets to schedule", currentBatch.size());
+        if (LOG.isDebugEnabled()) {
+            debugLogPendingTabletsStats();
+            LOG.debug("get {} tablets to schedule", currentBatch.size());
+        }
 
         AgentBatchTask batchTask = new AgentBatchTask();
         for (TabletSchedCtx tabletCtx : currentBatch) {
@@ -408,6 +427,8 @@ public class TabletScheduler extends MasterDaemon {
                 tabletCtx.setErrMsg(e.getMessage());
 
                 if (e.getStatus() == Status.SCHEDULE_FAILED) {
+                    LOG.debug("scheduling for tablet[{}] failed, type: {}, reason: {}",
+                            tabletCtx.getTabletId(), tabletCtx.getType().name(), e.getMessage());
                     if (tabletCtx.getType() == Type.BALANCE) {
                         // if balance is disabled, remove this tablet
                         if (Config.disable_balance) {
@@ -496,7 +517,7 @@ public class TabletScheduler extends MasterDaemon {
         stat.counterTabletScheduled.incrementAndGet();
 
         // check this tablet again
-        Database db = catalog.getDbIncludeRecycleBin(tabletCtx.getDbId());
+        Database db = globalStateMgr.getDbIncludeRecycleBin(tabletCtx.getDbId());
         if (db == null) {
             throw new SchedException(Status.UNRECOVERABLE, "db does not exist");
         }
@@ -504,7 +525,7 @@ public class TabletScheduler extends MasterDaemon {
         Pair<TabletStatus, TabletSchedCtx.Priority> statusPair;
         db.writeLock();
         try {
-            OlapTable tbl = (OlapTable) catalog.getTableIncludeRecycleBin(db, tabletCtx.getTblId());
+            OlapTable tbl = (OlapTable) globalStateMgr.getTableIncludeRecycleBin(db, tabletCtx.getTblId());
             if (tbl == null) {
                 throw new SchedException(Status.UNRECOVERABLE, "tbl does not exist");
             }
@@ -513,18 +534,22 @@ public class TabletScheduler extends MasterDaemon {
 
             OlapTableState tableState = tbl.getState();
 
-            Partition partition = catalog.getPartitionIncludeRecycleBin(tbl, tabletCtx.getPartitionId());
+            Partition partition = globalStateMgr.getPartitionIncludeRecycleBin(tbl, tabletCtx.getPartitionId());
             if (partition == null) {
                 throw new SchedException(Status.UNRECOVERABLE, "partition does not exist");
             }
+            if (partition.isUseStarOS()) {
+                throw new SchedException(Status.UNRECOVERABLE, "tablet is managed by StarOS");
+            }
 
-            short replicaNum = catalog.getReplicationNumIncludeRecycleBin(tbl.getPartitionInfo(), partition.getId());
+            short replicaNum =
+                    globalStateMgr.getReplicationNumIncludeRecycleBin(tbl.getPartitionInfo(), partition.getId());
             if (replicaNum == (short) -1) {
                 throw new SchedException(Status.UNRECOVERABLE, "invalid replication number");
             }
 
             DataProperty dataProperty =
-                    catalog.getDataPropertyIncludeRecycleBin(tbl.getPartitionInfo(), partition.getId());
+                    globalStateMgr.getDataPropertyIncludeRecycleBin(tbl.getPartitionInfo(), partition.getId());
             if (dataProperty == null) {
                 throw new SchedException(Status.UNRECOVERABLE, "partition data property not exist");
             }
@@ -534,7 +559,7 @@ public class TabletScheduler extends MasterDaemon {
                 throw new SchedException(Status.UNRECOVERABLE, "index does not exist");
             }
 
-            Tablet tablet = idx.getTablet(tabletCtx.getTabletId());
+            LocalTablet tablet = (LocalTablet) idx.getTablet(tabletCtx.getTabletId());
             Preconditions.checkNotNull(tablet);
 
             if (isColocateTable) {
@@ -552,17 +577,15 @@ public class TabletScheduler extends MasterDaemon {
                 Set<Long> backendsSet = colocateTableIndex.getTabletBackendsByGroup(groupId, tabletOrderIdx);
                 TabletStatus st = tablet.getColocateHealthStatus(
                         partition.getVisibleVersion(),
-                        partition.getVisibleVersionHash(),
                         replicaNum,
                         backendsSet);
                 statusPair = Pair.create(st, Priority.HIGH);
                 tabletCtx.setColocateGroupBackendIds(backendsSet);
             } else {
-                List<Long> aliveBeIdsInCluster = infoService.getClusterBackendIds(db.getClusterName(), true);
+                List<Long> aliveBeIdsInCluster = infoService.getBackendIds(true);
                 statusPair = tablet.getHealthStatusWithPriority(
                         infoService, tabletCtx.getCluster(),
                         partition.getVisibleVersion(),
-                        partition.getVisibleVersionHash(),
                         replicaNum,
                         aliveBeIdsInCluster);
             }
@@ -601,8 +624,8 @@ public class TabletScheduler extends MasterDaemon {
             // we do not concern priority here.
             // once we take the tablet out of priority queue, priority is meaningless.
             tabletCtx.setTablet(tablet);
-            tabletCtx.setVersionInfo(partition.getVisibleVersion(), partition.getVisibleVersionHash(),
-                    partition.getCommittedVersion(), partition.getCommittedVersionHash());
+            tabletCtx.setVersionInfo(partition.getVisibleVersion(),
+                    partition.getCommittedVersion());
             tabletCtx.setSchemaHash(tbl.getSchemaHashByIndexId(idx.getId()));
             tabletCtx.setStorageMedium(dataProperty.getStorageMedium());
 
@@ -612,7 +635,8 @@ public class TabletScheduler extends MasterDaemon {
         }
     }
 
-    private void handleTabletByTypeAndStatus(TabletStatus status, TabletSchedCtx tabletCtx, AgentBatchTask batchTask)
+    @VisibleForTesting
+    public void handleTabletByTypeAndStatus(TabletStatus status, TabletSchedCtx tabletCtx, AgentBatchTask batchTask)
             throws SchedException {
         if (tabletCtx.getType() == Type.REPAIR) {
             switch (status) {
@@ -672,6 +696,11 @@ public class TabletScheduler extends MasterDaemon {
         Preconditions.checkNotNull(destPath);
         tabletCtx.setDest(destPath.getBeId(), destPath.getPathHash());
 
+        if (Config.recover_with_empty_tablet && tabletCtx.getReplicas().size() == 1) {
+            batchTask.addTask(tabletCtx.createEmptyReplicaAndTask());
+            return;
+        }
+
         // choose a source replica for cloning from
         tabletCtx.chooseSrcReplica(backendsWorkingSlots);
 
@@ -723,18 +752,24 @@ public class TabletScheduler extends MasterDaemon {
         stat.counterReplicaUnavailableErr.incrementAndGet();
         try {
             handleReplicaVersionIncomplete(tabletCtx, batchTask);
-            LOG.info("succeed to find version incomplete replica from tablet relocating. tablet id: {}",
-                    tabletCtx.getTabletId());
+            LOG.info(
+                    "succeed to find version incomplete replica from tablet relocating. tablet: {} replicas: {} {}->{}",
+                    tabletCtx.getTabletId(), tabletCtx.getTablet().getReplicaInfos(),
+                    tabletCtx.getSrcReplica().getBackendId(), tabletCtx.getDestBackendId());
         } catch (SchedException e) {
             if (e.getStatus() == Status.SCHEDULE_FAILED) {
-                LOG.info("failed to find version incomplete replica from tablet relocating. tablet id: {}, "
-                        + "try to find a new backend", tabletCtx.getTabletId());
+                LOG.debug("failed to find version incomplete replica from tablet relocating. " +
+                                "reason: [{}], tablet: [{}], replicas: {} dest:{} try to find a new backend", e.getMessage(),
+                        tabletCtx.getTabletId(), tabletCtx.getTablet().getReplicaInfos(),
+                        tabletCtx.getDestBackendId());
                 // the dest or src slot may be taken after calling handleReplicaVersionIncomplete(),
                 // so we need to release these slots first.
                 // and reserve the tablet in TabletSchedCtx so that it can continue to be scheduled.
                 tabletCtx.releaseResource(this, true);
                 handleReplicaMissing(tabletCtx, batchTask);
-                LOG.info("succeed to find new backend for tablet relocating. tablet id: {}", tabletCtx.getTabletId());
+                LOG.info("succeed to find new backend for tablet relocating. tablet: {} replicas: {} {}->{}",
+                        tabletCtx.getTabletId(), tabletCtx.getTablet().getReplicaInfos(),
+                        tabletCtx.getSrcReplica().getBackendId(), tabletCtx.getDestBackendId());
             } else {
                 throw e;
             }
@@ -835,7 +870,7 @@ public class TabletScheduler extends MasterDaemon {
     private boolean deleteReplicaWithLowerVersion(TabletSchedCtx tabletCtx, boolean force) throws SchedException {
         for (Replica replica : tabletCtx.getReplicas()) {
             if (!replica
-                    .checkVersionCatchUp(tabletCtx.getCommittedVersion(), tabletCtx.getCommittedVersionHash(), false)) {
+                    .checkVersionCatchUp(tabletCtx.getVisibleVersion(), false)) {
                 deleteReplicaInternal(tabletCtx, replica, "lower version", force);
                 return true;
             }
@@ -975,23 +1010,28 @@ public class TabletScheduler extends MasterDaemon {
         /*
          * Before deleting a replica, we should make sure that there is no running txn on it and no more txns will be on it.
          * So we do followings:
-         * 1. If replica is loadable, set a watermark txn id on it and set it state as DECOMMISSION, but not deleting it this time.
-         *      The DECOMMISSION state will ensure that no more txns will be on this replicas.
-         * 2. Wait for any txns before the watermark txn id to be finished. If all are finished, which means this replica is
-         *      safe to be deleted.
+         * 1. If replica is loadable, set a watermark txn id on it and set it state as DECOMMISSION, but not
+         *      deleting it this time. The DECOMMISSION state will ensure that no more txns will be on this replicas.
+         * 2. Wait for any txns before the watermark txn id to be finished. If all are finished, which means
+         *      this replica is safe to be deleted.
          */
         if (!force && replica.getState().canLoad() && replica.getWatermarkTxnId() == -1) {
             long nextTxnId =
-                    Catalog.getCurrentGlobalTransactionMgr().getTransactionIDGenerator().getNextTransactionId();
+                    GlobalStateMgr.getCurrentGlobalTransactionMgr().getTransactionIDGenerator().getNextTransactionId();
             replica.setWatermarkTxnId(nextTxnId);
+            tabletCtx.resetDecommissionedReplicaState();
+            tabletCtx.setDecommissionedReplica(replica);
             replica.setState(ReplicaState.DECOMMISSION);
             // set priority to normal because it may wait for a long time. Remain it as VERY_HIGH may block other task.
             tabletCtx.setOrigPriority(Priority.NORMAL);
+            LOG.info("decommission tablet:" + tabletCtx.getTabletId() + " type:" + tabletCtx.getType() + " replica:" +
+                    replica.getBackendId() + " reason:" + reason + " watermark:" + nextTxnId + " replicas:" +
+                    tabletCtx.getTablet().getReplicaInfos());
             throw new SchedException(Status.SCHEDULE_FAILED, "set watermark txn " + nextTxnId);
         } else if (replica.getState() == ReplicaState.DECOMMISSION && replica.getWatermarkTxnId() != -1) {
             long watermarkTxnId = replica.getWatermarkTxnId();
             try {
-                if (!Catalog.getCurrentGlobalTransactionMgr().isPreviousTransactionsFinished(watermarkTxnId,
+                if (!GlobalStateMgr.getCurrentGlobalTransactionMgr().isPreviousTransactionsFinished(watermarkTxnId,
                         tabletCtx.getDbId(), Lists.newArrayList(tabletCtx.getTblId()))) {
                     throw new SchedException(Status.SCHEDULE_FAILED,
                             "wait txn before " + watermarkTxnId + " to be finished");
@@ -1001,7 +1041,8 @@ public class TabletScheduler extends MasterDaemon {
             }
         }
 
-        // delete this replica from catalog.
+        String replicaInfos = tabletCtx.getTablet().getReplicaInfos();
+        // delete this replica from globalStateMgr.
         // it will also delete replica from tablet inverted index.
         tabletCtx.deleteReplica(replica);
 
@@ -1022,14 +1063,14 @@ public class TabletScheduler extends MasterDaemon {
                 tabletCtx.getTabletId(),
                 replica.getBackendId());
 
-        Catalog.getCurrentCatalog().getEditLog().logDeleteReplica(info);
+        GlobalStateMgr.getCurrentState().getEditLog().logDeleteReplica(info);
 
-        LOG.info("delete replica. tablet id: {}, backend id: {}. reason: {}, force: {}",
-                tabletCtx.getTabletId(), replica.getBackendId(), reason, force);
+        LOG.info("delete replica. tablet id: {}, backend id: {}. reason: {}, force: {} replicas: {}",
+                tabletCtx.getTabletId(), replica.getBackendId(), reason, force, replicaInfos);
     }
 
     private void sendDeleteReplicaTask(long backendId, long tabletId, int schemaHash) {
-        DropReplicaTask task = new DropReplicaTask(backendId, tabletId, schemaHash);
+        DropReplicaTask task = new DropReplicaTask(backendId, tabletId, schemaHash, false);
         AgentBatchTask batchTask = new AgentBatchTask();
         batchTask.addTask(task);
         AgentTaskExecutor.submit(batchTask);
@@ -1177,6 +1218,16 @@ public class TabletScheduler extends MasterDaemon {
         throw new SchedException(Status.SCHEDULE_FAILED, "unable to find dest path which can be fit in");
     }
 
+    private synchronized void addBackToPendingTablets(TabletSchedCtx tabletCtx) {
+        // Since we know it's add back, corresponding tablet id is still recorded in `allTabletIds`,
+        // so we explicitly remove the id from `allTabletIds`, otherwise `addTablet()` may fail.
+        // And when adding back, we don't want it to be failed because of exceeding limit of
+        // `Config.max_scheduling_tablets` since it's already got scheduled before, we just adjusted
+        // its priority and want it to be scheduled again, so we set force to be true here.
+        allTabletIds.remove(tabletCtx.getTabletId());
+        addTablet(tabletCtx, true /* force */);
+    }
+
     /**
      * For some reason, a tablet info failed to be scheduled this time,
      * So we dynamically change its priority and add back to queue, waiting for next round.
@@ -1184,7 +1235,7 @@ public class TabletScheduler extends MasterDaemon {
     private void dynamicAdjustPrioAndAddBackToPendingTablets(TabletSchedCtx tabletCtx, String message) {
         Preconditions.checkState(tabletCtx.getState() == TabletSchedCtx.State.PENDING);
         tabletCtx.adjustPriority(stat);
-        addTablet(tabletCtx, true /* force */);
+        addBackToPendingTablets(tabletCtx);
     }
 
     private void finalizeTabletCtx(TabletSchedCtx tabletCtx, TabletSchedCtx.State state, String reason) {
@@ -1197,6 +1248,7 @@ public class TabletScheduler extends MasterDaemon {
 
     private void releaseTabletCtx(TabletSchedCtx tabletCtx, TabletSchedCtx.State state) {
         tabletCtx.setState(state);
+        tabletCtx.resetDecommissionedReplicaState();
         tabletCtx.releaseResource(this);
         tabletCtx.setFinishedTime(System.currentTimeMillis());
     }
@@ -1239,7 +1291,7 @@ public class TabletScheduler extends MasterDaemon {
         long tabletId = cloneTask.getTabletId();
         TabletSchedCtx tabletCtx = takeRunningTablets(tabletId);
         if (tabletCtx == null) {
-            LOG.warn("tablet info does not exist: {}", tabletId);
+            LOG.warn("tablet info does not exist, tablet:{} backend:{}", tabletId, cloneTask.getBackendId());
             // tablet does not exist, no need to keep task.
             return true;
         }

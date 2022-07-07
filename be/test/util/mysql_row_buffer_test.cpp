@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "util/mysql_row_buffer.h"
 
@@ -7,6 +7,7 @@
 #include "gtest/gtest.h"
 #include "gutil/port.h"
 #include "runtime/large_int_value.h"
+#include "types/constexpr.h"
 
 namespace starrocks {
 

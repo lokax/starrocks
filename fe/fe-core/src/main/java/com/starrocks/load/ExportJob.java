@@ -39,7 +39,6 @@ import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TableName;
 import com.starrocks.analysis.TableRef;
 import com.starrocks.analysis.TupleDescriptor;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.MysqlTable;
@@ -68,6 +67,7 @@ import com.starrocks.planner.PlanFragmentId;
 import com.starrocks.planner.PlanNodeId;
 import com.starrocks.planner.ScanNode;
 import com.starrocks.qe.Coordinator;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.task.AgentClient;
 import com.starrocks.thrift.TAgentResult;
@@ -115,6 +115,7 @@ public class ExportJob implements Writable {
     private String clusterName;
     private long tableId;
     private BrokerDesc brokerDesc;
+    // exportPath has "/" suffix
     private String exportPath;
     private String exportTempPath;
     private String fileNamePrefix;
@@ -124,6 +125,7 @@ public class ExportJob implements Writable {
     private Map<String, String> properties = Maps.newHashMap();
     private List<String> partitions;
     private TableName tableName;
+    private List<String> columnNames;
     private String sql = "";
     private JobState state;
     private long createTimeMs;
@@ -149,7 +151,7 @@ public class ExportJob implements Writable {
         this.startTimeMs = -1;
         this.finishTimeMs = -1;
         this.failMsg = new ExportFailMsg(ExportFailMsg.CancelType.UNKNOWN, "");
-        this.analyzer = new Analyzer(Catalog.getCurrentCatalog(), null);
+        this.analyzer = new Analyzer(GlobalStateMgr.getCurrentState(), null);
         this.desc = analyzer.getDescTbl();
         this.exportPath = "";
         this.exportTempPath = "";
@@ -167,7 +169,7 @@ public class ExportJob implements Writable {
 
     public void setJob(ExportStmt stmt) throws UserException {
         String dbName = stmt.getTblName().getDb();
-        Database db = Catalog.getCurrentCatalog().getDb(dbName);
+        Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
         if (db == null) {
             throw new DdlException("Database " + dbName + " does not exist");
         }
@@ -182,7 +184,7 @@ public class ExportJob implements Writable {
 
         exportPath = stmt.getPath();
         Preconditions.checkArgument(!Strings.isNullOrEmpty(exportPath));
-        exportTempPath = this.exportPath + "/__starrocks_export_tmp_" + queryId.toString() + "/";
+        exportTempPath = this.exportPath + "__starrocks_export_tmp_" + queryId.toString();
         fileNamePrefix = stmt.getFileNamePrefix();
         Preconditions.checkArgument(!Strings.isNullOrEmpty(fileNamePrefix));
         if (includeQueryId) {
@@ -190,6 +192,7 @@ public class ExportJob implements Writable {
         }
 
         this.partitions = stmt.getPartitions();
+        this.columnNames = stmt.getColumnNames();
 
         db.readLock();
         try {
@@ -200,7 +203,7 @@ public class ExportJob implements Writable {
             }
             this.tableId = exportTable.getId();
             this.tableName = stmt.getTblName();
-            genExecFragment();
+            genExecFragment(stmt);
         } finally {
             db.readUnlock();
         }
@@ -208,18 +211,36 @@ public class ExportJob implements Writable {
         this.sql = stmt.toSql();
     }
 
-    private void genExecFragment() throws UserException {
+    private void genExecFragment(ExportStmt stmt) throws UserException {
         registerToDesc();
-        plan();
+        plan(stmt);
     }
 
-    private void registerToDesc() {
+    private void registerToDesc() throws UserException {
         TableRef ref = new TableRef(tableName, null, partitions == null ? null : new PartitionNames(false, partitions));
         BaseTableRef tableRef = new BaseTableRef(ref, exportTable, tableName);
         exportTupleDesc = desc.createTupleDescriptor();
         exportTupleDesc.setTable(exportTable);
         exportTupleDesc.setRef(tableRef);
-        for (Column col : exportTable.getBaseSchema()) {
+
+        Map<String, Column> nameToColumn = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
+        List<Column> tableColumns = exportTable.getBaseSchema();
+        List<Column> exportColumns = Lists.newArrayList();
+        for (Column column : tableColumns) {
+            nameToColumn.put(column.getName(), column);
+        }
+        if (columnNames == null) {
+            exportColumns.addAll(tableColumns);
+        } else {
+            for (String columnName : columnNames) {
+                if (!nameToColumn.containsKey(columnName)) {
+                    throw new UserException("Column [" + columnName + "] does not exist in table.");
+                }
+                exportColumns.add(nameToColumn.get(columnName));
+            }
+        }
+
+        for (Column col : exportColumns) {
             SlotDescriptor slot = desc.addSlotDescriptor(exportTupleDesc);
             slot.setIsMaterialized(true);
             slot.setColumn(col);
@@ -228,13 +249,12 @@ public class ExportJob implements Writable {
         desc.computeMemLayout();
     }
 
-    private void plan() throws UserException {
+    private void plan(ExportStmt stmt) throws UserException {
         List<PlanFragment> fragments = Lists.newArrayList();
         List<ScanNode> scanNodes = Lists.newArrayList();
 
         ScanNode scanNode = genScanNode();
         tabletLocations = scanNode.getScanRangeLocations(0);
-        scanNode.setUseVectorized(scanNode.isVectorized() && Config.vectorized_load_enable);
         if (tabletLocations == null) {
             // not olap scan node
             PlanFragment fragment = genPlanFragment(exportTable.getType(), scanNode, 0);
@@ -248,7 +268,7 @@ public class ExportJob implements Writable {
             }
 
             long maxBytesPerBe = Config.export_max_bytes_per_be_per_task;
-            TabletInvertedIndex invertedIndex = Catalog.getCurrentInvertedIndex();
+            TabletInvertedIndex invertedIndex = GlobalStateMgr.getCurrentInvertedIndex();
             List<TScanRangeLocations> copyTabletLocations = Lists.newArrayList(tabletLocations);
             int taskIdx = 0;
             while (!copyTabletLocations.isEmpty()) {
@@ -263,7 +283,7 @@ public class ExportJob implements Writable {
                     long dataSize = replica != null ? replica.getDataSize() : 0L;
 
                     Long assignedBytes = bytesPerBe.get(backendId);
-                    if (assignedBytes == null || (assignedBytes != null && assignedBytes < maxBytesPerBe)) {
+                    if (assignedBytes == null || assignedBytes < maxBytesPerBe) {
                         taskTabletLocations.add(scanRangeLocations);
                         bytesPerBe.put(backendId, assignedBytes != null ? assignedBytes + dataSize : dataSize);
                         iter.remove();
@@ -271,7 +291,6 @@ public class ExportJob implements Writable {
                 }
 
                 OlapScanNode taskScanNode = genOlapScanNodeByLocation(taskTabletLocations);
-                taskScanNode.setUseVectorized(taskScanNode.isVectorized() && Config.vectorized_load_enable);
                 scanNodes.add(taskScanNode);
                 PlanFragment fragment = genPlanFragment(exportTable.getType(), taskScanNode, taskIdx++);
                 fragments.add(fragment);
@@ -281,7 +300,7 @@ public class ExportJob implements Writable {
                     tabletLocations.size(), id, fragments.size());
         }
 
-        genCoordinators(fragments, scanNodes);
+        genCoordinators(stmt, fragments, scanNodes);
     }
 
     private ScanNode genScanNode() throws UserException {
@@ -302,18 +321,16 @@ public class ExportJob implements Writable {
                 throw new UserException("Unsupported table type: " + exportTable.getType());
         }
 
-        scanNode.finalize(analyzer);
+        scanNode.finalizeStats(analyzer);
         return scanNode;
     }
 
     private OlapScanNode genOlapScanNodeByLocation(List<TScanRangeLocations> locations) {
-        OlapScanNode olapScanNode = OlapScanNode.createOlapScanNodeByLocation(
+        return OlapScanNode.createOlapScanNodeByLocation(
                 new PlanNodeId(nextId.getAndIncrement()),
                 exportTupleDesc,
                 "OlapScanNodeForExport",
                 locations);
-
-        return olapScanNode;
     }
 
     private PlanFragment genPlanFragment(Table.TableType type, ScanNode scanNode, int taskIdx) throws UserException {
@@ -331,9 +348,6 @@ public class ExportJob implements Writable {
                 break;
         }
         fragment.setOutputExprs(createOutputExprs());
-        if (Config.vectorized_load_enable && fragment.isOutPutExprsVectorized()) {
-            fragment.setOutPutExprsUseVectorized();
-        }
 
         scanNode.setFragmentId(fragment.getFragmentId());
         fragment.setSink(new ExportSink(exportTempPath, fileNamePrefix + taskIdx + "_", columnSeparator,
@@ -341,7 +355,7 @@ public class ExportJob implements Writable {
         try {
             fragment.finalize(analyzer, false);
         } catch (Exception e) {
-            LOG.info("Fragment finalize failed. e= {}", e);
+            LOG.info("Fragment finalize failed. e=", e);
             throw new UserException("Fragment finalize failed");
         }
 
@@ -362,7 +376,7 @@ public class ExportJob implements Writable {
         return outputExprs;
     }
 
-    private void genCoordinators(List<PlanFragment> fragments, List<ScanNode> nodes) {
+    private void genCoordinators(ExportStmt stmt, List<PlanFragment> fragments, List<ScanNode> nodes) {
         UUID uuid = UUID.randomUUID();
         for (int i = 0; i < fragments.size(); ++i) {
             PlanFragment fragment = fragments.get(i);
@@ -370,7 +384,7 @@ public class ExportJob implements Writable {
             TUniqueId queryId = new TUniqueId(uuid.getMostSignificantBits() + i, uuid.getLeastSignificantBits());
             Coordinator coord = new Coordinator(
                     id, queryId, desc, Lists.newArrayList(fragment), Lists.newArrayList(scanNode), clusterName,
-                    TimeUtils.DEFAULT_TIME_ZONE);
+                    TimeUtils.DEFAULT_TIME_ZONE, stmt.getExportStartTime());
             coord.setExecMemoryLimit(getMemLimit());
             this.coordList.add(coord);
             LOG.info("split export job to tasks. job id: {}, task idx: {}, task query id: {}",
@@ -441,7 +455,11 @@ public class ExportJob implements Writable {
         return partitions;
     }
 
-    public int getProgress() {
+    public List<String> getColumnNames() {
+        return columnNames;
+    }
+
+    public synchronized int getProgress() {
         return progress;
     }
 
@@ -543,7 +561,7 @@ public class ExportJob implements Writable {
                 break;
         }
         if (!isReplay) {
-            Catalog.getCurrentCatalog().getEditLog().logExportUpdateState(id, newState);
+            GlobalStateMgr.getCurrentState().getEditLog().logExportUpdateState(id, newState);
         }
         return true;
     }
@@ -555,12 +573,12 @@ public class ExportJob implements Writable {
             TNetworkAddress address = snapshotPath.first;
             String host = address.getHostname();
             int port = address.getPort();
-            Backend backend = Catalog.getCurrentSystemInfo().getBackendWithBePort(host, port);
+            Backend backend = GlobalStateMgr.getCurrentSystemInfo().getBackendWithBePort(host, port);
             if (backend == null) {
                 continue;
             }
             long backendId = backend.getId();
-            if (!Catalog.getCurrentSystemInfo().checkBackendAvailable(backendId)) {
+            if (!GlobalStateMgr.getCurrentSystemInfo().checkBackendAvailable(backendId)) {
                 continue;
             }
 
@@ -713,7 +731,7 @@ public class ExportJob implements Writable {
         columnSeparator = Text.readString(in);
         rowDelimiter = Text.readString(in);
 
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_53) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_53) {
             int count = in.readInt();
             for (int i = 0; i < count; i++) {
                 String propertyKey = Text.readString(in);
@@ -743,12 +761,19 @@ public class ExportJob implements Writable {
             brokerDesc = BrokerDesc.read(in);
         }
 
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_43) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_43) {
             tableName = new TableName();
             tableName.readFields(in);
         } else {
             tableName = new TableName("DUMMY", "DUMMY");
         }
+    }
+
+    /**
+     * for ut only
+     */
+    public void setTableName(TableName tableName) {
+        this.tableName = tableName;
     }
 
     @Override

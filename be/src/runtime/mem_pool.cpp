@@ -21,12 +21,11 @@
 
 #include "runtime/mem_pool.h"
 
-#include <stdio.h>
-
 #include <algorithm>
+#include <cstdio>
 #include <sstream>
 
-#include "runtime/mem_tracker.h"
+#include "runtime/current_thread.h"
 #include "runtime/memory/chunk_allocator.h"
 #include "util/bit_util.h"
 #include "util/starrocks_metrics.h"
@@ -51,7 +50,6 @@ MemPool::~MemPool() {
         total_bytes_released += chunk.chunk.size;
         ChunkAllocator::instance()->free(chunk.chunk);
     }
-    mem_tracker_->release(total_bytes_released);
     StarRocksMetrics::instance()->memory_pool_bytes_total.increment(-total_bytes_released);
 }
 
@@ -77,7 +75,6 @@ void MemPool::free_all() {
     total_allocated_bytes_ = 0;
     total_reserved_bytes_ = 0;
 
-    mem_tracker_->release(total_bytes_released);
     StarRocksMetrics::instance()->memory_pool_bytes_total.increment(-total_bytes_released);
 }
 
@@ -106,7 +103,7 @@ bool MemPool::find_chunk(size_t min_size, bool check_limits) {
     }
 
     // Didn't find a big enough free chunk - need to allocate new chunk.
-    size_t chunk_size = 0;
+    size_t chunk_size;
     DCHECK_LE(next_chunk_size_, MAX_CHUNK_SIZE);
 
     if (config::disable_mem_pools) {
@@ -119,17 +116,15 @@ bool MemPool::find_chunk(size_t min_size, bool check_limits) {
     }
 
     chunk_size = BitUtil::RoundUpToPowerOfTwo(chunk_size);
-    if (check_limits) {
-        if (!mem_tracker_->try_consume(chunk_size)) return false;
-    } else {
-        mem_tracker_->consume(chunk_size);
-    }
 
     // Allocate a new chunk. Return early if allocate fails.
     Chunk chunk;
     if (!ChunkAllocator::instance()->allocate(chunk_size, &chunk)) {
-        mem_tracker_->release(chunk_size);
-        return false;
+        if (tls_thread_status.is_catched()) {
+            throw std::bad_alloc();
+        } else {
+            return false;
+        }
     }
     ASAN_POISON_MEMORY_REGION(chunk.data, chunk_size);
     // Put it before the first free chunk. If no free chunks, it goes at the end.
@@ -173,12 +168,6 @@ void MemPool::acquire_data(MemPool* src, bool keep_current) {
     src->total_reserved_bytes_ -= total_transfered_bytes;
     total_reserved_bytes_ += total_transfered_bytes;
 
-    // Skip unnecessary atomic ops if the mem_trackers are the same.
-    if (src->mem_tracker_ != mem_tracker_) {
-        src->mem_tracker_->release(total_transfered_bytes);
-        mem_tracker_->consume(total_transfered_bytes);
-    }
-
     // insert new chunks after current_chunk_idx_
     auto insert_chunk = chunks_.begin() + current_chunk_idx_ + 1;
     chunks_.insert(insert_chunk, src->chunks_.begin(), end_chunk);
@@ -204,18 +193,12 @@ void MemPool::acquire_data(MemPool* src, bool keep_current) {
 }
 
 void MemPool::exchange_data(MemPool* other) {
-    int64_t delta_size = other->total_reserved_bytes_ - total_reserved_bytes_;
-
     std::swap(current_chunk_idx_, other->current_chunk_idx_);
     std::swap(next_chunk_size_, other->next_chunk_size_);
     std::swap(total_allocated_bytes_, other->total_allocated_bytes_);
     std::swap(total_reserved_bytes_, other->total_reserved_bytes_);
     std::swap(peak_allocated_bytes_, other->peak_allocated_bytes_);
     std::swap(chunks_, other->chunks_);
-
-    // update MemTracker
-    mem_tracker_->consume(delta_size);
-    other->mem_tracker_->release(delta_size);
 }
 
 std::string MemPool::debug_string() {

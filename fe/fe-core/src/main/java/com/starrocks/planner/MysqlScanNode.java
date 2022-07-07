@@ -38,8 +38,6 @@ import com.starrocks.thrift.TMySQLScanNode;
 import com.starrocks.thrift.TPlanNode;
 import com.starrocks.thrift.TPlanNodeType;
 import com.starrocks.thrift.TScanRangeLocations;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -47,15 +45,10 @@ import java.util.List;
 /**
  * Full scan of an MySQL table.
  */
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public class MysqlScanNode extends ScanNode {
-    private static final Logger LOG = LogManager.getLogger(MysqlScanNode.class);
-
     private final List<String> columns = new ArrayList<String>();
     private final List<String> filters = new ArrayList<String>();
-    private String tblName;
+    private final String tblName;
 
     /**
      * Constructs node to scan given data files of table 'tbl'.
@@ -72,11 +65,8 @@ public class MysqlScanNode extends ScanNode {
     }
 
     @Override
-    public void finalize(Analyzer analyzer) throws UserException {
-        // Convert predicates to MySQL columns and filters.
-        createMySQLColumns();
-        createMySQLFilters();
-        computeStats(analyzer);
+    public void finalizeStats(Analyzer analyzer) throws UserException {
+        computeColumnsAndFilters();
     }
 
     public void computeColumnsAndFilters() {
@@ -86,10 +76,8 @@ public class MysqlScanNode extends ScanNode {
 
     @Override
     protected String getNodeExplainString(String prefix, TExplainLevel detailLevel) {
-        StringBuilder output = new StringBuilder();
-        output.append(prefix).append("TABLE: ").append(tblName).append("\n");
-        output.append(prefix).append("Query: ").append(getMysqlQueryStr()).append("\n");
-        return output.toString();
+        return prefix + "TABLE: " + tblName + "\n" +
+                prefix + "Query: " + getMysqlQueryStr() + "\n";
     }
 
     private String getMysqlQueryStr() {
@@ -144,6 +132,7 @@ public class MysqlScanNode extends ScanNode {
     protected void toThrift(TPlanNode msg) {
         msg.node_type = TPlanNodeType.MYSQL_SCAN_NODE;
         msg.mysql_scan_node = new TMySQLScanNode(desc.getId().asInt(), tblName, columns, filters);
+        msg.mysql_scan_node.setLimit(limit);
     }
 
     /**
@@ -172,17 +161,7 @@ public class MysqlScanNode extends ScanNode {
     }
 
     @Override
-    public boolean isVectorized() {
+    public boolean canUsePipeLine() {
         return true;
-    }
-
-    @Override
-    public void setUseVectorized(boolean flag) {
-        this.useVectorized = flag;
-
-        // conjuncts is useless in BE, set it in order to make the all slot of mysql scan node is Vectorized
-        for (Expr expr : conjuncts) {
-            expr.setUseVectorized(flag);
-        }
     }
 }

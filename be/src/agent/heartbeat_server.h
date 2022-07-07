@@ -19,31 +19,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_AGENT_HEARTBEAT_SERVER_H
-#define STARROCKS_BE_SRC_AGENT_HEARTBEAT_SERVER_H
+#pragma once
 
+#include <memory>
 #include <mutex>
 
 #include "agent/status.h"
+#include "common/statusor.h"
 #include "gen_cpp/HeartbeatService.h"
 #include "gen_cpp/Status_types.h"
+#include "gutil/macros.h"
 #include "runtime/exec_env.h"
 #include "storage/olap_define.h"
 #include "thrift/transport/TTransportUtils.h"
 
 namespace starrocks {
 
-const uint32_t HEARTBEAT_INTERVAL = 10;
 class StorageEngine;
 class Status;
 class ThriftServer;
 
 class HeartbeatServer : public HeartbeatServiceIf {
 public:
-    explicit HeartbeatServer(TMasterInfo* master_info);
-    virtual ~HeartbeatServer(){};
+    HeartbeatServer();
+    ~HeartbeatServer() override = default;
 
-    virtual void init_cluster_id();
+    virtual void init_cluster_id_or_die();
 
     // Master send heartbeat to this server
     //
@@ -52,23 +53,22 @@ public:
     //
     // Output parameters:
     // * heartbeat_result: The result of heartbeat set
-    virtual void heartbeat(THeartbeatResult& heartbeat_result, const TMasterInfo& master_info);
+    void heartbeat(THeartbeatResult& heartbeat_result, const TMasterInfo& master_info) override;
+
+    DISALLOW_COPY_AND_MOVE(HeartbeatServer);
 
 private:
-    Status _heartbeat(const TMasterInfo& master_info);
+    enum CmpResult {
+        kUnchanged,
+        kNeedUpdate,
+        kNeedUpdateAndReport,
+    };
+
+    StatusOr<CmpResult> compare_master_info(const TMasterInfo& master_info);
 
     StorageEngine* _olap_engine;
-
-    // mutex to protect master_info and _epoch
-    std::mutex _hb_mtx;
-    // Not owned. Point to the ExecEnv::_master_info
-    TMasterInfo* _master_info;
-    int64_t _epoch;
-
-    DISALLOW_COPY_AND_ASSIGN(HeartbeatServer);
 }; // class HeartBeatServer
 
-AgentStatus create_heartbeat_server(ExecEnv* exec_env, uint32_t heartbeat_server_port, ThriftServer** heart_beat_server,
-                                    uint32_t worker_thread_num, TMasterInfo* local_master_info);
+StatusOr<std::unique_ptr<ThriftServer>> create_heartbeat_server(ExecEnv* exec_env, uint32_t heartbeat_server_port,
+                                                                uint32_t worker_thread_num);
 } // namespace starrocks
-#endif // STARROCKS_BE_SRC_AGENT_HEARTBEAT_SERVER_H

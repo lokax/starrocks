@@ -26,7 +26,10 @@
 #include <utility>
 
 #include "gutil/macros.h" // for DISALLOW_COPY_AND_ASSIGN
-#include "storage/lru_cache.h"
+#include "runtime/current_thread.h"
+#include "runtime/exec_env.h"
+#include "util/defer_op.h"
+#include "util/lru_cache.h"
 
 namespace starrocks {
 
@@ -69,8 +72,6 @@ public:
 
     StoragePageCache(MemTracker* mem_tracker, size_t capacity);
 
-    void update_memory_usage_statistics();
-
     // Lookup the given page in the cache.
     //
     // If the page is found, the cache entry will be written into handle.
@@ -101,10 +102,15 @@ private:
 // class will release the cache entry when it is destroyed.
 class PageCacheHandle {
 public:
-    PageCacheHandle() {}
+    PageCacheHandle() = default;
     PageCacheHandle(Cache* cache, Cache::Handle* handle) : _cache(cache), _handle(handle) {}
     ~PageCacheHandle() {
         if (_handle != nullptr) {
+#ifndef BE_TEST
+            MemTracker* prev_tracker =
+                    tls_thread_status.set_mem_tracker(ExecEnv::GetInstance()->page_cache_mem_tracker());
+            DeferOp op([&] { tls_thread_status.set_mem_tracker(prev_tracker); });
+#endif
             _cache->release(_handle);
         }
     }
@@ -129,7 +135,8 @@ private:
     Cache::Handle* _handle = nullptr;
 
     // Don't allow copy and assign
-    DISALLOW_COPY_AND_ASSIGN(PageCacheHandle);
+    PageCacheHandle(const PageCacheHandle&) = delete;
+    const PageCacheHandle& operator=(const PageCacheHandle&) = delete;
 };
 
 } // namespace starrocks

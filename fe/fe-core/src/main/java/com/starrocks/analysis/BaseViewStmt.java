@@ -25,12 +25,13 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.starrocks.catalog.Column;
-import com.starrocks.catalog.PrimitiveType;
-import com.starrocks.catalog.ScalarType;
+import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.UserException;
+import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.ast.QueryStatement;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -43,21 +44,31 @@ public class BaseViewStmt extends DdlStmt {
 
     protected final TableName tableName;
     protected final List<ColWithComment> cols;
-    protected final QueryStmt viewDefStmt;
+    protected QueryStmt viewDefStmt;
 
     // Set during analyze
-    protected final List<Column> finalCols;
+    protected List<Column> finalCols;
 
     protected String originalViewDef;
     protected String inlineViewDef;
 
     protected QueryStmt cloneStmt;
 
+    protected QueryStatement queryStatement;
+
     public BaseViewStmt(TableName tableName, List<ColWithComment> cols, QueryStmt queryStmt) {
         Preconditions.checkNotNull(queryStmt);
         this.tableName = tableName;
         this.cols = cols;
         this.viewDefStmt = queryStmt;
+        finalCols = Lists.newArrayList();
+    }
+
+    public BaseViewStmt(TableName tableName, List<ColWithComment> cols, QueryStatement queryStmt) {
+        Preconditions.checkNotNull(queryStmt);
+        this.tableName = tableName;
+        this.cols = cols;
+        this.queryStatement = queryStmt;
         finalCols = Lists.newArrayList();
     }
 
@@ -69,12 +80,32 @@ public class BaseViewStmt extends DdlStmt {
         return tableName.getTbl();
     }
 
+    public TableName getTableName() {
+        return tableName;
+    }
+
     public List<Column> getColumns() {
         return finalCols;
     }
 
+    public void setFinalCols(List<Column> finalCols) {
+        this.finalCols = finalCols;
+    }
+
     public String getInlineViewDef() {
         return inlineViewDef;
+    }
+
+    public void setInlineViewDef(String inlineViewDef) {
+        this.inlineViewDef = inlineViewDef;
+    }
+
+    public QueryStatement getQueryStatement() {
+        return queryStatement;
+    }
+
+    public List<ColWithComment> getCols() {
+        return cols;
     }
 
     /**
@@ -87,20 +118,16 @@ public class BaseViewStmt extends DdlStmt {
             if (cols.size() != viewDefStmt.getColLabels().size()) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_VIEW_WRONG_LIST);
             }
-            // TODO(zc): type
             for (int i = 0; i < cols.size(); ++i) {
-                PrimitiveType type = viewDefStmt.getBaseTblResultExprs().get(i).getType().getPrimitiveType();
-                Column col = new Column(cols.get(i).getColName(), ScalarType.createType(type));
+                Type type = viewDefStmt.getBaseTblResultExprs().get(i).getType().clone();
+                Column col = new Column(cols.get(i).getColName(), type);
                 col.setComment(cols.get(i).getComment());
                 finalCols.add(col);
             }
         } else {
-            // TODO(zc): type
             for (int i = 0; i < viewDefStmt.getBaseTblResultExprs().size(); ++i) {
-                PrimitiveType type = viewDefStmt.getBaseTblResultExprs().get(i).getType().getPrimitiveType();
-                finalCols.add(new Column(
-                        viewDefStmt.getColLabels().get(i),
-                        ScalarType.createType(type)));
+                Type type = viewDefStmt.getBaseTblResultExprs().get(i).getType().clone();
+                finalCols.add(new Column(viewDefStmt.getColLabels().get(i), type));
             }
         }
         // Set for duplicate columns
@@ -148,5 +175,9 @@ public class BaseViewStmt extends DdlStmt {
         if (viewDefStmt.hasOutFileClause()) {
             throw new AnalysisException("Not support OUTFILE clause in CREATE VIEW statement");
         }
+    }
+
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
+        return visitor.visitBaseViewStatement(this, context);
     }
 }

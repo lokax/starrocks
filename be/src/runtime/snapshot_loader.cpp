@@ -21,13 +21,14 @@
 
 #include "runtime/snapshot_loader.h"
 
-#include <stdint.h>
-
+#include <cstdint>
 #include <filesystem>
 
+#include "agent/master_info.h"
 #include "common/logging.h"
-#include "env/env.h"
-#include "env/env_broker.h"
+#include "fs/fs.h"
+#include "fs/fs_broker.h"
+#include "fs/fs_util.h"
 #include "gen_cpp/FileBrokerService_types.h"
 #include "gen_cpp/FrontendService.h"
 #include "gen_cpp/FrontendService_types.h"
@@ -38,7 +39,7 @@
 #include "storage/snapshot_manager.h"
 #include "storage/storage_engine.h"
 #include "storage/tablet.h"
-#include "util/file_utils.h"
+#include "storage/tablet_manager.h"
 #include "util/thrift_rpc_helper.h"
 
 namespace starrocks {
@@ -66,7 +67,7 @@ inline const std::string& client_id(ExecEnv* env, const TNetworkAddress& addr) {
 SnapshotLoader::SnapshotLoader(ExecEnv* env, int64_t job_id, int64_t task_id)
         : _env(env), _job_id(job_id), _task_id(task_id) {}
 
-SnapshotLoader::~SnapshotLoader() {}
+SnapshotLoader::~SnapshotLoader() = default;
 
 Status SnapshotLoader::upload(const std::map<std::string, std::string>& src_to_dest_path,
                               const TNetworkAddress& broker_addr, const std::map<std::string, std::string>& broker_prop,
@@ -98,9 +99,9 @@ Status SnapshotLoader::upload(const std::map<std::string, std::string>& src_to_d
     int report_counter = 0;
     int total_num = src_to_dest_path.size();
     int finished_num = 0;
-    for (auto iter = src_to_dest_path.begin(); iter != src_to_dest_path.end(); iter++) {
-        const std::string& src_path = iter->first;
-        const std::string& dest_path = iter->second;
+    for (const auto& iter : src_to_dest_path) {
+        const std::string& src_path = iter.first;
+        const std::string& dest_path = iter.second;
 
         int64_t tablet_id = 0;
         int32_t schema_hash = 0;
@@ -120,19 +121,11 @@ Status SnapshotLoader::upload(const std::map<std::string, std::string>& src_to_d
         RETURN_IF_ERROR(_get_existing_files_from_local(src_path, &local_files));
 
         // 2.3 iterate local files
-        for (auto it = local_files.begin(); it != local_files.end(); it++) {
+        for (auto& local_file : local_files) {
             RETURN_IF_ERROR(_report_every(10, &report_counter, finished_num, total_num, TTaskType::type::UPLOAD));
 
-            const std::string& local_file = *it;
             // calc md5sum of localfile
-            std::string md5sum;
-            status = FileUtils::md5sum(src_path + "/" + local_file, &md5sum);
-            if (!status.ok()) {
-                std::stringstream ss;
-                ss << "failed to get md5sum of file: " << local_file << ": " << status.get_error_msg();
-                LOG(WARNING) << ss.str();
-                return Status::InternalError(ss.str());
-            }
+            ASSIGN_OR_RETURN(auto md5sum, fs::md5sum(src_path + "/" + local_file));
             VLOG(2) << "get file checksum: " << local_file << ": " << md5sum;
             local_files_with_checksum.push_back(local_file + "." + md5sum);
 
@@ -162,14 +155,13 @@ Status SnapshotLoader::upload(const std::map<std::string, std::string>& src_to_d
             auto tmp_broker_file_name = full_remote_file + ".part";
             auto local_file_path = src_path + "/" + local_file;
 
-            EnvBroker env_broker(broker_addr, broker_prop);
-            std::unique_ptr<WritableFile> broker_file;
-            RETURN_IF_ERROR(env_broker.new_writable_file(tmp_broker_file_name, &broker_file));
+            BrokerFileSystem fs_broker(broker_addr, broker_prop);
+            WritableFileOptions opts{.sync_on_close = false, .mode = FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE};
+            ASSIGN_OR_RETURN(auto broker_file, fs_broker.new_writable_file(opts, tmp_broker_file_name));
 
-            std::unique_ptr<SequentialFile> input_file;
-            RETURN_IF_ERROR(Env::Default()->new_sequential_file(local_file_path, &input_file));
+            ASSIGN_OR_RETURN(auto input_file, FileSystem::Default()->new_sequential_file(local_file_path));
 
-            auto res = FileUtils::copy(input_file.get(), broker_file.get(), 1024 * 1024);
+            auto res = fs::copy(input_file.get(), broker_file.get(), 1024 * 1024);
             if (!res.ok()) {
                 return res.status();
             }
@@ -225,16 +217,16 @@ Status SnapshotLoader::download(const std::map<std::string, std::string>& src_to
     int report_counter = 0;
     int total_num = src_to_dest_path.size();
     int finished_num = 0;
-    for (auto iter = src_to_dest_path.begin(); iter != src_to_dest_path.end(); iter++) {
-        const std::string& remote_path = iter->first;
-        const std::string& local_path = iter->second;
+    for (const auto& iter : src_to_dest_path) {
+        const std::string& remote_path = iter.first;
+        const std::string& local_path = iter.second;
 
         int64_t local_tablet_id = 0;
         int32_t schema_hash = 0;
         RETURN_IF_ERROR(_get_tablet_id_and_schema_hash_from_file_path(local_path, &local_tablet_id, &schema_hash));
         downloaded_tablet_ids->push_back(local_tablet_id);
 
-        int64_t remote_tablet_id;
+        int64_t remote_tablet_id = 0;
         RETURN_IF_ERROR(_get_tablet_id_from_remote_path(remote_path, &remote_tablet_id));
         VLOG(2) << "get local tablet id: " << local_tablet_id << ", schema hash: " << schema_hash
                 << ", remote tablet id: " << remote_tablet_id;
@@ -253,7 +245,7 @@ Status SnapshotLoader::download(const std::map<std::string, std::string>& src_to
             return Status::InternalError(ss.str());
         }
 
-        TabletSharedPtr tablet = _env->storage_engine()->tablet_manager()->get_tablet(local_tablet_id, schema_hash);
+        TabletSharedPtr tablet = _env->storage_engine()->tablet_manager()->get_tablet(local_tablet_id);
         if (tablet == nullptr) {
             std::stringstream ss;
             ss << "failed to get local tablet: " << local_tablet_id;
@@ -278,15 +270,14 @@ Status SnapshotLoader::download(const std::map<std::string, std::string>& src_to
                     need_download = true;
                 } else {
                     // check checksum
-                    std::string local_md5sum;
-                    Status st = FileUtils::md5sum(local_path + "/" + remote_file, &local_md5sum);
-                    if (!st.ok()) {
+                    auto local_md5sum = fs::md5sum(local_path + "/" + remote_file);
+                    if (!local_md5sum.ok()) {
                         LOG(WARNING) << "failed to get md5sum of local file: " << remote_file
-                                     << ". msg: " << st.get_error_msg() << ". download it";
+                                     << ". msg: " << local_md5sum.status() << ". download it";
                         need_download = true;
                     } else {
-                        VLOG(2) << "get local file checksum: " << remote_file << ": " << local_md5sum;
-                        if (file_stat.md5 != local_md5sum) {
+                        VLOG(2) << "get local file checksum: " << remote_file << ": " << *local_md5sum;
+                        if (file_stat.md5 != *local_md5sum) {
                             // file's checksum does not equal, download it.
                             need_download = true;
                         }
@@ -310,37 +301,29 @@ Status SnapshotLoader::download(const std::map<std::string, std::string>& src_to
             size_t file_len = file_stat.size;
 
             // check disk capacity
-            if (data_dir->reach_capacity_limit(file_len)) {
+            if (data_dir->capacity_limit_reached(file_len)) {
                 return Status::InternalError("capacity limit reached");
             }
 
-            EnvBroker env_broker(broker_addr, broker_prop);
-            std::unique_ptr<SequentialFile> broker_file;
-            RETURN_IF_ERROR(env_broker.new_sequential_file(full_remote_file, &broker_file));
+            BrokerFileSystem fs_broker(broker_addr, broker_prop);
+            ASSIGN_OR_RETURN(auto broker_file, fs_broker.new_sequential_file(full_remote_file));
 
             // remove file which will be downloaded now.
             // this file will be added to local_files if it be downloaded successfully.
             local_files.erase(find);
 
             // 3. open local file for write
-            std::unique_ptr<WritableFile> local_file;
-            RETURN_IF_ERROR(Env::Default()->new_writable_file(full_local_file, &local_file));
+            WritableFileOptions opts{.sync_on_close = false, .mode = FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE};
+            ASSIGN_OR_RETURN(auto local_file, FileSystem::Default()->new_writable_file(opts, full_local_file));
 
-            auto res = FileUtils::copy(broker_file.get(), local_file.get(), 1024 * 1024);
+            auto res = fs::copy(broker_file.get(), local_file.get(), 1024 * 1024);
             if (!res.ok()) {
                 return res.status();
             }
             RETURN_IF_ERROR(local_file->close());
 
             // 5. check md5 of the downloaded file
-            std::string downloaded_md5sum;
-            status = FileUtils::md5sum(full_local_file, &downloaded_md5sum);
-            if (!status.ok()) {
-                std::stringstream ss;
-                ss << "failed to get md5sum of file: " << full_local_file;
-                LOG(WARNING) << ss.str();
-                return Status::InternalError(ss.str());
-            }
+            ASSIGN_OR_RETURN(auto downloaded_md5sum, fs::md5sum(full_local_file));
             VLOG(2) << "get downloaded file checksum: " << full_local_file << ": " << downloaded_md5sum;
             if (downloaded_md5sum != file_stat.md5) {
                 std::stringstream ss;
@@ -388,20 +371,20 @@ Status SnapshotLoader::download(const std::map<std::string, std::string>& src_to
 }
 
 // move the snapshot files in snapshot_path
-// to tablet_path
-// If overwrite, just replace the tablet_path with snapshot_path,
+// to schema_hash_path
+// If overwrite, just replace the schema_hash_path with snapshot_path,
 // else: (TODO)
 //
 // MUST hold tablet's header lock, push lock, cumulative lock and base compaction lock
-Status SnapshotLoader::move(const std::string& snapshot_path, TabletSharedPtr tablet, bool overwrite) {
-    std::string tablet_path = tablet->tablet_path();
+Status SnapshotLoader::move(const std::string& snapshot_path, const TabletSharedPtr& tablet, bool overwrite) {
+    std::string tablet_path = tablet->schema_hash_path();
     std::string store_path = tablet->data_dir()->path();
     LOG(INFO) << "begin to move snapshot files. from: " << snapshot_path << ", to: " << tablet_path
               << ", store: " << store_path << ", job: " << _job_id << ", task id: " << _task_id;
 
     Status status = Status::OK();
 
-    // validate snapshot_path and tablet_path
+    // validate snapshot_path and schema_hash_path
     int64_t snapshot_tablet_id = 0;
     int32_t snapshot_schema_hash = 0;
     RETURN_IF_ERROR(
@@ -520,7 +503,7 @@ Status SnapshotLoader::_get_tablet_id_and_schema_hash_from_file_path(const std::
                                                                      int32_t* schema_hash) {
     // path should be like: /path/.../tablet_id/schema_hash
     // we try to extract tablet_id from path
-    size_t pos = src_path.find_last_of("/");
+    size_t pos = src_path.find_last_of('/');
     if (pos == std::string::npos || pos == src_path.length() - 1) {
         return Status::InternalError("failed to get tablet id from path: " + src_path);
     }
@@ -531,7 +514,7 @@ Status SnapshotLoader::_get_tablet_id_and_schema_hash_from_file_path(const std::
     ss1 >> *schema_hash;
 
     // skip schema hash part
-    size_t pos2 = src_path.find_last_of("/", pos - 1);
+    size_t pos2 = src_path.find_last_of('/', pos - 1);
     if (pos2 == std::string::npos) {
         return Status::InternalError("failed to get tablet id from path: " + src_path);
     }
@@ -554,9 +537,10 @@ Status SnapshotLoader::_check_local_snapshot_paths(const std::map<std::string, s
         } else {
             path = pair.second;
         }
-        if (!FileUtils::is_dir(path)) {
+        ASSIGN_OR_RETURN(auto is_dir, fs::is_directory(path));
+        if (!is_dir) {
             std::stringstream ss;
-            ss << "snapshot path is not directory or does not exist: " << path;
+            ss << "snapshot path is not directory: " << path;
             LOG(WARNING) << ss.str();
             return Status::RuntimeError(ss.str());
         }
@@ -604,7 +588,7 @@ Status SnapshotLoader::_get_existing_files_from_remote(BrokerServiceConnection& 
             }
 
             const std::string& file_name = file.path;
-            size_t pos = file_name.find_last_of(".");
+            size_t pos = file_name.find_last_of('.');
             if (pos == std::string::npos || pos == file_name.size() - 1) {
                 // Not found checksum separator, ignore this file
                 continue;
@@ -630,7 +614,7 @@ Status SnapshotLoader::_get_existing_files_from_remote(BrokerServiceConnection& 
 
 Status SnapshotLoader::_get_existing_files_from_local(const std::string& local_path,
                                                       std::vector<std::string>* local_files) {
-    Status status = FileUtils::list_files(Env::Default(), local_path, local_files);
+    Status status = FileSystem::Default()->get_children(local_path, local_files);
     if (!status.ok()) {
         std::stringstream ss;
         ss << "failed to list files in local path: " << local_path << ", msg: " << status.get_error_msg();
@@ -679,7 +663,7 @@ Status SnapshotLoader::_rename_remote_file(BrokerServiceConnection& client, cons
 
 void SnapshotLoader::_assemble_file_name(const std::string& snapshot_path, const std::string& tablet_path,
                                          int64_t tablet_id, int64_t start_version, int64_t end_version,
-                                         int64_t vesion_hash, int32_t seg_num, const std::string suffix,
+                                         int64_t vesion_hash, int32_t seg_num, const std::string& suffix,
                                          std::string* snapshot_file, std::string* tablet_file) {
     std::stringstream ss1;
     ss1 << snapshot_path << "/" << tablet_id << "_" << start_version << "_" << end_version << "_" << vesion_hash << "_"
@@ -715,7 +699,7 @@ Status SnapshotLoader::_replace_tablet_id(const std::string& file_name, int64_t 
 Status SnapshotLoader::_get_tablet_id_from_remote_path(const std::string& remote_path, int64_t* tablet_id) {
     // eg:
     // bos://xxx/../__tbl_10004/__part_10003/__idx_10004/__10005
-    size_t pos = remote_path.find_last_of("_");
+    size_t pos = remote_path.find_last_of('_');
     if (pos == std::string::npos) {
         return Status::InternalError("invalid remove file path: " + remote_path);
     }
@@ -740,7 +724,7 @@ Status SnapshotLoader::_report_every(int report_threshold, int* counter, int32_t
     LOG(INFO) << "report to frontend. job id: " << _job_id << ", task id: " << _task_id
               << ", finished num: " << finished_num << ", total num:" << total_num;
 
-    TNetworkAddress master_addr = _env->master_info()->network_address;
+    TNetworkAddress master_addr = get_master_address();
 
     TSnapshotLoaderReportRequest request;
     request.job_id = _job_id;

@@ -1,8 +1,9 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.external.hive;
 
 import com.starrocks.catalog.Column;
+import com.starrocks.catalog.Table.TableType;
 
 import java.util.List;
 import java.util.Objects;
@@ -15,17 +16,15 @@ public class HiveTableColumnsKey {
     private final List<Column> partitionColumns;
     private final List<String> columnNames;
 
+    private final TableType tableType;
+
     public HiveTableColumnsKey(String databaseName, String tableName, List<Column> partitionColumns,
-                               List<String> columnNames) {
+                               List<String> columnNames, TableType tableType) {
         this.databaseName = databaseName;
         this.tableName = tableName;
         this.partitionColumns = partitionColumns;
         this.columnNames = columnNames;
-    }
-
-    public static HiveTableColumnsKey gen(String databaseName, String tableName, List<Column> partitionColumns,
-                                          List<String> columnNames) {
-        return new HiveTableColumnsKey(databaseName, tableName, partitionColumns, columnNames);
+        this.tableType = tableType;
     }
 
     public String getDatabaseName() {
@@ -44,6 +43,10 @@ public class HiveTableColumnsKey {
         return columnNames;
     }
 
+    public TableType getTableType() {
+        return tableType;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -55,11 +58,12 @@ public class HiveTableColumnsKey {
 
         HiveTableColumnsKey other = (HiveTableColumnsKey) o;
         return Objects.equals(databaseName, other.databaseName) &&
-                Objects.equals(tableName, other.tableName);
+                Objects.equals(tableName, other.tableName) &&
+                Objects.equals(tableType, other.tableType);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(databaseName, tableName);
+        return Objects.hash(databaseName, tableName, tableType);
     }
 }

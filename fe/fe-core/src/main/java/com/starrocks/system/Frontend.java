@@ -21,11 +21,13 @@
 
 package com.starrocks.system;
 
-import com.starrocks.catalog.Catalog;
+import com.starrocks.common.Config;
 import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.ha.BDBHA;
 import com.starrocks.ha.FrontendNodeType;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.HeartbeatResponse.HbStatus;
 
 import java.io.DataInput;
@@ -43,9 +45,13 @@ public class Frontend implements Writable {
 
     private long replayedJournalId;
     private long lastUpdateTime;
+    private long startTime;
     private String heartbeatErrMsg = "";
+    private String feVersion;
 
     private boolean isAlive = false;
+
+    private int heartbeatRetryTimes = 0;
 
     public Frontend() {
     }
@@ -97,28 +103,54 @@ public class Frontend implements Writable {
         return lastUpdateTime;
     }
 
+    public long getStartTime() {
+        return startTime;
+    }
+
+    public String getFeVersion() {
+        return feVersion;
+    }
+
+    public void updateHostAndEditLogPort(String host, int editLogPort) {
+        this.host = host;
+        this.editLogPort = editLogPort;
+    }
+
     /**
      * handle Frontend's heartbeat response.
      * Because the replayed journal id is very likely to be changed at each heartbeat response,
      * so we simple return true if the heartbeat status is OK.
      * But if heartbeat status is BAD, only return true if it is the first time to transfer from alive to dead.
      */
-    public boolean handleHbResponse(FrontendHbResponse hbResponse) {
+    public boolean handleHbResponse(FrontendHbResponse hbResponse, boolean isReplay) {
         boolean isChanged = false;
         if (hbResponse.getStatus() == HbStatus.OK) {
+            if (!isAlive && !isReplay) {
+                if (GlobalStateMgr.getCurrentState().getHaProtocol() instanceof BDBHA) {
+                    BDBHA ha = (BDBHA) GlobalStateMgr.getCurrentState().getHaProtocol();
+                    ha.removeUnstableNode(host, GlobalStateMgr.getCurrentState().getFollowerCnt());
+                }
+            }
             isAlive = true;
             queryPort = hbResponse.getQueryPort();
             rpcPort = hbResponse.getRpcPort();
             replayedJournalId = hbResponse.getReplayedJournalId();
             lastUpdateTime = hbResponse.getHbTime();
+            startTime = hbResponse.getFeStartTime();
+            feVersion = hbResponse.getFeVersion();
             heartbeatErrMsg = "";
             isChanged = true;
+            this.heartbeatRetryTimes = 0;
         } else {
-            if (isAlive) {
-                isAlive = false;
-                isChanged = true;
+            if (this.heartbeatRetryTimes < Config.heartbeat_retry_times) {
+                this.heartbeatRetryTimes++;
+            } else {
+                if (isAlive) {
+                    isAlive = false;
+                    isChanged = true;
+                }
+                heartbeatErrMsg = hbResponse.getMsg() == null ? "Unknown error" : hbResponse.getMsg();
             }
-            heartbeatErrMsg = hbResponse.getMsg() == null ? "Unknown error" : hbResponse.getMsg();
         }
         return isChanged;
     }
@@ -133,17 +165,12 @@ public class Frontend implements Writable {
 
     public void readFields(DataInput in) throws IOException {
         role = FrontendNodeType.valueOf(Text.readString(in));
-        if (role == FrontendNodeType.REPLICA) {
-            // this is for compatibility.
-            // we changed REPLICA to FOLLOWER
-            role = FrontendNodeType.FOLLOWER;
-        }
         host = Text.readString(in);
         editLogPort = in.readInt();
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_41) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_41) {
             nodeName = Text.readString(in);
         } else {
-            nodeName = Catalog.genFeNodeName(host, editLogPort, true /* old style */);
+            nodeName = GlobalStateMgr.genFeNodeName(host, editLogPort, true /* old style */);
         }
     }
 

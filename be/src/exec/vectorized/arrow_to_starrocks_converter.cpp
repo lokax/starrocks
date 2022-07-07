@@ -1,16 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exec/vectorized/arrow_to_starrocks_converter.h"
 
 #include <arrow/array.h>
 
+#include "arrow/array/array_binary.h"
+#include "arrow/array/array_nested.h"
+#include "arrow/scalar.h"
+#include "arrow/type_fwd.h"
+#include "arrow/type_traits.h"
 #include "column/array_column.h"
 #include "column/nullable_column.h"
 #include "column/type_traits.h"
 #include "column/vectorized_fwd.h"
 #include "common/status.h"
+#include "exec/vectorized/arrow_type_traits.h"
 #include "gutil/strings/fastmem.h"
 #include "gutil/strings/substitute.h"
+#include "runtime/datetime_value.h"
 #include "runtime/descriptors.h"
 #include "runtime/primitive_type.h"
 #include "runtime/runtime_state.h"
@@ -23,68 +30,6 @@ Status illegal_converting_error(const std::string& arrow_type_name, const std::s
     return Status::InternalError(strings::Substitute("Illegal converting from arrow type($0) to StarRocks type($1)",
                                                      arrow_type_name, type_name));
 }
-
-template <ArrowTypeId AT>
-struct ArrowTypeStructTraits {};
-#define M_ArrowTypeValueToTypeStruct(v, s)                       \
-    template <>                                                  \
-    struct ArrowTypeStructTraits<v> {                            \
-        using TypeStruct = std::enable_if_t<s::type_id == v, s>; \
-    }
-
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::BOOL, arrow::BooleanType);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::INT8, arrow::Int8Type);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::UINT8, arrow::UInt8Type);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::INT16, arrow::Int16Type);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::UINT16, arrow::UInt16Type);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::INT32, arrow::Int32Type);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::UINT32, arrow::UInt32Type);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::INT64, arrow::Int64Type);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::UINT64, arrow::UInt64Type);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::HALF_FLOAT, arrow::HalfFloatType);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::FLOAT, arrow::FloatType);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::DOUBLE, arrow::DoubleType);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::BINARY, arrow::BinaryType);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::STRING, arrow::StringType);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::FIXED_SIZE_BINARY, arrow::FixedSizeBinaryType);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::LARGE_BINARY, arrow::LargeBinaryType);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::LARGE_STRING, arrow::LargeStringType);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::DECIMAL, arrow::Decimal128Type);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::DATE32, arrow::Date32Type);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::DATE64, arrow::Date64Type);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::TIMESTAMP, arrow::TimestampType);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::LIST, arrow::ListType);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::LARGE_LIST, arrow::LargeListType);
-M_ArrowTypeValueToTypeStruct(ArrowTypeId::FIXED_SIZE_LIST, arrow::FixedSizeListType);
-
-template <ArrowTypeId AT>
-using ArrowTypeValueToStruct = typename ArrowTypeStructTraits<AT>::TypeStruct;
-
-template <ArrowTypeId AT>
-using ArrowTypeValueToArrayType = typename arrow::TypeTraits<ArrowTypeValueToStruct<AT>>::ArrayType;
-template <ArrowTypeId AT, typename = guard::Guard>
-struct ArrowTypeValueToCppTypeStruct {
-    using type = typename ArrowTypeValueToArrayType<AT>::value_type;
-};
-template <>
-struct ArrowTypeValueToCppTypeStruct<ArrowTypeId::BOOL, guard::Guard> {
-    using type = bool;
-};
-
-VALUE_GUARD(ArrowTypeId, BinaryATGuard, at_is_binary, ArrowTypeId::BINARY, ArrowTypeId::STRING,
-            ArrowTypeId::FIXED_SIZE_BINARY, ArrowTypeId::LARGE_BINARY, ArrowTypeId::LARGE_STRING)
-
-template <ArrowTypeId AT>
-struct ArrowTypeValueToCppTypeStruct<AT, BinaryATGuard<AT>> {
-    using type = const uint8_t*;
-};
-template <>
-struct ArrowTypeValueToCppTypeStruct<ArrowTypeId::DECIMAL, guard::Guard> {
-    using type = const uint8_t*;
-};
-
-template <ArrowTypeId AT>
-using ArrowTypeValueToCppType = typename ArrowTypeValueToCppTypeStruct<AT>::type;
 
 DEF_PRED_GUARD(DirectlyCopybleGuard, is_directly_copyable, ArrowTypeId, AT, PrimitiveType, PT)
 #define IS_DIRECTLY_COPYABLE_CTOR(AT, PT) DEF_PRED_CASE_CTOR(is_directly_copyable, AT, PT)
@@ -156,8 +101,8 @@ void fill_filter(const arrow::Array* array, size_t array_start_idx, size_t num_e
 template <ArrowTypeId AT, PrimitiveType PT, bool is_nullable, bool is_strict, typename = guard::Guard,
           typename = guard::Guard>
 struct ArrowConverter {
-    using ArrowArrayType = ArrowTypeValueToArrayType<AT>;
-    using ArrowCppType = ArrowTypeValueToCppType<AT>;
+    using ArrowArrayType = ArrowTypeIdToArrayType<AT>;
+    using ArrowCppType = ArrowTypeIdToCppType<AT>;
     using CppType = RunTimeCppType<PT>;
     using ColumnType = RunTimeColumnType<PT>;
 
@@ -239,8 +184,8 @@ static inline constexpr uint32_t binary_max_length = (PT == TYPE_VARCHAR) ? Type
 
 template <ArrowTypeId AT, PrimitiveType PT, bool is_nullable, bool is_strict>
 struct ArrowConverter<AT, PT, is_nullable, is_strict, BinaryATGuard<AT>, BinaryPTGuard<PT>> {
-    using ArrowArrayType = ArrowTypeValueToArrayType<AT>;
-    using ArrowCppType = ArrowTypeValueToCppType<AT>;
+    using ArrowArrayType = ArrowTypeIdToArrayType<AT>;
+    using ArrowCppType = ArrowTypeIdToCppType<AT>;
     using CppType = RunTimeCppType<PT>;
     using ColumnType = RunTimeColumnType<PT>;
     static void optimize_not_nullable_fixed_size_binary(const ArrowArrayType* array, size_t array_start_idx,
@@ -349,7 +294,7 @@ struct ArrowConverter<AT, PT, is_nullable, is_strict, BinaryATGuard<AT>, BinaryP
 
                     if (ctx != nullptr) {
                         std::string raw_data = "arrow data is fixed size binary type";
-                        std::string reason = strings::Substitute("type length $0 exeeds max length $1", width,
+                        std::string reason = strings::Substitute("type length $0 exceeds max length $1", width,
                                                                  binary_max_length<PT>);
                         ctx->report_error_message(reason, raw_data);
                     }
@@ -384,7 +329,7 @@ struct ArrowConverter<AT, PT, is_nullable, is_strict, BinaryATGuard<AT>, BinaryP
                             const char* s_data = reinterpret_cast<const char*>(concrete_array->GetValue(i, &s_size));
                             std::string raw_data = std::string(s_data, s_size);
                             std::string reason =
-                                    strings::Substitute("string length $0 exeeds max length $1", s_size, max_length);
+                                    strings::Substitute("string length $0 exceeds max length $1", s_size, max_length);
                             ctx->report_error_message(reason, raw_data);
                         }
                     }
@@ -429,9 +374,9 @@ VALUE_GUARD(PrimitiveType, DecimalOfAnyVersionPTGuard, pt_is_decimal_of_any_vers
 template <PrimitiveType PT, bool is_nullable, bool is_strict>
 struct ArrowConverter<ArrowTypeId::DECIMAL, PT, is_nullable, is_strict, guard::Guard, DecimalOfAnyVersionPTGuard<PT>> {
     static constexpr ArrowTypeId AT = ArrowTypeId::DECIMAL;
-    using ArrowType = ArrowTypeValueToStruct<AT>;
-    using ArrowArrayType = ArrowTypeValueToArrayType<AT>;
-    using ArrowCppType = ArrowTypeValueToCppType<AT>;
+    using ArrowType = ArrowTypeIdToType<AT>;
+    using ArrowArrayType = ArrowTypeIdToArrayType<AT>;
+    using ArrowCppType = ArrowTypeIdToCppType<AT>;
     using CppType = RunTimeCppType<PT>;
     using ColumnType = RunTimeColumnType<PT>;
 
@@ -568,9 +513,9 @@ VALUE_GUARD(ArrowTypeId, DateOrDateTimeATGuard, at_is_date_or_datetime, ArrowTyp
 
 template <ArrowTypeId AT, PrimitiveType PT, bool is_nullable, bool is_strict>
 struct ArrowConverter<AT, PT, is_nullable, is_strict, DateOrDateTimeATGuard<AT>, DateOrDateTimePTGuard<PT>> {
-    using ArrowType = ArrowTypeValueToStruct<AT>;
-    using ArrowArrayType = ArrowTypeValueToArrayType<AT>;
-    using ArrowCppType = ArrowTypeValueToCppType<AT>;
+    using ArrowType = ArrowTypeIdToType<AT>;
+    using ArrowArrayType = ArrowTypeIdToArrayType<AT>;
+    using ArrowCppType = ArrowTypeIdToCppType<AT>;
     using CppType = RunTimeCppType<PT>;
     using ColumnType = RunTimeColumnType<PT>;
 
@@ -682,6 +627,21 @@ struct ArrowConverter<AT, PT, is_nullable, is_strict, DateOrDateTimeATGuard<AT>,
     }
 };
 
+// Convert nested arrow type(Map,List,Struct...) to Json
+Status convert_arrow_to_json(const arrow::Array* array, JsonColumn* output);
+
+template <ArrowTypeId AT, PrimitiveType PT, bool is_nullable, bool is_strict>
+struct ArrowConverter<AT, PT, is_nullable, is_strict, JsonGuard<PT>> {
+    static Status apply(const arrow::Array* array, size_t array_start_idx, size_t num_elements, Column* column,
+                        size_t column_start_idx, [[maybe_unused]] uint8_t* null_data,
+                        [[maybe_unused]] uint8_t* filter_data, ArrowConvertContext* ctx) {
+        auto* json_column = down_cast<JsonColumn*>(column);
+        json_column->reserve(column->size() + num_elements);
+
+        return convert_arrow_to_json(array, json_column);
+    }
+};
+
 constexpr int32_t convert_idx(ArrowTypeId at, PrimitiveType pt, bool is_nullable, bool is_strict) {
     return (at << 17) | (pt << 2) | (is_nullable ? 2 : 0) | (is_strict ? 1 : 0);
 }
@@ -713,27 +673,30 @@ static const std::unordered_map<ArrowTypeId, PrimitiveType> global_strict_arrow_
         STRICT_ARROW_CONV_ENTRY_R(TYPE_DATE, ArrowTypeId::DATE32),
         STRICT_ARROW_CONV_ENTRY_R(TYPE_DATETIME, ArrowTypeId::DATE64, ArrowTypeId::TIMESTAMP),
         STRICT_ARROW_CONV_ENTRY_R(TYPE_DECIMAL128, ArrowTypeId::DECIMAL),
+        STRICT_ARROW_CONV_ENTRY_R(TYPE_JSON, ArrowTypeId::STRUCT, ArrowTypeId::MAP, ArrowTypeId::LIST),
 };
 
 static const std::unordered_map<int32_t, ConvertFunc> global_optimized_arrow_conv_table{
-        ARROW_CONV_ENTRY(ArrowTypeId::BOOL, TYPE_BOOLEAN),
-        ARROW_CONV_ENTRY(ArrowTypeId::INT8, TYPE_TINYINT, TYPE_SMALLINT, TYPE_INT, TYPE_BIGINT, TYPE_LARGEINT),
-        ARROW_CONV_ENTRY(ArrowTypeId::INT8, TYPE_FLOAT, TYPE_DOUBLE),
-        ARROW_CONV_ENTRY(ArrowTypeId::UINT8, TYPE_TINYINT, TYPE_SMALLINT, TYPE_INT, TYPE_BIGINT, TYPE_LARGEINT),
-        ARROW_CONV_ENTRY(ArrowTypeId::INT16, TYPE_SMALLINT, TYPE_INT, TYPE_BIGINT, TYPE_LARGEINT),
-        ARROW_CONV_ENTRY(ArrowTypeId::INT16, TYPE_FLOAT, TYPE_DOUBLE),
-        ARROW_CONV_ENTRY(ArrowTypeId::UINT16, TYPE_SMALLINT, TYPE_INT, TYPE_BIGINT, TYPE_LARGEINT),
-        ARROW_CONV_ENTRY(ArrowTypeId::UINT16, TYPE_FLOAT, TYPE_DOUBLE),
-        ARROW_CONV_ENTRY(ArrowTypeId::INT32, TYPE_INT, TYPE_BIGINT, TYPE_LARGEINT, TYPE_DOUBLE),
-        ARROW_CONV_ENTRY(ArrowTypeId::UINT32, TYPE_INT, TYPE_BIGINT, TYPE_LARGEINT, TYPE_DOUBLE),
-        ARROW_CONV_ENTRY(ArrowTypeId::INT64, TYPE_BIGINT, TYPE_LARGEINT),
-        ARROW_CONV_ENTRY(ArrowTypeId::UINT64, TYPE_BIGINT, TYPE_LARGEINT),
-        ARROW_CONV_ENTRY(ArrowTypeId::INT64, TYPE_BIGINT, TYPE_LARGEINT),
-        ARROW_CONV_ENTRY(ArrowTypeId::UINT64, TYPE_BIGINT, TYPE_LARGEINT),
+        ARROW_CONV_ENTRY(ArrowTypeId::BOOL, TYPE_BOOLEAN, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::INT8, TYPE_TINYINT, TYPE_SMALLINT, TYPE_INT, TYPE_BIGINT, TYPE_LARGEINT,
+                         TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::INT8, TYPE_FLOAT, TYPE_DOUBLE, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::UINT8, TYPE_TINYINT, TYPE_SMALLINT, TYPE_INT, TYPE_BIGINT, TYPE_LARGEINT,
+                         TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::INT16, TYPE_SMALLINT, TYPE_INT, TYPE_BIGINT, TYPE_LARGEINT, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::INT16, TYPE_FLOAT, TYPE_DOUBLE, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::UINT16, TYPE_SMALLINT, TYPE_INT, TYPE_BIGINT, TYPE_LARGEINT, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::UINT16, TYPE_FLOAT, TYPE_DOUBLE, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::INT32, TYPE_INT, TYPE_BIGINT, TYPE_LARGEINT, TYPE_DOUBLE, TYPE_JSON, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::UINT32, TYPE_INT, TYPE_BIGINT, TYPE_LARGEINT, TYPE_DOUBLE, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::INT64, TYPE_BIGINT, TYPE_LARGEINT, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::UINT64, TYPE_BIGINT, TYPE_LARGEINT, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::INT64, TYPE_BIGINT, TYPE_LARGEINT, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::UINT64, TYPE_BIGINT, TYPE_LARGEINT, TYPE_JSON),
         ARROW_CONV_ENTRY(ArrowTypeId::HALF_FLOAT, TYPE_FLOAT, TYPE_DOUBLE),
-        ARROW_CONV_ENTRY(ArrowTypeId::FLOAT, TYPE_FLOAT, TYPE_DOUBLE),
-        ARROW_CONV_ENTRY(ArrowTypeId::DOUBLE, TYPE_DOUBLE),
-        ARROW_CONV_ENTRY(ArrowTypeId::STRING, TYPE_CHAR, TYPE_VARCHAR),
+        ARROW_CONV_ENTRY(ArrowTypeId::FLOAT, TYPE_FLOAT, TYPE_DOUBLE, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::DOUBLE, TYPE_DOUBLE, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::STRING, TYPE_CHAR, TYPE_VARCHAR, TYPE_JSON),
         ARROW_CONV_ENTRY(ArrowTypeId::BINARY, TYPE_CHAR, TYPE_VARCHAR),
         ARROW_CONV_ENTRY(ArrowTypeId::FIXED_SIZE_BINARY, TYPE_CHAR, TYPE_VARCHAR),
         ARROW_CONV_ENTRY(ArrowTypeId::LARGE_BINARY, TYPE_CHAR, TYPE_VARCHAR),
@@ -742,6 +705,11 @@ static const std::unordered_map<int32_t, ConvertFunc> global_optimized_arrow_con
         ARROW_CONV_ENTRY(ArrowTypeId::DATE64, TYPE_DATE, TYPE_DATETIME),
         ARROW_CONV_ENTRY(ArrowTypeId::TIMESTAMP, TYPE_DATE, TYPE_DATETIME),
         ARROW_CONV_ENTRY(ArrowTypeId::DECIMAL, TYPE_DECIMALV2, TYPE_DECIMAL32, TYPE_DECIMAL64, TYPE_DECIMAL128),
+
+        // JSON converters
+        ARROW_CONV_ENTRY(ArrowTypeId::MAP, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::LIST, TYPE_JSON),
+        ARROW_CONV_ENTRY(ArrowTypeId::STRUCT, TYPE_JSON),
 };
 
 ConvertFunc get_arrow_converter(ArrowTypeId at, PrimitiveType pt, bool is_nullable, bool is_strict) {
@@ -774,7 +742,7 @@ struct ArrowListConverter {
     template <ArrowTypeId AT>
     static void unfold(std::vector<const arrow::Array*>* layers, std::vector<std::pair<size_t, size_t>>* ranges,
                        const arrow::Array** last_layer, std::pair<size_t, size_t>* last_range) {
-        using ArrowArrayType = ArrowTypeValueToArrayType<AT>;
+        using ArrowArrayType = ArrowTypeIdToArrayType<AT>;
         layers->push_back(*last_layer);
         ranges->push_back(*last_range);
         auto concrete_array = down_cast<const ArrowArrayType*>(*last_layer);
@@ -848,7 +816,7 @@ struct ArrowListConverter {
 
     template <typename T>
     static void list_offsets_copy(const arrow::Array* layer, const size_t layer_start_idx,
-                                  const size_t layer_num_elements, UInt32ColumnPtr offsets_layer) {
+                                  const size_t layer_num_elements, const UInt32ColumnPtr& offsets_layer) {
         using ArrowArrayType = typename arrow::TypeTraits<T>::ArrayType;
         using OffsetsType = typename T::offset_type;
         auto* concrete_array = down_cast<const ArrowArrayType*>(layer);

@@ -22,9 +22,14 @@
 package com.starrocks.catalog;
 
 import com.google.common.base.Preconditions;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.common.FeMetaVersion;
+import com.starrocks.common.NotImplementedException;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.persist.gson.GsonPostProcessable;
+import com.starrocks.persist.gson.GsonPreProcessable;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TStorageMedium;
 import com.starrocks.thrift.TTabletType;
 import org.apache.logging.log4j.LogManager;
@@ -40,17 +45,22 @@ import java.util.Map;
 /*
  * Repository of a partition's related infos
  */
-public class PartitionInfo implements Writable {
+public class PartitionInfo implements Writable, GsonPreProcessable, GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(PartitionInfo.class);
 
+    @SerializedName(value = "type")
     protected PartitionType type;
     // partition id -> data property
+    @SerializedName(value = "idToDataProperty")
     protected Map<Long, DataProperty> idToDataProperty;
     // partition id -> replication num
+    @SerializedName(value = "idToReplicationNum")
     protected Map<Long, Short> idToReplicationNum;
     // true if the partition has multi partition columns
+    @SerializedName(value = "isMultiColumnPartition")
     protected boolean isMultiColumnPartition = false;
 
+    @SerializedName(value = "idToInMemory")
     protected Map<Long, Boolean> idToInMemory;
 
     // partition id -> tablet type
@@ -110,13 +120,16 @@ public class PartitionInfo implements Writable {
     }
 
     public TTabletType getTabletType(long partitionId) {
-        if (!idToTabletType.containsKey(partitionId)) {
+        if (idToTabletType == null || !idToTabletType.containsKey(partitionId)) {
             return TTabletType.TABLET_TYPE_DISK;
         }
         return idToTabletType.get(partitionId);
     }
 
     public void setTabletType(long partitionId, TTabletType tabletType) {
+        if (idToTabletType == null) {
+            idToTabletType = new HashMap<>();
+        }
         idToTabletType.put(partitionId, tabletType);
     }
 
@@ -146,6 +159,10 @@ public class PartitionInfo implements Writable {
 
     public String toSql(OlapTable table, List<Long> partitionId) {
         return "";
+    }
+
+    public List<Column> getPartitionColumns() throws NotImplementedException {
+        throw new NotImplementedException("method not implemented yet");
     }
 
     @Override
@@ -184,7 +201,7 @@ public class PartitionInfo implements Writable {
 
             short replicationNum = in.readShort();
             idToReplicationNum.put(partitionId, replicationNum);
-            if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_72) {
+            if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_72) {
                 idToInMemory.put(partitionId, in.readBoolean());
             } else {
                 // for compatibility, default is false
@@ -194,18 +211,24 @@ public class PartitionInfo implements Writable {
     }
 
     @Override
+    public void gsonPreProcess() throws IOException {
+    }
+
+    @Override
+    public void gsonPostProcess() throws IOException {
+    }
+
+    @Override
     public String toString() {
         StringBuilder buff = new StringBuilder();
         buff.append("type: ").append(type.typeString).append("; ");
 
         for (Map.Entry<Long, DataProperty> entry : idToDataProperty.entrySet()) {
             buff.append(entry.getKey()).append("is HDD: ");
-            ;
             if (entry.getValue().equals(new DataProperty(TStorageMedium.HDD))) {
                 buff.append(true);
             } else {
                 buff.append(false);
-
             }
             buff.append("data_property: ").append(entry.getValue().toString());
             buff.append("replica number: ").append(idToReplicationNum.get(entry.getKey()));

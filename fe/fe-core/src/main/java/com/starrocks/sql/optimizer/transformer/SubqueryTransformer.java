@@ -1,6 +1,7 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.transformer;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.BetweenPredicate;
 import com.starrocks.analysis.BinaryPredicate;
@@ -12,12 +13,12 @@ import com.starrocks.analysis.Subquery;
 import com.starrocks.catalog.Function;
 import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.Type;
-import com.starrocks.sql.analyzer.ExprVisitor;
+import com.starrocks.qe.ConnectContext;
 import com.starrocks.sql.analyzer.SemanticException;
-import com.starrocks.sql.analyzer.relation.QueryRelation;
-import com.starrocks.sql.analyzer.relation.QuerySpecification;
-import com.starrocks.sql.analyzer.relation.Relation;
-import com.starrocks.sql.analyzer.relation.ValuesRelation;
+import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.ast.QueryRelation;
+import com.starrocks.sql.ast.QueryStatement;
+import com.starrocks.sql.ast.SelectRelation;
 import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.operator.logical.LogicalApplyOperator;
@@ -32,28 +33,44 @@ import com.starrocks.sql.optimizer.rewrite.ScalarOperatorRewriter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 public class SubqueryTransformer {
-    public OptExprBuilder handleSubqueries(ColumnRefFactory columnRefFactory, OptExprBuilder subOpt, Expr expression) {
-        FilterWithSubqueryHandler handler = new FilterWithSubqueryHandler(columnRefFactory, false);
-        subOpt = expression.accept(handler, new SubqueryContext(subOpt, true));
+    private final ConnectContext session;
+
+    public SubqueryTransformer(ConnectContext session) {
+        this.session = session;
+    }
+
+    public OptExprBuilder handleSubqueries(ColumnRefFactory columnRefFactory, OptExprBuilder subOpt, Expr expression,
+                                           Map<Integer, ExpressionMapping> cteContext) {
+        if (subOpt.getExpressionMapping().hasExpression(expression)) {
+            return subOpt;
+        }
+
+        FilterWithSubqueryHandler handler = new FilterWithSubqueryHandler(columnRefFactory, session);
+        subOpt = expression.accept(handler, new SubqueryContext(subOpt, true, cteContext));
 
         return subOpt;
     }
 
     // Only support scalar-subquery in `SELECT` clause
     public OptExprBuilder handleScalarSubqueries(ColumnRefFactory columnRefFactory, OptExprBuilder subOpt,
-                                                 Expr expression) {
-        FilterWithSubqueryHandler handler = new FilterWithSubqueryHandler(columnRefFactory, true);
-        subOpt = expression.accept(handler, new SubqueryContext(subOpt, true));
+                                                 Expr expression, Map<Integer, ExpressionMapping> cteContext) {
+        if (subOpt.getExpressionMapping().hasExpression(expression)) {
+            return subOpt;
+        }
+
+        FilterWithSubqueryHandler handler = new FilterWithSubqueryHandler(columnRefFactory, session);
+        subOpt = expression.accept(handler, new SubqueryContext(subOpt, false, cteContext));
 
         return subOpt;
     }
 
-    public ScalarOperator rewriteSubqueryScalarOperator(Expr predicate, OptExprBuilder subOpt, ExpressionMapping outer,
+    public ScalarOperator rewriteSubqueryScalarOperator(Expr predicate, OptExprBuilder subOpt,
                                                         List<ColumnRefOperator> correlation) {
         ScalarOperator scalarPredicate =
-                SqlToScalarOperatorTranslator.translate(predicate, subOpt.getExpressionMapping(), outer, correlation);
+                SqlToScalarOperatorTranslator.translate(predicate, subOpt.getExpressionMapping(), correlation);
 
         ArrayList<InPredicate> inPredicates = new ArrayList<>();
         predicate.collect(InPredicate.class, inPredicates);
@@ -81,70 +98,62 @@ public class SubqueryTransformer {
 
     private static class SubqueryContext {
         public OptExprBuilder builder;
-        public boolean isAndScope;
+        public boolean useSemiAnti;
+        public Map<Integer, ExpressionMapping> cteContext;
 
-        public SubqueryContext(OptExprBuilder builder, boolean isAndScope) {
+        public SubqueryContext(OptExprBuilder builder, boolean useSemiAnti,
+                               Map<Integer, ExpressionMapping> cteContext) {
             this.builder = builder;
-            this.isAndScope = isAndScope;
+            this.useSemiAnti = useSemiAnti;
+            this.cteContext = cteContext;
         }
     }
 
-    private static class FilterWithSubqueryHandler extends ExprVisitor<OptExprBuilder, SubqueryContext> {
+    private static class FilterWithSubqueryHandler extends AstVisitor<OptExprBuilder, SubqueryContext> {
         private final ColumnRefFactory columnRefFactory;
+        private final ConnectContext session;
 
-        /*
-         * Will forbidden handle IN/EXIST subquery, for
-         * 1. Only support scalar subquery in SELECT-clause
-         * 2. Only support scalar subquery when the subquery combine with other expression, such as:
-         *  select 123, (select xxx from ...) / 2;
-         *  select * from t1 where case when (select xx from xxx) > 2 then xxx ...
-         *
-         *  like sql `select * from t1 where case when xxx in (select xx from xxx) > 2 then xxx` is can't work
-         */
-        private boolean onlySupportScalarSubquery;
-
-        public FilterWithSubqueryHandler(ColumnRefFactory columnRefFactory, boolean onlySupportScalarSubquery) {
+        public FilterWithSubqueryHandler(ColumnRefFactory columnRefFactory, ConnectContext session) {
             this.columnRefFactory = columnRefFactory;
-            this.onlySupportScalarSubquery = onlySupportScalarSubquery;
+            this.session = session;
         }
 
-        private LogicalPlan getLogicalPlan(Relation relation, ExpressionMapping outer) {
-            if (!(relation instanceof QuerySpecification) && !(relation instanceof ValuesRelation)) {
-                throw new SemanticException("Unsupported subquery relation");
+        private LogicalPlan getLogicalPlan(QueryRelation relation, ConnectContext session, ExpressionMapping outer,
+                                           Map<Integer, ExpressionMapping> cteContext) {
+            if (!(relation instanceof SelectRelation)) {
+                throw new SemanticException("Currently only subquery of the Select type are supported");
             }
 
-            if (relation instanceof QuerySpecification) {
-                QuerySpecification querySpecification = (QuerySpecification) relation;
-                // For in subQuery, the order by is meaningless
-                querySpecification.getOrderBy().clear();
+            // For in subQuery, the order by is meaningless
+            if (!relation.hasLimit()) {
+                relation.getOrderBy().clear();
             }
 
-            return new RelationTransformer(columnRefFactory, outer).transform(relation);
+            return new RelationTransformer(columnRefFactory, session, outer, cteContext).transform(relation);
         }
 
         @Override
         public OptExprBuilder visitExpression(Expr node, SubqueryContext context) {
-            boolean tmp = onlySupportScalarSubquery;
-            onlySupportScalarSubquery = true;
-
+            OptExprBuilder builder = context.builder;
             for (Expr child : node.getChildren()) {
-                visit(child, context);
+                builder = visit(child, new SubqueryContext(builder, false, context.cteContext));
             }
 
-            onlySupportScalarSubquery = tmp;
-            return context.builder;
+            return builder;
         }
 
         @Override
         public OptExprBuilder visitInPredicate(InPredicate inPredicate, SubqueryContext context) {
-            if (onlySupportScalarSubquery || !(inPredicate.getChild(1) instanceof Subquery)) {
+            if (!(inPredicate.getChild(1) instanceof Subquery)) {
                 return context.builder;
             }
 
-            QueryRelation qb = ((Subquery) inPredicate.getChild(1)).getQueryBlock();
-            LogicalPlan subqueryPlan = getLogicalPlan(qb, context.builder.getExpressionMapping());
-            if (qb instanceof QuerySpecification &&
-                    !subqueryPlan.getCorrelation().isEmpty() && ((QuerySpecification) qb).hasAggregation()) {
+            QueryStatement queryStatement = ((Subquery) inPredicate.getChild(1)).getQueryStatement();
+            QueryRelation qb = queryStatement.getQueryRelation();
+            LogicalPlan subqueryPlan = getLogicalPlan(qb, session, context.builder.getExpressionMapping(),
+                    context.cteContext);
+            if (qb instanceof SelectRelation &&
+                    !subqueryPlan.getCorrelation().isEmpty() && ((SelectRelation) qb).hasAggregation()) {
                 throw new SemanticException(
                         "Unsupported correlated in predicate subquery with grouping or aggregation");
             }
@@ -166,7 +175,7 @@ public class SubqueryTransformer {
 
             LogicalApplyOperator applyOperator =
                     new LogicalApplyOperator(outputPredicateRef, inPredicateOperator, subqueryPlan.getCorrelation(),
-                            context.isAndScope);
+                            context.useSemiAnti);
             context.builder =
                     new OptExprBuilder(applyOperator, Arrays.asList(context.builder, subqueryPlan.getRootBuilder()),
                             context.builder.getExpressionMapping());
@@ -176,12 +185,11 @@ public class SubqueryTransformer {
 
         @Override
         public OptExprBuilder visitExistsPredicate(ExistsPredicate existsPredicate, SubqueryContext context) {
-            if (onlySupportScalarSubquery) {
-                return context.builder;
-            }
+            Preconditions.checkState(existsPredicate.getChild(0) instanceof Subquery);
 
-            QueryRelation qb = ((Subquery) existsPredicate.getChild(0)).getQueryBlock();
-            LogicalPlan subqueryPlan = getLogicalPlan(qb, context.builder.getExpressionMapping());
+            QueryRelation qb = ((Subquery) existsPredicate.getChild(0)).getQueryStatement().getQueryRelation();
+            LogicalPlan subqueryPlan = getLogicalPlan(qb, session, context.builder.getExpressionMapping(),
+                    context.cteContext);
 
             List<ColumnRefOperator> rightColRef = subqueryPlan.getOutputColumn();
 
@@ -194,7 +202,7 @@ public class SubqueryTransformer {
 
             LogicalApplyOperator applyOperator =
                     new LogicalApplyOperator(outputPredicateRef, existsPredicateOperator, subqueryPlan.getCorrelation(),
-                            context.isAndScope);
+                            context.useSemiAnti);
             context.builder =
                     new OptExprBuilder(applyOperator, Arrays.asList(context.builder, subqueryPlan.getRootBuilder()),
                             context.builder.getExpressionMapping());
@@ -223,12 +231,16 @@ public class SubqueryTransformer {
         public OptExprBuilder visitCompoundPredicate(CompoundPredicate node, SubqueryContext context) {
             OptExprBuilder builder = context.builder;
             if (CompoundPredicate.Operator.OR == node.getOp()) {
-                builder = node.getChild(0).accept(this, new SubqueryContext(builder, false));
-                builder = node.getChild(1).accept(this, new SubqueryContext(builder, false));
+                builder = node.getChild(0).accept(this, new SubqueryContext(builder, false, context.cteContext));
+                builder = node.getChild(1).accept(this, new SubqueryContext(builder, false, context.cteContext));
             } else if (CompoundPredicate.Operator.AND == node.getOp()) {
                 // And Scope extend from parents
-                builder = node.getChild(0).accept(this, new SubqueryContext(builder, context.isAndScope));
-                builder = node.getChild(1).accept(this, new SubqueryContext(builder, context.isAndScope));
+                builder = node.getChild(0)
+                        .accept(this, new SubqueryContext(builder, context.useSemiAnti, context.cteContext));
+                builder = node.getChild(1)
+                        .accept(this, new SubqueryContext(builder, context.useSemiAnti, context.cteContext));
+            } else {
+                builder = node.getChild(0).accept(this, new SubqueryContext(builder, false, context.cteContext));
             }
 
             return builder;
@@ -237,9 +249,14 @@ public class SubqueryTransformer {
         // scalar subquery
         @Override
         public OptExprBuilder visitSubquery(Subquery subquery, SubqueryContext context) {
-            LogicalPlan subqueryPlan = getLogicalPlan(subquery.getQueryBlock(), context.builder.getExpressionMapping());
-            if (!subqueryPlan.getCorrelation().isEmpty() && subquery.getQueryBlock() instanceof QuerySpecification
-                    && !((QuerySpecification) subquery.getQueryBlock()).hasAggregation()) {
+            QueryStatement queryStatement = subquery.getQueryStatement();
+            QueryRelation queryRelation = queryStatement.getQueryRelation();
+
+            LogicalPlan subqueryPlan =
+                    getLogicalPlan(queryRelation, session, context.builder.getExpressionMapping(),
+                            context.cteContext);
+            if (!subqueryPlan.getCorrelation().isEmpty() && queryRelation instanceof SelectRelation
+                    && !((SelectRelation) queryRelation).hasAggregation()) {
                 throw new SemanticException("Correlated scalar subquery should aggregation query");
             }
 
@@ -255,14 +272,14 @@ public class SubqueryTransformer {
              * So we need to do special processing on count,
              * other aggregate functions do not need special processing because they return NULL
              */
-            if (!subqueryPlan.getCorrelation().isEmpty() && subquery.getQueryBlock() instanceof QuerySpecification &&
-                    ((QuerySpecification) subquery.getQueryBlock()).hasAggregation() &&
-                    ((QuerySpecification) subquery.getQueryBlock()).getAggregate().get(0).getFnName().getFunction()
+            if (!subqueryPlan.getCorrelation().isEmpty() && queryRelation instanceof SelectRelation &&
+                    ((SelectRelation) queryRelation).hasAggregation() &&
+                    ((SelectRelation) queryRelation).getAggregate().get(0).getFnName().getFunction()
                             .equalsIgnoreCase(FunctionSet.COUNT)) {
 
-                subqueryOutput = new CallOperator("ifnull", Type.BIGINT,
+                subqueryOutput = new CallOperator(FunctionSet.IFNULL, Type.BIGINT,
                         Lists.newArrayList(subqueryOutput, ConstantOperator.createBigint(0)),
-                        Expr.getBuiltinFunction("ifnull", new Type[] {Type.BIGINT, Type.BIGINT},
+                        Expr.getBuiltinFunction(FunctionSet.IFNULL, new Type[] {Type.BIGINT, Type.BIGINT},
                                 Function.CompareMode.IS_IDENTICAL));
             }
 
@@ -273,7 +290,7 @@ public class SubqueryTransformer {
             // The Apply's output column is the subquery's result
             LogicalApplyOperator applyOperator =
                     new LogicalApplyOperator(outputPredicateRef, subqueryOutput, subqueryPlan.getCorrelation(),
-                            context.isAndScope);
+                            context.useSemiAnti);
             context.builder =
                     new OptExprBuilder(applyOperator, Arrays.asList(context.builder, subqueryPlan.getRootBuilder()),
                             context.builder.getExpressionMapping());

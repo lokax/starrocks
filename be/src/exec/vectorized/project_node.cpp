@@ -1,19 +1,30 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exec/vectorized/project_node.h"
 
+#include <cstring>
 #include <memory>
+#include <set>
+#include <vector>
 
+#include "column/binary_column.h"
 #include "column/chunk.h"
+#include "column/column.h"
 #include "column/column_helper.h"
 #include "column/nullable_column.h"
 #include "column/vectorized_fwd.h"
+#include "common/global_types.h"
+#include "common/status.h"
 #include "exec/pipeline/limit_operator.h"
 #include "exec/pipeline/pipeline_builder.h"
 #include "exec/pipeline/project_operator.h"
 #include "exprs/expr.h"
+#include "exprs/expr_context.h"
 #include "exprs/vectorized/column_ref.h"
-#include "exprs/vectorized/runtime_filter.h"
+#include "glog/logging.h"
+#include "gutil/casts.h"
+#include "runtime/current_thread.h"
+#include "runtime/primitive_type.h"
 #include "runtime/runtime_state.h"
 
 namespace starrocks::vectorized {
@@ -22,7 +33,11 @@ ProjectNode::ProjectNode(starrocks::ObjectPool* pool, const starrocks::TPlanNode
                          const starrocks::DescriptorTbl& desc)
         : ExecNode(pool, node, desc) {}
 
-ProjectNode::~ProjectNode() = default;
+ProjectNode::~ProjectNode() {
+    if (runtime_state() != nullptr) {
+        close(runtime_state());
+    }
+}
 
 Status ProjectNode::init(const TPlanNode& tnode, RuntimeState* state) {
     RETURN_IF_ERROR(ExecNode::init(tnode, state));
@@ -62,11 +77,12 @@ Status ProjectNode::prepare(RuntimeState* state) {
     SCOPED_TIMER(_runtime_profile->total_time_counter());
     RETURN_IF_ERROR(ExecNode::prepare(state));
 
-    RETURN_IF_ERROR(Expr::prepare(_expr_ctxs, state, row_desc(), expr_mem_tracker()));
-    RETURN_IF_ERROR(Expr::prepare(_common_sub_expr_ctxs, state, row_desc(), expr_mem_tracker()));
+    RETURN_IF_ERROR(Expr::prepare(_expr_ctxs, state));
+    RETURN_IF_ERROR(Expr::prepare(_common_sub_expr_ctxs, state));
 
     _expr_compute_timer = ADD_TIMER(runtime_profile(), "ExprComputeTime");
     _common_sub_expr_compute_timer = ADD_TIMER(runtime_profile(), "CommonSubExprComputeTime");
+
     return Status::OK();
 }
 
@@ -77,6 +93,16 @@ Status ProjectNode::open(RuntimeState* state) {
     RETURN_IF_ERROR(_children[0]->open(state));
     RETURN_IF_ERROR(Expr::open(_expr_ctxs, state));
     RETURN_IF_ERROR(Expr::open(_common_sub_expr_ctxs, state));
+
+    GlobalDictMaps* mdict_maps = state->mutable_query_global_dict_map();
+    _dict_optimize_parser.set_mutable_dict_maps(state, mdict_maps);
+
+    auto init_dict_optimize = [&](std::vector<ExprContext*>& expr_ctxs, std::vector<SlotId>& target_slots) {
+        return _dict_optimize_parser.rewrite_exprs(&expr_ctxs, state, target_slots);
+    };
+
+    RETURN_IF_ERROR(init_dict_optimize(_common_sub_expr_ctxs, _common_sub_slot_ids));
+    RETURN_IF_ERROR(init_dict_optimize(_expr_ctxs, _slot_ids));
     return Status::OK();
 }
 
@@ -95,6 +121,8 @@ Status ProjectNode::get_next(RuntimeState* state, ChunkPtr* chunk, bool* eos) {
         RETURN_IF_ERROR(_children[0]->get_next(state, chunk, eos));
     } while (!(*eos) && ((*chunk)->num_rows() == 0));
 
+    TRY_CATCH_ALLOC_SCOPE_START()
+
     if (*eos) {
         *chunk = nullptr;
         return Status::OK();
@@ -103,8 +131,10 @@ Status ProjectNode::get_next(RuntimeState* state, ChunkPtr* chunk, bool* eos) {
     {
         SCOPED_TIMER(_common_sub_expr_compute_timer);
         for (size_t i = 0; i < _common_sub_slot_ids.size(); ++i) {
-            (*chunk)->append_column(_common_sub_expr_ctxs[i]->evaluate((*chunk).get()), _common_sub_slot_ids[i]);
+            ASSIGN_OR_RETURN(auto col, _common_sub_expr_ctxs[i]->evaluate((*chunk).get()));
+            (*chunk)->append_column(std::move(col), _common_sub_slot_ids[i]);
         }
+        RETURN_IF_HAS_ERROR(_common_sub_expr_ctxs);
     }
 
     // ToDo(kks): we could reuse result columns, if the parent node isn't sort node
@@ -112,7 +142,7 @@ Status ProjectNode::get_next(RuntimeState* state, ChunkPtr* chunk, bool* eos) {
     {
         SCOPED_TIMER(_expr_compute_timer);
         for (size_t i = 0; i < _slot_ids.size(); ++i) {
-            result_columns[i] = _expr_ctxs[i]->evaluate((*chunk).get());
+            ASSIGN_OR_RETURN(result_columns[i], _expr_ctxs[i]->evaluate((*chunk).get()));
 
             if (result_columns[i]->only_null()) {
                 result_columns[i] = ColumnHelper::create_column(_expr_ctxs[i]->root()->type(), true);
@@ -133,6 +163,7 @@ Status ProjectNode::get_next(RuntimeState* state, ChunkPtr* chunk, bool* eos) {
                         NullableColumn::create(result_columns[i], NullColumn::create(result_columns[i]->size(), 0));
             }
         }
+        RETURN_IF_HAS_ERROR(_expr_ctxs);
     }
 
     ChunkPtr result_chunk = std::make_shared<Chunk>();
@@ -155,11 +186,9 @@ Status ProjectNode::get_next(RuntimeState* state, ChunkPtr* chunk, bool* eos) {
 
     COUNTER_SET(_rows_returned_counter, _num_rows_returned);
     DCHECK_CHUNK(*chunk);
-    return Status::OK();
-}
 
-Status ProjectNode::get_next(RuntimeState* state, RowBatch* row_batch, bool* eos) {
-    return Status::NotSupported("Vector query engine don't support row_batch");
+    TRY_CATCH_ALLOC_SCOPE_END()
+    return Status::OK();
 }
 
 Status ProjectNode::reset(RuntimeState* state) {
@@ -174,11 +203,12 @@ Status ProjectNode::close(RuntimeState* state) {
 
     Expr::close(_expr_ctxs, state);
     Expr::close(_common_sub_expr_ctxs, state);
-    RETURN_IF_ERROR(ExecNode::close(state));
-    return Status::OK();
+    _dict_optimize_parser.close(state);
+
+    return ExecNode::close(state);
 }
 
-void ProjectNode::push_down_predicate(RuntimeState* state, std::list<ExprContext*>* expr_ctxs, bool is_vectorized) {
+void ProjectNode::push_down_predicate(RuntimeState* state, std::list<ExprContext*>* expr_ctxs) {
     for (const auto& ctx : (*expr_ctxs)) {
         if (!ctx->root()->is_bound(_tuple_ids)) {
             continue;
@@ -188,26 +218,43 @@ void ProjectNode::push_down_predicate(RuntimeState* state, std::list<ExprContext
             continue;
         }
 
-        DCHECK(nullptr != dynamic_cast<vectorized::ColumnRef*>(ctx->root()->get_child(0)));
-        auto column = ((vectorized::ColumnRef*)ctx->root()->get_child(0));
+        auto column = down_cast<vectorized::ColumnRef*>(ctx->root()->get_child(0));
 
         for (int i = 0; i < _slot_ids.size(); ++i) {
             if (_slot_ids[i] == column->slot_id() && _expr_ctxs[i]->root()->is_slotref()) {
-                DCHECK(nullptr != dynamic_cast<vectorized::ColumnRef*>(_expr_ctxs[i]->root()));
-                auto ref = ((vectorized::ColumnRef*)_expr_ctxs[i]->root());
+                auto ref = down_cast<vectorized::ColumnRef*>(_expr_ctxs[i]->root());
                 column->set_slot_id(ref->slot_id());
                 column->set_tuple_id(ref->tuple_id());
+                break;
             }
         }
     }
 
-    ExecNode::push_down_predicate(state, expr_ctxs, is_vectorized);
+    ExecNode::push_down_predicate(state, expr_ctxs);
+}
+
+void ProjectNode::push_down_tuple_slot_mappings(RuntimeState* state,
+                                                const std::vector<TupleSlotMapping>& parent_mappings) {
+    _tuple_slot_mappings = parent_mappings;
+
+    DCHECK(_tuple_ids.size() == 1);
+    for (int i = 0; i < _slot_ids.size(); ++i) {
+        if (_expr_ctxs[i]->root()->is_slotref()) {
+            DCHECK(nullptr != dynamic_cast<vectorized::ColumnRef*>(_expr_ctxs[i]->root()));
+            auto ref = ((vectorized::ColumnRef*)_expr_ctxs[i]->root());
+            _tuple_slot_mappings.emplace_back(ref->tuple_id(), ref->slot_id(), _tuple_ids[0], _slot_ids[i]);
+        }
+    }
+
+    for (auto& child : _children) {
+        child->push_down_tuple_slot_mappings(state, _tuple_slot_mappings);
+    }
 }
 
 void ProjectNode::push_down_join_runtime_filter(RuntimeState* state,
                                                 vectorized::RuntimeFilterProbeCollector* collector) {
     // accept runtime filters from parent if possible.
-    _runtime_filter_collector.push_down(collector, _tuple_ids);
+    _runtime_filter_collector.push_down(collector, _tuple_ids, _local_rf_waiting_set);
 
     // check to see if runtime filters can be rewritten
     auto& descriptors = _runtime_filter_collector.descriptors();
@@ -227,7 +274,7 @@ void ProjectNode::push_down_join_runtime_filter(RuntimeState* state,
             if (_slot_ids[i] == slot_id) {
                 // replace with new probe expr
                 ExprContext* new_probe_expr_ctx = _expr_ctxs[i];
-                rf_desc->replace_probe_expr_ctx(state, row_desc(), expr_mem_tracker(), new_probe_expr_ctx);
+                rf_desc->replace_probe_expr_ctx(state, row_desc(), new_probe_expr_ctx);
                 match = true;
                 break;
             }
@@ -250,9 +297,14 @@ void ProjectNode::push_down_join_runtime_filter(RuntimeState* state,
 pipeline::OpFactories ProjectNode::decompose_to_pipeline(pipeline::PipelineBuilderContext* context) {
     using namespace pipeline;
     OpFactories operators = _children[0]->decompose_to_pipeline(context);
+    // Create a shared RefCountedRuntimeFilterCollector
+    auto&& rc_rf_probe_collector = std::make_shared<RcRfProbeCollector>(1, std::move(this->runtime_filter_collector()));
+
     operators.emplace_back(std::make_shared<ProjectOperatorFactory>(
             context->next_operator_id(), id(), std::move(_slot_ids), std::move(_expr_ctxs),
             std::move(_type_is_nullable), std::move(_common_sub_slot_ids), std::move(_common_sub_expr_ctxs)));
+    // Initialize OperatorFactory's fields involving runtime filters.
+    this->init_runtime_filter_for_operator(operators.back().get(), context, rc_rf_probe_collector);
     if (limit() != -1) {
         operators.emplace_back(std::make_shared<LimitOperatorFactory>(context->next_operator_id(), id(), limit()));
     }

@@ -38,15 +38,14 @@ class StreamLoadPipe;
 
 class DataConsumer {
 public:
-    DataConsumer(StreamLoadContext* ctx)
+    DataConsumer()
             : _id(UniqueId::gen_uid()),
               _grp_id(UniqueId::gen_uid()),
-              _has_grp(false),
               _init(false),
               _cancelled(false),
               _last_visit_time(0) {}
 
-    virtual ~DataConsumer() {}
+    virtual ~DataConsumer() = default;
 
     // init the consumer with the given parameters
     virtual Status init(StreamLoadContext* ctx) = 0;
@@ -63,16 +62,12 @@ public:
     virtual bool match(StreamLoadContext* ctx) = 0;
 
     const UniqueId& id() { return _id; }
-    time_t last_visit_time() { return _last_visit_time; }
-    void set_grp(const UniqueId& grp_id) {
-        _grp_id = grp_id;
-        _has_grp = true;
-    }
+    time_t last_visit_time() const { return _last_visit_time; }
+    void set_grp(const UniqueId& grp_id) { _grp_id = grp_id; }
 
 protected:
     UniqueId _id;
     UniqueId _grp_id;
-    bool _has_grp;
 
     // lock to protect the following bools
     std::mutex _lock;
@@ -83,7 +78,7 @@ protected:
 
 class KafkaEventCb : public RdKafka::EventCb {
 public:
-    void event_cb(RdKafka::Event& event) {
+    void event_cb(RdKafka::Event& event) override {
         switch (event.type()) {
         case RdKafka::Event::EVENT_ERROR:
             LOG(INFO) << "kafka error: " << RdKafka::err2str(event.err()) << ", event: " << event.str();
@@ -111,10 +106,10 @@ public:
 
 class KafkaDataConsumer : public DataConsumer {
 public:
-    KafkaDataConsumer(StreamLoadContext* ctx)
-            : DataConsumer(ctx), _brokers(ctx->kafka_info->brokers), _topic(ctx->kafka_info->topic) {}
+    explicit KafkaDataConsumer(StreamLoadContext* ctx)
+            : DataConsumer(), _brokers(ctx->kafka_info->brokers), _topic(ctx->kafka_info->topic) {}
 
-    virtual ~KafkaDataConsumer() {
+    ~KafkaDataConsumer() override {
         VLOG(3) << "deconstruct consumer";
         if (_k_consumer) {
             _k_consumer->close();
@@ -123,13 +118,13 @@ public:
         }
     }
 
-    virtual Status init(StreamLoadContext* ctx) override;
+    Status init(StreamLoadContext* ctx) override;
     // TODO(cmy): currently do not implement single consumer start method, using group_consume
-    virtual Status consume(StreamLoadContext* ctx) override { return Status::OK(); }
-    virtual Status cancel(StreamLoadContext* ctx) override;
+    Status consume(StreamLoadContext* ctx) override { return Status::OK(); }
+    Status cancel(StreamLoadContext* ctx) override;
     // reassign partition topics
-    virtual Status reset() override;
-    virtual bool match(StreamLoadContext* ctx) override;
+    Status reset() override;
+    bool match(StreamLoadContext* ctx) override;
     // commit kafka offset
     Status commit(std::vector<RdKafka::TopicPartition*>& offset);
 
@@ -153,7 +148,6 @@ private:
 
     KafkaEventCb _k_event_cb;
     RdKafka::KafkaConsumer* _k_consumer = nullptr;
-    std::shared_ptr<KafkaConsumerPipe> _k_consumer_pipe;
 };
 
 } // end namespace starrocks

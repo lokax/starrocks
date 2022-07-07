@@ -97,7 +97,6 @@ import com.starrocks.qe.SqlModeHelper;
         keywordMap.put("all", new Integer(SqlParserSymbols.KW_ALL));
         keywordMap.put("alter", new Integer(SqlParserSymbols.KW_ALTER));
         keywordMap.put("and", new Integer(SqlParserSymbols.KW_AND));
-        keywordMap.put("analyze", new Integer(SqlParserSymbols.KW_ANALYZE));
         keywordMap.put("anti", new Integer(SqlParserSymbols.KW_ANTI));
         keywordMap.put("array", new Integer(SqlParserSymbols.KW_ARRAY));
         keywordMap.put("as", new Integer(SqlParserSymbols.KW_AS));
@@ -112,7 +111,6 @@ import com.starrocks.qe.SqlModeHelper;
         keywordMap.put("bitmap", new Integer(SqlParserSymbols.KW_BITMAP));
         keywordMap.put("bitmap_union", new Integer(SqlParserSymbols.KW_BITMAP_UNION));
         keywordMap.put("boolean", new Integer(SqlParserSymbols.KW_BOOLEAN));
-        keywordMap.put("both", new Integer(SqlParserSymbols.KW_BOTH));
         keywordMap.put("broker", new Integer(SqlParserSymbols.KW_BROKER));
         keywordMap.put("buckets", new Integer(SqlParserSymbols.KW_BUCKETS));
         keywordMap.put("builtin", new Integer(SqlParserSymbols.KW_BUILTIN));
@@ -144,6 +142,7 @@ import com.starrocks.qe.SqlModeHelper;
         keywordMap.put("cross", new Integer(SqlParserSymbols.KW_CROSS));
         keywordMap.put("cube", new Integer(SqlParserSymbols.KW_CUBE));
         keywordMap.put("current", new Integer(SqlParserSymbols.KW_CURRENT));
+        keywordMap.put("current_timestamp", new Integer(SqlParserSymbols.KW_CURRENT_TIMESTAMP));
         keywordMap.put("current_user", new Integer(SqlParserSymbols.KW_CURRENT_USER));
         keywordMap.put("data", new Integer(SqlParserSymbols.KW_DATA));
         keywordMap.put("database", new Integer(SqlParserSymbols.KW_DATABASE));
@@ -179,7 +178,6 @@ import com.starrocks.qe.SqlModeHelper;
         keywordMap.put("end", new Integer(SqlParserSymbols.KW_END));
         keywordMap.put("engine", new Integer(SqlParserSymbols.KW_ENGINE));
         keywordMap.put("engines", new Integer(SqlParserSymbols.KW_ENGINES));
-        keywordMap.put("enter", new Integer(SqlParserSymbols.KW_ENTER));
         keywordMap.put("errors", new Integer(SqlParserSymbols.KW_ERRORS));
         keywordMap.put("events", new Integer(SqlParserSymbols.KW_EVENTS));
         keywordMap.put("except", new Integer(SqlParserSymbols.KW_EXCEPT));
@@ -209,6 +207,7 @@ import com.starrocks.qe.SqlModeHelper;
         keywordMap.put("grant", new Integer(SqlParserSymbols.KW_GRANT));
         keywordMap.put("grants", new Integer(SqlParserSymbols.KW_GRANTS));
         keywordMap.put("group", new Integer(SqlParserSymbols.KW_GROUP));
+        keywordMap.put("groups", new Integer(SqlParserSymbols.KW_GROUPS));
         keywordMap.put("grouping", new Integer(SqlParserSymbols.KW_GROUPING));
         keywordMap.put("hash", new Integer(SqlParserSymbols.KW_HASH));
         keywordMap.put("having", new Integer(SqlParserSymbols.KW_HAVING));
@@ -238,6 +237,7 @@ import com.starrocks.qe.SqlModeHelper;
         keywordMap.put("isolation", new Integer(SqlParserSymbols.KW_ISOLATION));
         keywordMap.put("install", new Integer(SqlParserSymbols.KW_INSTALL));
         keywordMap.put("join", new Integer(SqlParserSymbols.KW_JOIN));
+        keywordMap.put("json", new Integer(SqlParserSymbols.KW_JSON));
         keywordMap.put("key", new Integer(SqlParserSymbols.KW_KEY));
         keywordMap.put("keys", new Integer(SqlParserSymbols.KW_KEYS));
         keywordMap.put("kill", new Integer(SqlParserSymbols.KW_KILL));
@@ -251,15 +251,15 @@ import com.starrocks.qe.SqlModeHelper;
         keywordMap.put("like", new Integer(SqlParserSymbols.KW_LIKE));
         keywordMap.put("limit", new Integer(SqlParserSymbols.KW_LIMIT));
         keywordMap.put("link", new Integer(SqlParserSymbols.KW_LINK));
+        keywordMap.put("list", new Integer(SqlParserSymbols.KW_LIST));
         keywordMap.put("load", new Integer(SqlParserSymbols.KW_LOAD));
         keywordMap.put("local", new Integer(SqlParserSymbols.KW_LOCAL));
         keywordMap.put("location", new Integer(SqlParserSymbols.KW_LOCATION));
+        keywordMap.put("logical", new Integer(SqlParserSymbols.KW_LOGICAL));
         keywordMap.put("materialized", new Integer(SqlParserSymbols.KW_MATERIALIZED));
         keywordMap.put("max", new Integer(SqlParserSymbols.KW_MAX));
         keywordMap.put("maxvalue", new Integer(SqlParserSymbols.KW_MAX_VALUE));
         keywordMap.put("merge", new Integer(SqlParserSymbols.KW_MERGE));
-        keywordMap.put("migrate", new Integer(SqlParserSymbols.KW_MIGRATE));
-        keywordMap.put("migrations", new Integer(SqlParserSymbols.KW_MIGRATIONS));
         keywordMap.put("min", new Integer(SqlParserSymbols.KW_MIN));
         keywordMap.put("minus", new Integer(SqlParserSymbols.KW_MINUS));
         keywordMap.put("minute", new Integer(SqlParserSymbols.KW_MINUTE));
@@ -306,7 +306,6 @@ import com.starrocks.qe.SqlModeHelper;
         keywordMap.put("read", new Integer(SqlParserSymbols.KW_READ));
         keywordMap.put("real", new Integer(SqlParserSymbols.KW_DOUBLE));
         keywordMap.put("recover", new Integer(SqlParserSymbols.KW_RECOVER));
-        keywordMap.put("refresh", new Integer(SqlParserSymbols.KW_REFRESH));
         keywordMap.put("regexp", new Integer(SqlParserSymbols.KW_REGEXP));
         keywordMap.put("release", new Integer(SqlParserSymbols.KW_RELEASE));
         keywordMap.put("rename", new Integer(SqlParserSymbols.KW_RENAME));
@@ -453,6 +452,7 @@ import com.starrocks.qe.SqlModeHelper;
     tokenIdMap.put(new Integer(SqlParserSymbols.error), "ERROR");
     tokenIdMap.put(new Integer(SqlParserSymbols.BITXOR), "^");
     tokenIdMap.put(new Integer(SqlParserSymbols.NUMERIC_OVERFLOW), "NUMERIC OVERFLOW");
+    tokenIdMap.put(new Integer(SqlParserSymbols.ARROW), "->");
   }
 
   public static boolean isKeyword(Integer tokenId) {
@@ -592,6 +592,7 @@ EndOfLineComment = "--" !({HintContent}|{ContainsLineTerminator}) {LineTerminato
 "\"" { return newToken(SqlParserSymbols.UNMATCHED_STRING_LITERAL, null); }
 "'" { return newToken(SqlParserSymbols.UNMATCHED_STRING_LITERAL, null); }
 "`" { return newToken(SqlParserSymbols.UNMATCHED_STRING_LITERAL, null); }
+"->" { return newToken(SqlParserSymbols.ARROW, null); }
 
 {QuotedIdentifier} {
     // Remove the quotes
@@ -633,7 +634,7 @@ EndOfLineComment = "--" !({HintContent}|{ContainsLineTerminator}) {LineTerminato
 
 {DoubleQuoteStringLiteral} {
   return newToken(SqlParserSymbols.STRING_LITERAL,
-                  escapeBackSlash(yytext().substring(1, yytext().length()-1)).replaceAll("\"\"", "\""));
+                  escapeBackSlash(yytext().substring(1, yytext().length()-1)));
 }
 
 {CommentedHintBegin} {

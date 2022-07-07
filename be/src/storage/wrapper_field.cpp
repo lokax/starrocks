@@ -28,7 +28,7 @@ const size_t DEFAULT_STRING_LENGTH = 50;
 WrapperField* WrapperField::create(const TabletColumn& column, uint32_t len) {
     bool is_string_type = (column.type() == OLAP_FIELD_TYPE_CHAR || column.type() == OLAP_FIELD_TYPE_VARCHAR ||
                            column.type() == OLAP_FIELD_TYPE_HLL || column.type() == OLAP_FIELD_TYPE_OBJECT ||
-                           column.type() == OLAP_FIELD_TYPE_PERCENTILE);
+                           column.type() == OLAP_FIELD_TYPE_PERCENTILE || column.type() == OLAP_FIELD_TYPE_JSON);
     if (is_string_type && len > OLAP_STRING_MAX_LENGTH) {
         LOG(WARNING) << "length of string parameter is too long. len=" << len << " max_len=" << OLAP_STRING_MAX_LENGTH;
         return nullptr;
@@ -51,8 +51,7 @@ WrapperField* WrapperField::create(const TabletColumn& column, uint32_t len) {
         variable_len = column.length();
     }
 
-    WrapperField* wrapper = new WrapperField(rep, variable_len, is_string_type);
-    return wrapper;
+    return new WrapperField(rep, variable_len, is_string_type);
 }
 
 WrapperField* WrapperField::create_by_type(const FieldType& type, int32_t var_length) {
@@ -62,7 +61,7 @@ WrapperField* WrapperField::create_by_type(const FieldType& type, int32_t var_le
     }
     bool is_string_type =
             (type == OLAP_FIELD_TYPE_CHAR || type == OLAP_FIELD_TYPE_VARCHAR || type == OLAP_FIELD_TYPE_HLL ||
-             type == OLAP_FIELD_TYPE_OBJECT || type == OLAP_FIELD_TYPE_PERCENTILE);
+             type == OLAP_FIELD_TYPE_OBJECT || type == OLAP_FIELD_TYPE_PERCENTILE || type == OLAP_FIELD_TYPE_JSON);
     auto wrapper = new WrapperField(rep, var_length, is_string_type);
     return wrapper;
 }
@@ -84,8 +83,5 @@ WrapperField::WrapperField(Field* rep, size_t variable_len, bool is_string_type)
         slice->data = _string_content.get();
     }
 }
-
-WrapperField::WrapperField(Field* rep, const RowCursorCell& row_cursor_cell)
-        : _rep(rep), _field_buf((char*)row_cursor_cell.cell_ptr() - 1) {}
 
 } // namespace starrocks

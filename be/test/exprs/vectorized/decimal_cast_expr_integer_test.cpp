@@ -1,10 +1,10 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include <gtest/gtest.h>
 
 #include "exprs/vectorized/decimal_cast_expr_test_helper.h"
 #include "runtime/primitive_type.h"
-#include "runtime/vectorized/time_types.h"
+#include "runtime/time_types.h"
 
 namespace starrocks::vectorized {
 

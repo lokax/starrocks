@@ -21,8 +21,10 @@
 
 package com.starrocks.analysis;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.sql.ast.AstVisitor;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -31,10 +33,7 @@ import java.util.Objects;
 /**
  * Combination of expr and ASC/DESC, and nulls ordering.
  */
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
-public class OrderByElement {
+public class OrderByElement implements ParseNode {
     private Expr expr;
     private final boolean isAsc;
 
@@ -80,7 +79,7 @@ public class OrderByElement {
             OrderByElement element = src.get(i);
             OrderByElement reverseElement =
                     new OrderByElement(element.getExpr().clone(), !element.isAsc,
-                            !nullsFirst(element.nullsFirstParam, element.isAsc));
+                            !nullsFirst(element.nullsFirstParam));
             result.add(reverseElement);
         }
 
@@ -138,6 +137,20 @@ public class OrderByElement {
         return strBuilder.toString();
     }
 
+    public String toDigest() {
+        StringBuilder strBuilder = new StringBuilder();
+        strBuilder.append(expr.toDigest());
+        strBuilder.append(isAsc ? " asc" : " desc");
+        if (nullsFirstParam != null) {
+            if (isAsc && !nullsFirstParam) {
+                strBuilder.append(" nulls last");
+            } else if (!isAsc && nullsFirstParam) {
+                strBuilder.append(" nulls first");
+            }
+        }
+        return strBuilder.toString();
+    }
+
     public String explain() {
         StringBuilder strBuilder = new StringBuilder();
         strBuilder.append(expr.explain());
@@ -181,11 +194,16 @@ public class OrderByElement {
      *
      * @param nullsFirstParam True if "NULLS FIRST", false if "NULLS LAST", or null if
      *                        the NULLs order was not specified.
-     * @param isAsc
      * @return Returns true if nulls are ordered first or false if nulls are ordered last.
      * Independent of isAsc.
      */
-    public static boolean nullsFirst(Boolean nullsFirstParam, boolean isAsc) {
-        return nullsFirstParam == null ? isAsc : nullsFirstParam;
+    public static boolean nullsFirst(Boolean nullsFirstParam) {
+        Preconditions.checkNotNull(nullsFirstParam);
+        return nullsFirstParam;
+    }
+
+    @Override
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
+        return visitor.visitOrderByElement(this, context);
     }
 }

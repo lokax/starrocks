@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.load.loadv2;
 
@@ -78,7 +78,7 @@ public class ManualLoadTxnCommitAttachment extends TxnCommitAttachment {
             errorLogUrl = Text.readString(in);
         }
         // TODO: Persist `receivedBytes` && `loadedBytes`
-        // if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_93) {
+        // if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_93) {
         //     receivedBytes = in.readLong();
         //     loadedBytes = in.readLong();
         // }

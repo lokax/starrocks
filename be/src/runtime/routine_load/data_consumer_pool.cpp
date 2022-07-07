@@ -23,6 +23,7 @@
 
 #include "common/config.h"
 #include "runtime/routine_load/data_consumer_group.h"
+#include "util/thread.h"
 
 namespace starrocks {
 
@@ -70,11 +71,12 @@ Status DataConsumerPool::get_consumer_grp(StreamLoadContext* ctx, std::shared_pt
     }
     DCHECK(ctx->kafka_info);
 
-    std::shared_ptr<KafkaDataConsumerGroup> grp = std::make_shared<KafkaDataConsumerGroup>();
-
     // one data consumer group contains at least one data consumers.
     int max_consumer_num = config::max_consumer_num_per_group;
     size_t consumer_num = std::min((size_t)max_consumer_num, ctx->kafka_info->begin_offset.size());
+
+    std::shared_ptr<KafkaDataConsumerGroup> grp = std::make_shared<KafkaDataConsumerGroup>(consumer_num);
+
     for (int i = 0; i < consumer_num; ++i) {
         std::shared_ptr<DataConsumer> consumer;
         RETURN_IF_ERROR(get_consumer(ctx, &consumer));
@@ -86,7 +88,7 @@ Status DataConsumerPool::get_consumer_grp(StreamLoadContext* ctx, std::shared_pt
     return Status::OK();
 }
 
-void DataConsumerPool::return_consumer(std::shared_ptr<DataConsumer> consumer) {
+void DataConsumerPool::return_consumer(const std::shared_ptr<DataConsumer>& consumer) {
     std::unique_lock<std::mutex> l(_lock);
 
     if (_pool.size() == _max_pool_size) {
@@ -98,27 +100,33 @@ void DataConsumerPool::return_consumer(std::shared_ptr<DataConsumer> consumer) {
     consumer->reset();
     _pool.push_back(consumer);
     VLOG(3) << "return the data consumer: " << consumer->id() << ", current pool size: " << _pool.size();
-    return;
 }
 
 void DataConsumerPool::return_consumers(DataConsumerGroup* grp) {
-    for (std::shared_ptr<DataConsumer> consumer : grp->consumers()) {
+    for (const std::shared_ptr<DataConsumer>& consumer : grp->consumers()) {
         return_consumer(consumer);
     }
 }
 
 Status DataConsumerPool::start_bg_worker() {
-    _clean_idle_consumer_thread = std::thread([this] {
+    std::shared_ptr<bool> is_closed = _is_closed;
+
+    _clean_idle_consumer_thread = std::thread([=] {
 #ifdef GOOGLE_PROFILER
         ProfilerRegisterThread();
 #endif
 
         uint32_t interval = 60;
         while (true) {
+            if (*is_closed) {
+                return;
+            }
+
             _clean_idle_consumer_bg();
             sleep(interval);
         }
     });
+    Thread::set_thread_name(_clean_idle_consumer_thread, "clean_idle_cm");
     _clean_idle_consumer_thread.detach();
     return Status::OK();
 }
@@ -128,6 +136,10 @@ void DataConsumerPool::_clean_idle_consumer_bg() {
 
     std::unique_lock<std::mutex> l(_lock);
     time_t now = time(nullptr);
+
+    if (*_is_closed) {
+        return;
+    }
 
     auto iter = std::begin(_pool);
     while (iter != std::end(_pool)) {

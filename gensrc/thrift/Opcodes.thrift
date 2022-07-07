@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/gensrc/thrift/Opcodes.thrift
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -29,8 +25,8 @@ enum TExprOpcode {
     CAST,
     FILTER_IN,
     FILTER_NOT_IN,
-    FILTER_NEW_IN,
-    FILTER_NEW_NOT_IN,
+    FILTER_NEW_IN, // deprecated
+    FILTER_NEW_NOT_IN, // deprecated
     EQ,
     NE,
     LT,

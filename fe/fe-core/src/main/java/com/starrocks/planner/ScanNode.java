@@ -26,7 +26,6 @@ import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.SlotDescriptor;
 import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.common.UserException;
-import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TScanRangeLocations;
 
 import java.util.List;
@@ -35,9 +34,6 @@ import java.util.Map;
 /**
  * Representation of the common elements of all scan nodes.
  */
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public abstract class ScanNode extends PlanNode {
     protected final TupleDescriptor desc;
     protected Map<String, PartitionColumnFilter> columnFilters;
@@ -48,24 +44,8 @@ public abstract class ScanNode extends PlanNode {
         this.desc = desc;
     }
 
-    /**
-     * Helper function to parse a "host:port" address string into TNetworkAddress
-     * This is called with ipaddress:port when doing scan range assigment.
-     */
-    protected static TNetworkAddress addressToTNetworkAddress(String address) {
-        TNetworkAddress result = new TNetworkAddress();
-        String[] hostPort = address.split(":");
-        result.hostname = hostPort[0];
-        result.port = Integer.parseInt(hostPort[1]);
-        return result;
-    }
-
     public void setColumnFilters(Map<String, PartitionColumnFilter> columnFilters) {
         this.columnFilters = columnFilters;
-    }
-
-    public void setSortColumn(String column) {
-        sortColumn = column;
     }
 
     /**

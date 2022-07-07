@@ -22,6 +22,9 @@
 package com.starrocks.common.util;
 
 import com.starrocks.thrift.TUnit;
+import org.apache.commons.lang3.tuple.Triple;
+
+import java.util.List;
 
 // Counter means indicators field. The counter's name is key, the counter itself is value.  
 public class Counter {
@@ -47,5 +50,62 @@ public class Counter {
     public Counter(TUnit type, long value) {
         this.value = value;
         this.type = type.getValue();
+    }
+
+    public static boolean isAverageType(TUnit type) {
+        return TUnit.CPU_TICKS == type
+                || TUnit.TIME_NS == type
+                || TUnit.TIME_MS == type
+                || TUnit.TIME_S == type;
+    }
+
+    /**
+     * Merge all the isomorphic counters
+     * The exact semantics of merge depends on TUnit
+     */
+    public static MergedInfo mergeIsomorphicCounters(TUnit type, List<Triple<Counter, Counter, Counter>> counters) {
+        long mergedValue = 0;
+        long minValue = Long.MAX_VALUE;
+        long maxValue = Long.MIN_VALUE;
+
+        for (Triple<Counter, Counter, Counter> triple : counters) {
+            Counter counter = triple.getLeft();
+            Counter minCounter = triple.getMiddle();
+            Counter maxCounter = triple.getRight();
+
+            if (minCounter != null && minCounter.getValue() < minValue) {
+                minValue = minCounter.getValue();
+            }
+            if (counter.getValue() < minValue) {
+                minValue = counter.getValue();
+            }
+
+            if (maxCounter != null && maxCounter.getValue() > maxValue) {
+                maxValue = maxCounter.getValue();
+            }
+            if (counter.getValue() > maxValue) {
+                maxValue = counter.getValue();
+            }
+
+            mergedValue += counter.getValue();
+        }
+
+        if (isAverageType(type)) {
+            mergedValue /= counters.size();
+        }
+
+        return new MergedInfo(mergedValue, minValue, maxValue);
+    }
+
+    public static final class MergedInfo {
+        public final long mergedValue;
+        public final long minValue;
+        public final long maxValue;
+
+        public MergedInfo(long mergedValue, long minValue, long maxValue) {
+            this.mergedValue = mergedValue;
+            this.minValue = minValue;
+            this.maxValue = maxValue;
+        }
     }
 }

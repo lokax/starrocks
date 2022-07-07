@@ -21,12 +21,12 @@
 
 package com.starrocks.system;
 
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.FsBroker;
 import com.starrocks.common.GenericPool;
 import com.starrocks.common.Pair;
 import com.starrocks.common.util.Util;
 import com.starrocks.ha.FrontendNodeType;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.HeartbeatMgr.BrokerHeartbeatHandler;
 import com.starrocks.system.HeartbeatMgr.FrontendHeartbeatHandler;
 import com.starrocks.system.HeartbeatResponse.HbStatus;
@@ -46,23 +46,23 @@ import org.junit.Test;
 public class HeartbeatMgrTest {
 
     @Mocked
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
 
     @Before
     public void setUp() {
         new Expectations() {
             {
-                catalog.getSelfNode();
+                globalStateMgr.getSelfNode();
                 minTimes = 0;
                 result = Pair.create("192.168.1.3", 9010); // not self
 
-                catalog.isReady();
+                globalStateMgr.isReady();
                 minTimes = 0;
                 result = true;
 
-                Catalog.getCurrentCatalog();
+                GlobalStateMgr.getCurrentState();
                 minTimes = 0;
-                result = catalog;
+                result = globalStateMgr;
             }
         };
 
@@ -75,7 +75,7 @@ public class HeartbeatMgrTest {
             public String getResultForUrl(String urlStr, String encodedAuthInfo, int connectTimeoutMs,
                                           int readTimeoutMs) {
                 if (urlStr.contains("192.168.1.1")) {
-                    return "{\"replayedJournalId\":191224,\"queryPort\":9131,\"rpcPort\":9121,\"status\":\"OK\",\"msg\":\"Success\"}";
+                    return "{\"replayedJournalId\":191224,\"queryPort\":9131,\"rpcPort\":9121,\"status\":\"OK\",\"msg\":\"Success\",\"feStartTime\":1637288321250,\"feVersion\":\"2.0-ac45651a\"}";
                 } else {
                     return "{\"replayedJournalId\":0,\"queryPort\":0,\"rpcPort\":0,\"status\":\"FAILED\",\"msg\":\"not ready\"}";
                 }
@@ -92,6 +92,8 @@ public class HeartbeatMgrTest {
         Assert.assertEquals(9121, hbResponse.getRpcPort());
         Assert.assertEquals(9131, hbResponse.getQueryPort());
         Assert.assertEquals(HbStatus.OK, hbResponse.getStatus());
+        Assert.assertEquals(1637288321250L, hbResponse.getFeStartTime());
+        Assert.assertEquals("2.0-ac45651a", hbResponse.getFeVersion());
 
         Frontend fe2 = new Frontend(FrontendNodeType.FOLLOWER, "test2", "192.168.1.2", 9010);
         handler = new FrontendHeartbeatHandler(fe2, 12345, "abcd");

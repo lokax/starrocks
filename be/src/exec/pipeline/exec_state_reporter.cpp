@@ -1,9 +1,10 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 #include "exec/pipeline/exec_state_reporter.h"
 
 #include <thrift/Thrift.h>
 #include <thrift/protocol/TDebugProtocol.h>
 
+#include "agent/master_info.h"
 #include "gen_cpp/FrontendService_types.h"
 #include "gen_cpp/InternalService_types.h"
 #include "gen_cpp/Types_types.h"
@@ -12,8 +13,7 @@
 #include "runtime/runtime_state.h"
 #include "service/backend_options.h"
 
-namespace starrocks {
-namespace pipeline {
+namespace starrocks::pipeline {
 std::string to_load_error_http_path(const std::string& file_name) {
     if (file_name.empty()) {
         return "";
@@ -24,7 +24,7 @@ std::string to_load_error_http_path(const std::string& file_name) {
     return url.str();
 }
 
-std::string to_http_path(const std::string token, const std::string& file_name) {
+std::string to_http_path(const std::string& token, const std::string& file_name) {
     std::stringstream url;
     url << "http://" << BackendOptions::get_localhost() << ":" << config::webserver_port << "/api/_download_load?"
         << "token=" << token << "&file=" << file_name;
@@ -54,8 +54,10 @@ TReportExecStatusParams ExecStateReporter::create_report_exec_status_params(Frag
         if (runtime_state->query_options().query_type == TQueryType::LOAD) {
             params.__set_loaded_rows(runtime_state->num_rows_load_total());
         }
-        profile->to_thrift(&params.profile);
-        params.__isset.profile = true;
+        if (fragment_ctx->is_report_profile()) {
+            profile->to_thrift(&params.profile);
+            params.__isset.profile = true;
+        }
 
         if (!runtime_state->output_files().empty()) {
             params.__isset.delta_urls = true;
@@ -96,8 +98,9 @@ TReportExecStatusParams ExecStateReporter::create_report_exec_status_params(Frag
         params.__isset.error_log = (params.error_log.size() > 0);
     }
 
-    if (exec_env->master_info()->__isset.backend_id) {
-        params.__set_backend_id(exec_env->master_info()->backend_id);
+    auto backend_id = get_backend_id();
+    if (backend_id.has_value()) {
+        params.__set_backend_id(backend_id.value());
     }
     return params;
 }
@@ -108,12 +111,11 @@ using apache::thrift::transport::TTransportException;
 
 // including the final status when execution finishes.
 Status ExecStateReporter::report_exec_status(const TReportExecStatusParams& params, ExecEnv* exec_env,
-                                             TNetworkAddress fe_addr) {
+                                             const TNetworkAddress& fe_addr) {
     Status fe_status;
     FrontendServiceConnection coord(exec_env->frontend_client_cache(), fe_addr, &fe_status);
     if (!fe_status.ok()) {
-        std::stringstream ss;
-        ss << "couldn't get a client for " << fe_addr;
+        LOG(WARNING) << "Couldn't get a client for " << fe_addr;
         return fe_status;
     }
 
@@ -145,7 +147,7 @@ Status ExecStateReporter::report_exec_status(const TReportExecStatusParams& para
 }
 
 ExecStateReporter::ExecStateReporter() {
-    auto status = ThreadPoolBuilder("exec_state_reporter_thread")
+    auto status = ThreadPoolBuilder("ex_state_report") // exec state reporter
                           .set_min_threads(1)
                           .set_max_threads(2)
                           .set_max_queue_size(1000)
@@ -156,29 +158,8 @@ ExecStateReporter::ExecStateReporter() {
     }
 }
 
-void ExecStateReporter::submit(FragmentContext* fragment_ctx, const Status& status, bool done, bool clean) {
-    auto report_func = [=]() {
-        auto params = create_report_exec_status_params(fragment_ctx, status, done);
-        auto status = report_exec_status(params, fragment_ctx->runtime_state()->exec_env(), fragment_ctx->fe_addr());
-        if (!status.ok()) {
-            LOG(WARNING) << "[Driver] Fail to report exec state: fragment_instance_id="
-                         << fragment_ctx->fragment_instance_id();
-        } else {
-            LOG(INFO) << "[Driver] Succeed to report exec state: fragment_instance_id="
-                      << fragment_ctx->fragment_instance_id();
-        }
-        if (clean) {
-            auto query_id = fragment_ctx->query_id();
-            auto&& query_ctx = QueryContextManager::instance()->get(query_id);
-            DCHECK(query_ctx);
-            query_ctx->fragment_mgr()->unregister(fragment_ctx->fragment_instance_id());
-            if (query_ctx->count_down_fragment()) {
-                QueryContextManager::instance()->unregister(query_id);
-            }
-        }
-    };
-    _thread_pool->submit_func(report_func);
+void ExecStateReporter::submit(std::function<void()>&& report_task) {
+    _thread_pool->submit_func(std::move(report_task));
 }
 
-} // namespace pipeline
-} // namespace starrocks
+} // namespace starrocks::pipeline

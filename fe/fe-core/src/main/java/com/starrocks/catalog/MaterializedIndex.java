@@ -21,11 +21,15 @@
 
 package com.starrocks.catalog;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.gson.annotations.SerializedName;
+import com.starrocks.catalog.lake.LakeTablet;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.persist.gson.GsonPostProcessable;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.thrift.TIndexState;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -50,6 +54,28 @@ public class MaterializedIndex extends MetaObject implements Writable, GsonPostP
 
         public boolean isVisible() {
             return this == IndexState.NORMAL || this == IndexState.SCHEMA_CHANGE;
+        }
+
+        public TIndexState toThrift() {
+            switch (this) {
+                case NORMAL:
+                    return TIndexState.NORMAL;
+                case SHADOW:
+                    return TIndexState.SHADOW;
+                default:
+                    return null;
+            }
+        }
+
+        public static IndexState fromThrift(TIndexState tState) {
+            switch (tState) {
+                case NORMAL:
+                    return IndexState.NORMAL;
+                case SHADOW:
+                    return IndexState.SHADOW;
+                default:
+                    return null;
+            }
         }
     }
 
@@ -129,7 +155,7 @@ public class MaterializedIndex extends MetaObject implements Writable, GsonPostP
         idToTablets.put(tablet.getId(), tablet);
         tablets.add(tablet);
         if (!isRestore) {
-            Catalog.getCurrentInvertedIndex().addTablet(tablet.getId(), tabletMeta);
+            GlobalStateMgr.getCurrentInvertedIndex().addTablet(tablet.getId(), tabletMeta);
         }
     }
 
@@ -184,11 +210,23 @@ public class MaterializedIndex extends MetaObject implements Writable, GsonPostP
     }
 
     public long getReplicaCount() {
-        long replicaCount = 0;
-        for (Tablet tablet : getTablets()) {
-            replicaCount += tablet.getReplicas().size();
+        if (tablets.isEmpty()) {
+            return 0L;
         }
-        return replicaCount;
+
+        Tablet t = tablets.get(0);
+        if (t instanceof LakeTablet) {
+            return tablets.size();
+        } else {
+            Preconditions.checkState(t instanceof LocalTablet);
+
+            long replicaCount = 0;
+            for (Tablet tablet : getTablets()) {
+                LocalTablet localTablet = (LocalTablet) tablet;
+                replicaCount += localTablet.getReplicas().size();
+            }
+            return replicaCount;
+        }
     }
 
     public int getTabletOrderIdx(long tabletId) {
@@ -231,7 +269,8 @@ public class MaterializedIndex extends MetaObject implements Writable, GsonPostP
 
         int tabletCount = in.readInt();
         for (int i = 0; i < tabletCount; ++i) {
-            Tablet tablet = Tablet.read(in);
+            // LakeTablet uses json serialization.
+            Tablet tablet = LocalTablet.read(in);
             tablets.add(tablet);
             idToTablets.put(tablet.getId(), tablet);
         }

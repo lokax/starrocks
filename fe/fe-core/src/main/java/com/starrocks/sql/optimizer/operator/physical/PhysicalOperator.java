@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.operator.physical;
 
@@ -7,28 +7,10 @@ import com.starrocks.sql.optimizer.base.DistributionSpec;
 import com.starrocks.sql.optimizer.base.OrderSpec;
 import com.starrocks.sql.optimizer.operator.Operator;
 import com.starrocks.sql.optimizer.operator.OperatorType;
-import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
+
+import java.util.Set;
 
 public abstract class PhysicalOperator extends Operator {
-    protected long limit = -1;
-    protected ScalarOperator predicate;
-
-    public long getLimit() {
-        return limit;
-    }
-
-    public void setLimit(long limit) {
-        this.limit = limit;
-    }
-
-    public ScalarOperator getPredicate() {
-        return predicate;
-    }
-
-    public void setPredicate(ScalarOperator predicate) {
-        this.predicate = predicate;
-    }
-
     protected OrderSpec orderSpec;
     protected DistributionSpec distributionSpec;
 
@@ -77,7 +59,7 @@ public abstract class PhysicalOperator extends Operator {
         return result;
     }
 
-    public abstract boolean equals(Object o);
-
-    public abstract int hashCode();
+    public boolean couldApplyStringDict(Set<Integer> childDictColumns) {
+        return false;
+    }
 }

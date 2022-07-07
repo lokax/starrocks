@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_UTIL_THREAD_POOL_H
-#define STARROCKS_BE_SRC_UTIL_THREAD_POOL_H
+#pragma once
 
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/list_hook.hpp>
@@ -36,6 +35,7 @@
 #include "common/status.h"
 #include "gutil/ref_counted.h"
 #include "util/monotime.h"
+#include "util/priority_queue.h"
 
 namespace starrocks {
 
@@ -116,7 +116,8 @@ private:
     int _max_queue_size;
     MonoDelta _idle_timeout;
 
-    DISALLOW_COPY_AND_ASSIGN(ThreadPoolBuilder);
+    ThreadPoolBuilder(const ThreadPoolBuilder&) = delete;
+    const ThreadPoolBuilder& operator=(const ThreadPoolBuilder&) = delete;
 };
 
 // Thread pool with a variable number of threads.
@@ -156,6 +157,12 @@ private:
 //    thread_pool->SubmitFunc(std::bind(&Func, 10));
 class ThreadPool {
 public:
+    enum Priority {
+        LOW_PRIORITY = 0,
+        HIGH_PRIORITY,
+        NUM_PRIORITY,
+    };
+
     ~ThreadPool();
 
     // Wait for the running tasks to complete and then shutdown the threads.
@@ -167,10 +174,10 @@ public:
     void shutdown();
 
     // Submits a Runnable class.
-    Status submit(std::shared_ptr<Runnable> r);
+    Status submit(std::shared_ptr<Runnable> r, Priority pri = LOW_PRIORITY);
 
     // Submits a function bound using std::bind(&FuncName, args...).
-    Status submit_func(std::function<void()> f);
+    Status submit_func(std::function<void()> f, Priority pri = LOW_PRIORITY);
 
     // Waits until all the tasks are completed.
     void wait();
@@ -190,6 +197,7 @@ public:
         // Tasks submitted via this token may be executed concurrently.
         CONCURRENT,
     };
+
     std::unique_ptr<ThreadPoolToken> new_token(ExecutionMode mode);
 
     // Return the number of threads currently running (or in the process of starting up)
@@ -230,7 +238,7 @@ private:
     void check_not_pool_thread_unlocked();
 
     // Submits a task to be run via token.
-    Status do_submit(std::shared_ptr<Runnable> r, ThreadPoolToken* token);
+    Status do_submit(std::shared_ptr<Runnable> r, ThreadPoolToken* token, ThreadPool::Priority pri);
 
     // Releases token 't' and invalidates it.
     void release_token(ThreadPoolToken* t);
@@ -320,7 +328,8 @@ private:
     // ExecutionMode::CONCURRENT token used by the pool for tokenless submission.
     std::unique_ptr<ThreadPoolToken> _tokenless;
 
-    DISALLOW_COPY_AND_ASSIGN(ThreadPool);
+    ThreadPool(const ThreadPool&) = delete;
+    const ThreadPool& operator=(const ThreadPool&) = delete;
 };
 
 // Entry point for token-based task submission and blocking for a particular
@@ -336,11 +345,11 @@ public:
     // called first to take care of them.
     ~ThreadPoolToken();
 
-    // Submits a Runnable class.
-    Status submit(std::shared_ptr<Runnable> r);
+    // Submits a Runnable class with specified priority.
+    Status submit(std::shared_ptr<Runnable> r, ThreadPool::Priority pri = ThreadPool::LOW_PRIORITY);
 
-    // Submits a function bound using std::bind(&FuncName, args...).
-    Status submit_func(std::function<void()> f);
+    // Submits a function bound using std::bind(&FuncName, args...)  with specified priority.
+    Status submit_func(std::function<void()> f, ThreadPool::Priority pri = ThreadPool::LOW_PRIORITY);
 
     // Marks the token as unusable for future submissions. Any queued tasks not
     // yet running are destroyed. If tasks are in flight, Shutdown() will wait
@@ -419,7 +428,7 @@ private:
     State _state;
 
     // Queued client tasks.
-    std::deque<ThreadPool::Task> _entries;
+    PriorityQueue<ThreadPool::NUM_PRIORITY, ThreadPool::Task> _entries;
 
     // Condition variable for "token is idle". Waiters wake up when the token
     // transitions to IDLE or QUIESCED.
@@ -429,9 +438,8 @@ private:
     // token.
     int _active_threads;
 
-    DISALLOW_COPY_AND_ASSIGN(ThreadPoolToken);
+    ThreadPoolToken(const ThreadPoolToken&) = delete;
+    const ThreadPoolToken& operator=(const ThreadPoolToken&) = delete;
 };
 
 } // namespace starrocks
-
-#endif //STARROCKS_BE_SRC_UTIL_THREAD_POOL_H

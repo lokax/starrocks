@@ -21,16 +21,18 @@
 
 package com.starrocks.transaction;
 
+import com.google.common.collect.Lists;
 import com.google.gson.annotations.SerializedName;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.persist.gson.GsonUtils;
+import com.starrocks.server.GlobalStateMgr;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.List;
 
 public class PartitionCommitInfo implements Writable {
 
@@ -38,21 +40,46 @@ public class PartitionCommitInfo implements Writable {
     private long partitionId;
     @SerializedName(value = "version")
     private long version;
+
+    // For LakeTable, the value of versionTime indicates different circumstances:
+    //  = 0 : no publish version task has been executed since process starts
+    //  < 0 : last publish version task failed and Math.abs(versionTime) is the last execution time
+    //  > 0 : last publish version task succeeded and versionTime is the last execution time
+    //
+    // For OlapTable, versionTime always greater than 0.
     @SerializedName(value = "versionTime")
     private long versionTime;
-    @SerializedName(value = "versionHash")
-    private long versionHash;
+
+    // For low cardinality string column with global dict
+    // TODO(KKS): move invalidDictCacheColumns and validDictCacheColumns to TableCommitInfo
+    // Currently, for support FE rollback, we persist the invalidDictCacheColumns in PartitionCommitInfo by json,
+    // not TableCommitInfo.
+
+    @SerializedName(value = "invalidColumns")
+    private List<String> invalidDictCacheColumns = Lists.newArrayList();
+    @SerializedName(value = "validColumns")
+    private List<String> validDictCacheColumns = Lists.newArrayList();
 
     public PartitionCommitInfo() {
 
     }
 
-    public PartitionCommitInfo(long partitionId, long version, long versionHash, long visibleTime) {
+    public PartitionCommitInfo(long partitionId, long version, long visibleTime) {
         super();
         this.partitionId = partitionId;
         this.version = version;
         this.versionTime = visibleTime;
-        this.versionHash = versionHash;
+    }
+
+    public PartitionCommitInfo(long partitionId, long version, long visibleTime,
+                               List<String> invalidDictCacheColumns,
+                               List<String> validDictCacheColumns) {
+        super();
+        this.partitionId = partitionId;
+        this.version = version;
+        this.versionTime = visibleTime;
+        this.invalidDictCacheColumns = invalidDictCacheColumns;
+        this.validDictCacheColumns = validDictCacheColumns;
     }
 
     @Override
@@ -62,15 +89,19 @@ public class PartitionCommitInfo implements Writable {
     }
 
     public static PartitionCommitInfo read(DataInput in) throws IOException {
-        if (Catalog.getCurrentCatalogJournalVersion() < FeMetaVersion.VERSION_88) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() < FeMetaVersion.VERSION_88) {
             long partitionId = in.readLong();
             long version = in.readLong();
-            long versionHash = in.readLong();
-            return new PartitionCommitInfo(partitionId, version, versionHash, System.currentTimeMillis());
+            in.readLong();
+            return new PartitionCommitInfo(partitionId, version, System.currentTimeMillis());
         } else {
             String json = Text.readString(in);
             return GsonUtils.GSON.fromJson(json, PartitionCommitInfo.class);
         }
+    }
+
+    public void setVersionTime(long time) {
+        this.versionTime = time;
     }
 
     public long getPartitionId() {
@@ -85,8 +116,12 @@ public class PartitionCommitInfo implements Writable {
         return versionTime;
     }
 
-    public long getVersionHash() {
-        return versionHash;
+    public List<String> getInvalidDictCacheColumns() {
+        return invalidDictCacheColumns;
+    }
+
+    public List<String> getValidDictCacheColumns() {
+        return validDictCacheColumns;
     }
 
     @Override
@@ -94,7 +129,7 @@ public class PartitionCommitInfo implements Writable {
         StringBuilder sb = new StringBuilder("partitionid=");
         sb.append(partitionId);
         sb.append(", version=").append(version);
-        sb.append(", versionHash=").append(versionHash);
+        sb.append(", versionHash=").append(0);
         sb.append(", versionTime=").append(versionTime);
         return sb.toString();
     }

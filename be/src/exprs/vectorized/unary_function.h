@@ -1,9 +1,11 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
 #include <fmt/compile.h>
 #include <fmt/format.h>
+
+#include <cstdint>
 
 #include "column/column_helper.h"
 #include "column/const_column.h"
@@ -13,7 +15,6 @@
 #include "common/logging.h"
 #include "function_helper.h"
 #include "simd/simd.h"
-#include "stdint.h"
 
 namespace starrocks {
 namespace vectorized {
@@ -212,7 +213,7 @@ public:
 };
 
 /**
- * Use for strict binary operations function, usually the result
+ * Use for strict unary operations function, usually the result
  * contains (nullable column, data column) , like:
  *
  * Cast operations: cast INT to BIGINT, etc...
@@ -225,7 +226,7 @@ using VectorizedStrictUnaryFunction =
         DealNullableColumnUnaryFunction<UnpackConstColumnUnaryFunction<UnaryFunction<OP>>>;
 
 /**
- * Use for strict binary operations function, and special for slice!
+ * Use for strict unary operations function, and special for slice!
  * You should use it if your function result type is TYPE_VARCHAR, TYPE_CHAR.
  *
  * Support functions like:

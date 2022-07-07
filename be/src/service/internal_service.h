@@ -22,9 +22,8 @@
 #pragma once
 
 #include "common/status.h"
+#include "gen_cpp/doris_internal_service.pb.h"
 #include "gen_cpp/internal_service.pb.h"
-#include "gen_cpp/starrocks_internal_service.pb.h"
-#include "util/priority_thread_pool.hpp"
 
 namespace brpc {
 class Controller;
@@ -35,10 +34,10 @@ namespace starrocks {
 class ExecEnv;
 
 template <typename T>
-class PInternalServiceImpl : public T {
+class PInternalServiceImplBase : public T {
 public:
-    PInternalServiceImpl(ExecEnv* exec_env);
-    virtual ~PInternalServiceImpl();
+    PInternalServiceImplBase(ExecEnv* exec_env);
+    ~PInternalServiceImplBase() override;
 
     void transmit_data(::google::protobuf::RpcController* controller, const ::starrocks::PTransmitDataParams* request,
                        ::starrocks::PTransmitDataResult* response, ::google::protobuf::Closure* done) override;
@@ -84,9 +83,8 @@ public:
 private:
     Status _exec_plan_fragment(brpc::Controller* cntl);
 
-private:
+protected:
     ExecEnv* _exec_env;
-    PriorityThreadPool _tablet_worker_pool;
 };
 
 } // namespace starrocks

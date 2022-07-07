@@ -1,8 +1,9 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
 #include <string>
+#include <utility>
 
 #include "column/column.h"
 #include "common/status.h"
@@ -28,11 +29,24 @@ struct FunctionDescriptor {
 
     CloseFunction close_function;
 
-    FunctionDescriptor(const std::string& nm, uint8_t args, ScalarFunction sf, PrepareFunction pf, CloseFunction cf)
-            : name(nm), args_nums(args), scalar_function(sf), prepare_function(pf), close_function(cf) {}
+    bool exception_safe;
 
-    FunctionDescriptor(const std::string& nm, uint8_t args, ScalarFunction sf)
-            : name(nm), args_nums(args), scalar_function(sf), prepare_function(nullptr), close_function(nullptr) {}
+    FunctionDescriptor(std::string nm, uint8_t args, ScalarFunction sf, PrepareFunction pf, CloseFunction cf,
+                       bool exception_safe_)
+            : name(std::move(nm)),
+              args_nums(args),
+              scalar_function(sf),
+              prepare_function(pf),
+              close_function(cf),
+              exception_safe(exception_safe_) {}
+
+    FunctionDescriptor(std::string nm, uint8_t args, ScalarFunction sf, bool exception_safe_)
+            : name(std::move(nm)),
+              args_nums(args),
+              scalar_function(sf),
+              prepare_function(nullptr),
+              close_function(nullptr),
+              exception_safe(exception_safe_) {}
 };
 
 class BuiltinFunctions {

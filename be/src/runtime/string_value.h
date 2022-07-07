@@ -19,12 +19,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_RUNTIME_STRING_VALUE_H
-#define STARROCKS_BE_RUNTIME_STRING_VALUE_H
+#pragma once
 
-#include <string.h>
+#include <cstring>
 
-#include "udf/udf.h"
 #include "util/hash_util.hpp"
 #include "util/slice.h"
 
@@ -41,11 +39,11 @@ struct StringValue {
     // NOTE: This struct should keep the same memory layout with Slice, otherwise
     // it will lead to BE crash.
     // TODO(zc): we should unify this struct with Slice some day.
-    char* ptr;
-    size_t len;
+    char* ptr{nullptr};
+    size_t len{0};
 
     StringValue(char* ptr, size_t len) : ptr(ptr), len(len) {}
-    StringValue() : ptr(NULL), len(0) {}
+    StringValue() {}
 
     /// Construct a StringValue from 's'.  's' must be valid for as long as
     /// this object is valid.
@@ -102,14 +100,6 @@ struct StringValue {
     // Trims leading and trailing spaces.
     StringValue trim() const;
 
-    void to_string_val(starrocks_udf::StringVal* sv) const {
-        *sv = starrocks_udf::StringVal(reinterpret_cast<uint8_t*>(ptr), len);
-    }
-
-    static StringValue from_string_val(const starrocks_udf::StringVal& sv) {
-        return StringValue(reinterpret_cast<char*>(sv.ptr), sv.len);
-    }
-
     static StringValue from_slice(const starrocks::Slice& slice) { return StringValue(slice.data, slice.size); }
 };
 
@@ -123,5 +113,3 @@ std::ostream& operator<<(std::ostream& os, const StringValue& string_value);
 std::size_t operator-(const StringValue& v1, const StringValue& v2);
 
 } // namespace starrocks
-
-#endif

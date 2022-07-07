@@ -107,6 +107,13 @@ public class ThreadPoolManager {
                 new LogDiscardPolicy(poolName), poolName, needRegisterMetric);
     }
 
+    public static ThreadPoolExecutor newDaemonCacheThreadPool(int maxNumThread, int queueSize, String poolName,
+            boolean needRegisterMetric) {
+        return newDaemonThreadPool(0, maxNumThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(queueSize),
+                new BlockedPolicy(poolName, 5), poolName, needRegisterMetric);
+    }
+
     public static ThreadPoolExecutor newDaemonFixedThreadPool(int numThread, int queueSize, String poolName,
                                                               boolean needRegisterMetric) {
         return newDaemonThreadPool(numThread, numThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
@@ -173,12 +180,12 @@ public class ThreadPoolManager {
     }
 
     /**
-     * A handler for rejected task that try to be blocked until the pool enqueue task succeed or timeout, used for fixed thread pool
-     * throw RejectedExecutionException if timeout or catch InterruptedException
+     * A handler for rejected task that try to be blocked until the pool enqueue task succeed or timeout,
+     * used for fixed thread pool throw RejectedExecutionException if timeout or catch InterruptedException
      */
     static class BlockedPolicy implements RejectedExecutionHandler {
 
-        private static final Logger LOG = LogManager.getLogger(LogDiscardPolicy.class);
+        private static final Logger LOG = LogManager.getLogger(BlockedPolicy.class);
 
         private String threadPoolName;
 

@@ -29,36 +29,39 @@
 #include <string>
 
 #include "common/status.h"
+#include "fs/fs.h"
 #include "gen_cpp/Types_types.h"
 #include "gen_cpp/olap_file.pb.h"
+#include "storage/cluster_id_mgr.h"
+#include "storage/kv_store.h"
 #include "storage/olap_common.h"
-#include "storage/olap_meta.h"
 #include "storage/rowset/rowset_id_generator.h"
 
 namespace starrocks {
 
 class Tablet;
 class TabletManager;
-class TabletMeta;
 class TxnManager;
 
 // A DataDir used to manage data in same path.
 // Now, After DataDir was created, it will never be deleted for easy implementation.
 class DataDir {
 public:
-    DataDir(const std::string& path, int64_t capacity_bytes = -1,
-            TStorageMedium::type storage_medium = TStorageMedium::HDD, TabletManager* tablet_manager = nullptr,
-            TxnManager* txn_manager = nullptr);
+    explicit DataDir(const std::string& path, TStorageMedium::type storage_medium = TStorageMedium::HDD,
+                     TabletManager* tablet_manager = nullptr, TxnManager* txn_manager = nullptr);
     ~DataDir();
+
+    DataDir(const DataDir&) = delete;
+    void operator=(const DataDir&) = delete;
 
     Status init(bool read_only = false);
     void stop_bg_worker();
 
     const std::string& path() const { return _path; }
-    size_t path_hash() const { return _path_hash; }
+    int64_t path_hash() const { return _path_hash; }
     bool is_used() const { return _is_used; }
     void set_is_used(bool is_used) { _is_used = is_used; }
-    int32_t cluster_id() const { return _cluster_id; }
+    int32_t cluster_id() const { return _cluster_id_mgr->cluster_id(); }
 
     DataDirInfo get_dir_info() {
         DataDirInfo info;
@@ -77,9 +80,9 @@ public:
     Status set_cluster_id(int32_t cluster_id);
     void health_check();
 
-    OLAPStatus get_shard(uint64_t* shard);
+    Status get_shard(uint64_t* shard);
 
-    OlapMeta* get_meta() { return _meta; }
+    KVStore* get_meta() { return _kv_store; }
 
     bool is_ssd_disk() const { return _storage_medium == TStorageMedium::SSD; }
 
@@ -97,11 +100,7 @@ public:
     static std::string get_root_path_from_schema_hash_path_in_trash(const std::string& schema_hash_dir_in_trash);
 
     // load data from meta and data files
-    OLAPStatus load();
-
-    void add_pending_ids(const std::string& id);
-
-    void remove_pending_ids(const std::string& id);
+    Status load();
 
     // this function scans the paths in data dir to collect the paths to check
     // this is a producer function. After scan, it will notify the perform_path_gc function to gc
@@ -117,45 +116,34 @@ public:
     // so in order to avoid running out of disk capacity, we currently use the actual
     // disk available capacity and total capacity to do the calculation.
     // So that the capacity StarRocks actually used may exceeds the user specified capacity.
-    bool reach_capacity_limit(int64_t incoming_data_size);
+    bool capacity_limit_reached(int64_t incoming_data_size);
 
     Status update_capacity();
 
 private:
-    std::string _cluster_id_path() const { return _path + CLUSTER_ID_PREFIX; }
-    Status _init_cluster_id();
-    Status _init_capacity();
-    Status _init_file_system();
+    Status _init_data_dir();
+    Status _init_tmp_dir();
     Status _init_meta(bool read_only = false);
 
-    OLAPStatus _read_and_write_test_file();
-    Status _read_cluster_id(const std::string& cluster_id_path, int32_t* cluster_id);
-    Status _write_cluster_id_to_path(const std::string& path, int32_t cluster_id);
-    Status _add_version_info_to_cluster_id(const std::string& path);
+    Status _read_and_write_test_file();
 
     void _process_garbage_path(const std::string& path);
 
     bool _stop_bg_worker = false;
 
+    std::shared_ptr<FileSystem> _fs;
     std::string _path;
-    size_t _path_hash;
-    // user specified capacity
-    int64_t _capacity_bytes;
+    int64_t _path_hash;
     // the actual available capacity of the disk of this data dir
-    // NOTICE that _available_bytes may be larger than _capacity_bytes, if capacity is set
-    // by user, not the disk's actual capacity
     int64_t _available_bytes;
     // the actual capacity of the disk of this data dir
     int64_t _disk_capacity_bytes;
     TStorageMedium::type _storage_medium;
     bool _is_used;
 
-    std::string _file_system;
     TabletManager* _tablet_manager;
     TxnManager* _txn_manager;
-    int32_t _cluster_id;
-    // This flag will be set true if this store was not in root path when reloading
-    bool _to_be_deleted;
+    std::shared_ptr<ClusterIdMgr> _cluster_id_mgr;
 
     // used to protect _current_shard and _tablet_set
     std::mutex _mutex;
@@ -164,16 +152,13 @@ private:
 
     static const uint32_t MAX_SHARD_NUM = 1024;
 
-    OlapMeta* _meta = nullptr;
+    KVStore* _kv_store = nullptr;
     RowsetIdGenerator* _id_generator = nullptr;
 
     std::mutex _check_path_mutex;
     std::condition_variable _cv;
     std::set<std::string> _all_check_paths;
     std::set<std::string> _all_tablet_schemahash_paths;
-
-    std::shared_mutex _pending_path_mutex;
-    std::set<std::string> _pending_path_ids;
 };
 
 } // namespace starrocks

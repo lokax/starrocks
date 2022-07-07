@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -15,6 +15,7 @@ template <typename T>
 class DecimalV3Column final : public ColumnFactory<FixedLengthColumnBase<T>, DecimalV3Column<DecimalType<T>>, Column> {
 public:
     DecimalV3Column() = default;
+    explicit DecimalV3Column(size_t num_rows);
     DecimalV3Column(int precision, int scale);
     DecimalV3Column(int precision, int scale, size_t num_rows);
 
@@ -30,9 +31,10 @@ public:
 
     MutableColumnPtr clone_empty() const override;
 
-    void put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx) const;
+    void put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx) const override;
     std::string debug_item(uint32_t idx) const override;
-    void crc32_hash(uint32_t* hash, uint16_t from, uint16_t to) const override;
+    void crc32_hash(uint32_t* hash, uint32_t from, uint32_t to) const override;
+    int64_t xor_checksum(uint32_t from, uint32_t to) const override;
 
 private:
     int _precision;

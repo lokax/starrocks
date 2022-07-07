@@ -2,7 +2,7 @@
 # encoding: utf-8
 
 """
- This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+ This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
  """
 
 import os
@@ -12,7 +12,6 @@ from string import Template
 import vectorized_functions
 
 sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
-import starrocks_builtins_functions
 
 license_string = """
 // Licensed to the Apache Software Foundation (ASF) under one
@@ -88,22 +87,6 @@ BuiltinFunctions::FunctionTables BuiltinFunctions::_fn_tables = {
 
 function_list = list()
 
-
-def check_function(vectorized_fn, starrocks_fn):
-    # NAME: [[RETURN_TYPE, ARG_TYPES], ...]
-    ids = set()
-    for vfn in vectorized_fn:
-        assert 5 <= len(vfn) <= 7, "Invalid function in vectorized_functions.py:\n\t" + repr(vfn)
-
-        if "..." in vfn[3]:
-            assert 2 <= len(vfn[3]), "Invalid arguments in vectorized_functions.py:\n\t" + repr(vfn)
-            assert "..." == vfn[3][-1], "variadic parameter must at the end:\n\t" + repr(vfn)
-
-        if vfn[0] in ids:
-            assert False, "Duplicate id in vectorized_functions.py:\n\t" + repr(vfn)
-
-        ids.add(vfn[0])
-
 def add_function(fn_data):
     entry = dict()
     entry["id"] = fn_data[0]
@@ -124,6 +107,11 @@ def add_function(fn_data):
     if len(fn_data) >= 7:
         entry["prepare"] = "&" + fn_data[5] if fn_data[5] != "nullptr" else "nullptr"
         entry["close"] = "&" + fn_data[6] if fn_data[6] != "nullptr" else "nullptr"
+    
+    if fn_data[-1] == True or fn_data[-1] == False:
+        entry["exception_safe"] = str(fn_data[-1]).lower()
+    else:
+        entry["exception_safe"] = "true"
 
     function_list.append(entry)
 
@@ -151,12 +139,17 @@ def generate_fe(path):
 
 def generate_cpp(path):
     def gen_be_fn(fnm):
+        res = ""
         if "prepare" in fnm:
-            return '{%d, {"%s", %d, %s, %s, %s}}' % (
+            res = '{%d, {"%s", %d, %s, %s, %s' % (
                 fnm["id"], fnm["name"], fnm["args_nums"], fnm["fn"], fnm["prepare"], fnm["close"])
         else:
-            return '{%d, {"%s", %d, %s}}' % (
+            res ='{%d, {"%s", %d, %s' % (
                 fnm["id"], fnm["name"], fnm["args_nums"], fnm["fn"])
+        if "exception_safe" in fnm:
+            res = res + ", " + str(fnm["exception_safe"])
+            
+        return res + "}}"
 
     value = dict()
     value["license"] = license_string
@@ -169,9 +162,6 @@ def generate_cpp(path):
 
 
 if __name__ == '__main__':
-    # check function metadata
-    check_function(vectorized_functions.vectorized_functions, starrocks_builtins_functions.visible_functions)
-
     # Read the function metadata inputs
     for function in vectorized_functions.vectorized_functions:
         add_function(function)

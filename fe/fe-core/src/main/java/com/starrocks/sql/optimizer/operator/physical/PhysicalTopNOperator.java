@@ -1,38 +1,71 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.operator.physical;
 
+import com.google.common.base.Preconditions;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptExpressionVisitor;
+import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.base.OrderSpec;
+import com.starrocks.sql.optimizer.base.Ordering;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.OperatorVisitor;
+import com.starrocks.sql.optimizer.operator.Projection;
 import com.starrocks.sql.optimizer.operator.SortPhase;
+import com.starrocks.sql.optimizer.operator.TopNType;
+import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
+import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 
+import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 public class PhysicalTopNOperator extends PhysicalOperator {
     private final long offset;
+    private final List<ColumnRefOperator> partitionByColumns;
+    private final long partitionLimit;
     private final SortPhase sortPhase;
+    private final TopNType topNType;
     private final boolean isSplit;
-
-    private boolean isEnforced;
+    private final boolean isEnforced;
 
     // If limit is -1, means global sort
     public PhysicalTopNOperator(OrderSpec spec, long limit, long offset,
+                                List<ColumnRefOperator> partitionByColumns,
+                                long partitionLimit,
                                 SortPhase sortPhase,
+                                TopNType topNType,
                                 boolean isSplit,
-                                boolean isEnforced) {
+                                boolean isEnforced,
+                                ScalarOperator predicate,
+                                Projection projection) {
         super(OperatorType.PHYSICAL_TOPN, spec);
         this.limit = limit;
         this.offset = offset;
+        this.partitionByColumns = partitionByColumns;
+        this.partitionLimit = partitionLimit;
         this.sortPhase = sortPhase;
+        this.topNType = topNType;
         this.isSplit = isSplit;
         this.isEnforced = isEnforced;
+        this.predicate = predicate;
+        this.projection = projection;
+    }
+
+    public List<ColumnRefOperator> getPartitionByColumns() {
+        return partitionByColumns;
+    }
+
+    public long getPartitionLimit() {
+        return partitionLimit;
     }
 
     public SortPhase getSortPhase() {
         return sortPhase;
+    }
+
+    public TopNType getTopNType() {
+        return topNType;
     }
 
     public boolean isSplit() {
@@ -76,4 +109,25 @@ public class PhysicalTopNOperator extends PhysicalOperator {
     public <R, C> R accept(OptExpressionVisitor<R, C> visitor, OptExpression optExpression, C context) {
         return visitor.visitPhysicalTopN(optExpression, context);
     }
+
+    public void fillDisableDictOptimizeColumns(ColumnRefSet resultSet, Set<Integer> dictColIds) {
+        // nothing to do
+    }
+
+    public boolean couldApplyStringDict(Set<Integer> childDictColumns) {
+        Preconditions.checkState(!childDictColumns.isEmpty());
+        ColumnRefSet dictSet = new ColumnRefSet();
+        for (Integer id : childDictColumns) {
+            dictSet.union(id);
+        }
+
+        for (Ordering orderDesc : orderSpec.getOrderDescs()) {
+            if (orderDesc.getColumnRef().getUsedColumns().isIntersect(dictSet)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
 }

@@ -2,7 +2,7 @@
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/kudu/blob/master/src/kudu/common/key_encoder.h
 
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 // Some code copy from Kudu
 // Licensed to the Apache Software Foundation (ASF) under one
@@ -22,10 +22,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "primary_key_encoder.h"
+#include "storage/primary_key_encoder.h"
 
-#include <string.h>
-
+#include <cstring>
+#include <memory>
 #include <type_traits>
 
 #include "column/binary_column.h"
@@ -33,8 +33,8 @@
 #include "column/fixed_length_column.h"
 #include "column/schema.h"
 #include "gutil/endian.h"
-#include "runtime/date_value.h"
 #include "storage/tablet_schema.h"
+#include "types/date_value.hpp"
 
 namespace starrocks {
 
@@ -93,7 +93,7 @@ void decode_integral(Slice* src, T* v) {
 
 template <int LEN>
 static bool SSEEncodeChunk(const uint8_t** srcp, uint8_t** dstp) {
-#ifdef __aarch64__
+#if defined(__aarch64__) || !defined(__SSE4_2__)
     return false;
 #else
     __m128i data;
@@ -207,7 +207,7 @@ inline Status decode_slice(Slice* src, string* dest, bool is_last) {
     } else {
         uint8_t* separator = static_cast<uint8_t*>(memmem(src->data, src->size, "\0\0", 2));
         DCHECK(separator) << "bad encoded primary key, separator not found";
-        if (PREDICT_FALSE(separator == NULL)) {
+        if (PREDICT_FALSE(separator == nullptr)) {
             LOG(WARNING) << "bad encoded primary key, separator not found";
             return Status::InvalidArgument("bad encoded primary key, separator not found");
         }
@@ -228,8 +228,7 @@ bool PrimaryKeyEncoder::is_supported(const vectorized::Field& f) {
     if (f.is_nullable()) {
         return false;
     }
-    auto type = f.type()->type();
-    switch (type) {
+    switch (f.type()->type()) {
     case OLAP_FIELD_TYPE_BOOL:
     case OLAP_FIELD_TYPE_TINYINT:
     case OLAP_FIELD_TYPE_SMALLINT:
@@ -271,7 +270,7 @@ size_t PrimaryKeyEncoder::get_encoded_fixed_size(const vectorized::Schema& schem
     for (size_t i = 0; i < n; i++) {
         auto t = schema.field(i)->type()->type();
         if (t == OLAP_FIELD_TYPE_VARCHAR || t == OLAP_FIELD_TYPE_CHAR) {
-            return -1;
+            return 0;
         }
         ret += TabletColumn::get_field_length_by_type(t, 0);
     }
@@ -311,7 +310,7 @@ Status PrimaryKeyEncoder::create_column(const vectorized::Schema& schema,
             *pcolumn = vectorized::Int128Column::create_mutable();
             break;
         case OLAP_FIELD_TYPE_VARCHAR:
-            pcolumn->reset(new vectorized::BinaryColumn());
+            *pcolumn = std::make_unique<vectorized::BinaryColumn>();
             break;
         case OLAP_FIELD_TYPE_DATE_V2:
             *pcolumn = vectorized::DateColumn::create_mutable();
@@ -325,7 +324,7 @@ Status PrimaryKeyEncoder::create_column(const vectorized::Schema& schema,
     } else {
         // composite keys encoding to binary
         // TODO(cbl): support fixed length encoded keys, e.g. (int32, int32) => int64
-        pcolumn->reset(new vectorized::BinaryColumn());
+        *pcolumn = std::make_unique<vectorized::BinaryColumn>();
     }
     return Status::OK();
 }

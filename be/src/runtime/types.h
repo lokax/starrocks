@@ -19,34 +19,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_RUNTIME_TYPES_H
-#define STARROCKS_BE_RUNTIME_TYPES_H
+#pragma once
 
 #include <string>
 #include <vector>
 
-#include "common/config.h"
 #include "gen_cpp/Types_types.h" // for TPrimitiveType
 #include "gen_cpp/types.pb.h"    // for PTypeDesc
 #include "runtime/primitive_type.h"
-#include "storage/hll.h"
 #include "thrift/protocol/TDebugProtocol.h"
+#include "types/constexpr.h"
 
 namespace starrocks {
+
+class TypeInfo;
 
 // Describes a type. Includes the enum, children types, and any type-specific metadata
 // (e.g. precision and scale for decimals).
 struct TypeDescriptor {
-    PrimitiveType type;
+    PrimitiveType type{INVALID_TYPE};
     /// Only meaningful for type TYPE_CHAR/TYPE_VARCHAR/TYPE_HLL
-    int len;
-    static constexpr int MAX_VARCHAR_LENGTH = 65533;
+    int len{-1};
+    static constexpr int MAX_VARCHAR_LENGTH = 1048576;
     static constexpr int MAX_CHAR_LENGTH = 255;
     static constexpr int MAX_CHAR_INLINE_LENGTH = 128;
+    static constexpr int DEFAULT_BITMAP_LENGTH = 128;
 
     /// Only set if type == TYPE_DECIMAL
-    int precision;
-    int scale;
+    int precision{-1};
+    int scale{-1};
 
     /// Must be kept in sync with FE's max precision/scale.
     static const int MAX_PRECISION = 38;
@@ -63,13 +64,11 @@ struct TypeDescriptor {
     /// Only set if type == TYPE_STRUCT. The field name of each child.
     std::vector<std::string> field_names;
 
-    TypeDescriptor() : type(INVALID_TYPE), len(-1), precision(-1), scale(-1) {}
+    TypeDescriptor() {}
 
     explicit TypeDescriptor(PrimitiveType type) : type(type), len(-1), precision(-1), scale(-1) {}
 
     static TypeDescriptor create_char_type(int len) {
-        DCHECK_GE(len, 1);
-        DCHECK_LE(len, MAX_CHAR_LENGTH);
         TypeDescriptor ret;
         ret.type = TYPE_CHAR;
         ret.len = len;
@@ -77,12 +76,17 @@ struct TypeDescriptor {
     }
 
     static TypeDescriptor create_varchar_type(int len) {
-        DCHECK_GE(len, 1);
-        DCHECK_LE(len, MAX_VARCHAR_LENGTH);
         TypeDescriptor ret;
         ret.type = TYPE_VARCHAR;
         ret.len = len;
         return ret;
+    }
+
+    static TypeDescriptor create_json_type() {
+        TypeDescriptor res;
+        res.type = TYPE_JSON;
+        res.len = kJsonDefaultSize;
+        return res;
     }
 
     static TypeDescriptor create_hll_type() {
@@ -129,6 +133,12 @@ struct TypeDescriptor {
         return ret;
     }
 
+    static TypeDescriptor create_bitmap_type() {
+        TypeDescriptor ret(TYPE_OBJECT);
+        ret.len = DEFAULT_BITMAP_LENGTH;
+        return ret;
+    }
+
     static TypeDescriptor from_primtive_type(PrimitiveType type,
                                              [[maybe_unused]] int len = TypeDescriptor::MAX_VARCHAR_LENGTH,
                                              [[maybe_unused]] int precision = 27, [[maybe_unused]] int scale = 9) {
@@ -149,6 +159,10 @@ struct TypeDescriptor {
             return TypeDescriptor::create_decimalv3_type(TYPE_DECIMAL64, precision, scale);
         case TYPE_DECIMAL128:
             return TypeDescriptor::create_decimalv3_type(TYPE_DECIMAL128, precision, scale);
+        case TYPE_JSON:
+            return TypeDescriptor::create_json_type();
+        case TYPE_OBJECT:
+            return TypeDescriptor::create_bitmap_type();
         default:
             return TypeDescriptor(type);
         }
@@ -159,6 +173,8 @@ struct TypeDescriptor {
         DCHECK_EQ(idx, t.types.size());
         return result;
     }
+
+    static TypeDescriptor from_storage_type_info(TypeInfo* type_info);
 
     static TypeDescriptor from_protobuf(const PTypeDesc& ptype) {
         int idx = 0;
@@ -184,6 +200,13 @@ struct TypeDescriptor {
         } else {
             return type == o.type;
         }
+    }
+
+    bool is_implicit_castable(const TypeDescriptor& from) const {
+        if (is_decimal_type()) {
+            return precision == from.precision && scale == from.scale;
+        }
+        return false;
     }
 
     bool operator==(const TypeDescriptor& o) const {
@@ -240,108 +263,19 @@ struct TypeDescriptor {
 
     inline bool is_collection_type() const { return type == TYPE_ARRAY || type == TYPE_MAP; }
 
-    /// Returns the byte size of this type.  Returns 0 for variable length types.
-    inline int get_byte_size() const {
-        switch (type) {
-        case TYPE_ARRAY:
-        case TYPE_MAP:
-        case TYPE_VARCHAR:
-        case TYPE_HLL:
-        case TYPE_OBJECT:
-        case TYPE_PERCENTILE:
-            return 0;
+    // Could this type be used at join on conjuncts
+    bool support_join() const;
+    // Could this type be used at order by clause
+    bool support_orderby() const;
+    // Could this type be used at group by clause
+    bool support_groupby() const;
 
-        case TYPE_NULL:
-        case TYPE_BOOLEAN:
-        case TYPE_TINYINT:
-            return 1;
-
-        case TYPE_SMALLINT:
-            return 2;
-
-        case TYPE_INT:
-        case TYPE_FLOAT:
-        case TYPE_DECIMAL32:
-            return 4;
-
-        case TYPE_BIGINT:
-        case TYPE_DOUBLE:
-        case TYPE_DECIMAL64:
-            return 8;
-
-        case TYPE_LARGEINT:
-        case TYPE_DATETIME:
-        case TYPE_DATE:
-        case TYPE_DECIMALV2:
-        case TYPE_DECIMAL128:
-            return 16;
-
-        case TYPE_DECIMAL:
-            return 40;
-
-        case INVALID_TYPE:
-        case TYPE_BINARY:
-        case TYPE_CHAR:
-        case TYPE_STRUCT:
-        case TYPE_TIME:
-            DCHECK(false);
-        }
-        return 0;
-    }
+    // For some types with potential huge length, whose memory consumption is far more than normal types,
+    // they need a different chunk_size setting
+    bool is_huge_type() const { return type == TYPE_JSON || type == TYPE_OBJECT || type == TYPE_HLL; }
 
     /// Returns the size of a slot for this type.
-    inline int get_slot_size() const {
-        switch (type) {
-        case TYPE_CHAR:
-        case TYPE_VARCHAR:
-        case TYPE_HLL:
-        case TYPE_OBJECT:
-        case TYPE_PERCENTILE:
-            return sizeof(StringValue);
-
-        case TYPE_NULL:
-        case TYPE_BOOLEAN:
-        case TYPE_TINYINT:
-            return 1;
-
-        case TYPE_SMALLINT:
-            return 2;
-
-        case TYPE_INT:
-        case TYPE_FLOAT:
-        case TYPE_DECIMAL32:
-            return 4;
-
-        case TYPE_BIGINT:
-        case TYPE_DOUBLE:
-        case TYPE_TIME:
-        case TYPE_DECIMAL64:
-            return 8;
-
-        case TYPE_DATE:
-        case TYPE_DATETIME:
-            // This is the size of the slot, the actual size of the data is 12.
-            return sizeof(DateTimeValue);
-
-        case TYPE_DECIMAL:
-            return sizeof(DecimalValue);
-
-        case TYPE_LARGEINT:
-        case TYPE_DECIMALV2:
-        case TYPE_DECIMAL128:
-            return 16;
-        case TYPE_ARRAY:
-            return sizeof(void*); // sizeof(Collection*)
-        case INVALID_TYPE:
-        case TYPE_BINARY:
-        case TYPE_STRUCT:
-        case TYPE_MAP:
-            DCHECK(false);
-            break;
-        }
-        // For llvm complain
-        return -1;
-    }
+    int get_slot_size() const;
 
     static inline int get_decimal_byte_size(int precision) {
         DCHECK_GT(precision, 0);
@@ -377,5 +311,3 @@ inline std::ostream& operator<<(std::ostream& os, const TypeDescriptor& type) {
 }
 
 } // namespace starrocks
-
-#endif

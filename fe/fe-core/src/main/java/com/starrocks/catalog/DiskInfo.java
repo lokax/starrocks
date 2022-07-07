@@ -25,6 +25,7 @@ import com.starrocks.common.Config;
 import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TStorageMedium;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -44,6 +45,7 @@ public class DiskInfo implements Writable {
     private static final long DEFAULT_CAPACITY_B = 1024 * 1024 * 1024 * 1024L; // 1T
 
     private String rootPath;
+    // disk capacity
     private long totalCapacityB;
     private long dataUsedCapacityB;
     private long diskAvailableCapacityB;
@@ -61,7 +63,7 @@ public class DiskInfo implements Writable {
         this.rootPath = rootPath;
         this.totalCapacityB = DEFAULT_CAPACITY_B;
         this.dataUsedCapacityB = 0;
-        this.diskAvailableCapacityB = DEFAULT_CAPACITY_B;
+        this.diskAvailableCapacityB = totalCapacityB;
         this.state = DiskState.ONLINE;
         this.pathHash = 0;
         this.storageMedium = TStorageMedium.HDD;
@@ -77,6 +79,15 @@ public class DiskInfo implements Writable {
 
     public void setTotalCapacityB(long totalCapacityB) {
         this.totalCapacityB = totalCapacityB;
+    }
+
+    /**
+     * OtherUsed (totalCapacityB - diskAvailableCapacityB - dataUsedCapacityB) may hold a lot of disk space,
+     * disk usage percent = DataUsedCapacityB / TotalCapacityB in balance,
+     * using dataUsedCapacityB + diskAvailableCapacityB as total capacity is more reasonable.
+     */
+    public long getDataTotalCapacityB() {
+        return dataUsedCapacityB + diskAvailableCapacityB;
     }
 
     public long getDataUsedCapacityB() {
@@ -154,8 +165,9 @@ public class DiskInfo implements Writable {
     @Override
     public String toString() {
         return "DiskInfo [rootPath=" + rootPath + "(" + pathHash + "), totalCapacityB=" + totalCapacityB
-                + ", dataUsedCapacityB=" + dataUsedCapacityB + ", diskAvailableCapacityB="
-                + diskAvailableCapacityB + ", state=" + state + ", medium: " + storageMedium + "]";
+                + ", dataTotalCapacityB=" + getDataTotalCapacityB() + ", dataUsedCapacityB=" + dataUsedCapacityB
+                + ", diskAvailableCapacityB=" + diskAvailableCapacityB + ", state=" + state
+                + ", medium: " + storageMedium + "]";
     }
 
     @Override
@@ -170,7 +182,7 @@ public class DiskInfo implements Writable {
     public void readFields(DataInput in) throws IOException {
         this.rootPath = Text.readString(in);
         this.totalCapacityB = in.readLong();
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_36) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_36) {
             this.dataUsedCapacityB = in.readLong();
             this.diskAvailableCapacityB = in.readLong();
         } else {

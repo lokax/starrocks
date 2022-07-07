@@ -1,8 +1,9 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
 #include "column/column.h"
+#include "column/datum.h"
 #include "common/logging.h"
 
 namespace starrocks::vectorized {
@@ -14,21 +15,17 @@ public:
     explicit ConstColumn(ColumnPtr data_column);
     ConstColumn(ColumnPtr data_column, size_t size);
 
-    // Copy constructor
     ConstColumn(const ConstColumn& rhs) : _data(rhs._data->clone_shared()), _size(rhs._size) {}
 
-    // Move constructor
     ConstColumn(ConstColumn&& rhs) noexcept : _data(std::move(rhs._data)), _size(rhs._size) {}
 
-    // Copy assignment
     ConstColumn& operator=(const ConstColumn& rhs) {
         ConstColumn tmp(rhs);
         this->swap_column(tmp);
         return *this;
     }
 
-    // Move assignment
-    ConstColumn& operator=(ConstColumn&& rhs) {
+    ConstColumn& operator=(ConstColumn&& rhs) noexcept {
         ConstColumn tmp(std::move(rhs));
         this->swap_column(tmp);
         return *this;
@@ -40,7 +37,7 @@ public:
 
     bool is_null(size_t index) const override { return _data->is_null(0); }
 
-    bool only_null() const override { return _data->is_nullable(); }
+    bool only_null() const override { return _data->is_null(0); }
 
     bool has_null() const override { return _data->has_null(); }
 
@@ -53,6 +50,8 @@ public:
     uint8_t* mutable_raw_data() override { return reinterpret_cast<uint8_t*>(_data->mutable_raw_data()); }
 
     size_t size() const override { return _size; }
+
+    size_t capacity() const override { return UINT32_MAX; }
 
     size_t type_size() const override { return _data->type_size(); }
 
@@ -103,7 +102,7 @@ public:
         }
     }
 
-    bool append_strings(const std::vector<Slice>& strs) override { return false; }
+    bool append_strings(const Buffer<Slice>& strs) override { return false; }
 
     size_t append_numbers(const void* buff, size_t length) override { return -1; }
 
@@ -116,6 +115,10 @@ public:
     void append_default() override { _size++; }
 
     void append_default(size_t count) override { _size += count; }
+
+    void fill_default(const Filter& filter) override;
+
+    Status update_rows(const Column& src, const uint32_t* indexes) override;
 
     uint32_t serialize(size_t idx, uint8_t* pos) override { return _data->serialize(0, pos); }
 
@@ -137,14 +140,14 @@ public:
         return pos + _data->serialize_size(0);
     }
 
-    void deserialize_and_append_batch(std::vector<Slice>& srcs, size_t batch_size) override {
-        _size += batch_size;
+    void deserialize_and_append_batch(Buffer<Slice>& srcs, size_t chunk_size) override {
+        _size += chunk_size;
         if (_data->empty()) {
             _data->deserialize_and_append((uint8_t*)srcs[0].data);
         }
         uint32_t serialize_size = _data->serialize_size(0);
         // Note: we must update the pos
-        for (size_t i = 0; i < batch_size; i++) {
+        for (size_t i = 0; i < chunk_size; i++) {
             srcs[0].data = srcs[0].data + serialize_size;
         }
     }
@@ -153,21 +156,17 @@ public:
 
     uint32_t serialize_size(size_t idx) const override { return _data->serialize_size(0); }
 
-    size_t serialize_size() const override { return _data->serialize_size() + sizeof(size_t); }
-
-    uint8_t* serialize_column(uint8_t* dst) override;
-
-    const uint8_t* deserialize_column(const uint8_t* src) override;
-
     MutableColumnPtr clone_empty() const override { return create_mutable(_data->clone_empty(), 0); }
 
     size_t filter_range(const Column::Filter& filter, size_t from, size_t to) override;
 
     int compare_at(size_t left, size_t right, const Column& rhs, int nan_direction_hint) const override;
 
-    void fvn_hash(uint32_t* hash, uint16_t from, uint16_t to) const override;
+    void fnv_hash(uint32_t* hash, uint32_t from, uint32_t to) const override;
 
-    void crc32_hash(uint32_t* hash, uint16_t from, uint16_t to) const override;
+    void crc32_hash(uint32_t* hash, uint32_t from, uint32_t to) const override;
+
+    int64_t xor_checksum(uint32_t from, uint32_t to) const override;
 
     void put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx) const override { _data->put_mysql_row_buffer(buf, 0); }
 
@@ -180,8 +179,6 @@ public:
     Datum get(size_t n __attribute__((unused))) const override { return _data->get(0); }
 
     size_t memory_usage() const override { return _data->memory_usage() + sizeof(size_t); }
-
-    size_t shrink_memory_usage() const override { return _data->shrink_memory_usage() + sizeof(size_t); }
 
     size_t container_memory_usage() const override { return _data->container_memory_usage(); }
 
@@ -217,9 +214,28 @@ public:
         return ss.str();
     }
 
+    bool capacity_limit_reached(std::string* msg = nullptr) const override {
+        RETURN_IF_UNLIKELY(_data->capacity_limit_reached(msg), true);
+        if (_size > Column::MAX_CAPACITY_LIMIT) {
+            if (msg != nullptr) {
+                msg->append("Row count of const column reach limit: " + std::to_string(Column::MAX_CAPACITY_LIMIT));
+            }
+            return true;
+        }
+        return false;
+    }
+
+    void check_or_die() const override;
+
+    StatusOr<ColumnPtr> upgrade_if_overflow() override;
+
+    StatusOr<ColumnPtr> downgrade() override;
+
+    bool has_large_column() const override { return _data->has_large_column(); }
+
 private:
     ColumnPtr _data;
-    size_t _size;
+    uint64_t _size;
 };
 
 } // namespace starrocks::vectorized

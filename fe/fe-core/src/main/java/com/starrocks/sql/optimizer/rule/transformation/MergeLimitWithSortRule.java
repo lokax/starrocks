@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
@@ -21,7 +21,11 @@ public class MergeLimitWithSortRule extends TransformationRule {
 
     public boolean check(final OptExpression input, OptimizerContext context) {
         LogicalTopNOperator topN = (LogicalTopNOperator) input.getInputs().get(0).getOp();
-        return !topN.hasLimit();
+        LogicalLimitOperator limit = ((LogicalLimitOperator) input.getOp());
+
+        // Merge Init-Limit/Local-limit and Sort
+        // Local-limit may be generate at MergeLimitWithLimitRule
+        return (limit.isInit() || limit.isLocal()) && !topN.hasLimit();
     }
 
     @Override

@@ -21,12 +21,15 @@
 
 package com.starrocks.catalog;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
 import com.starrocks.catalog.Table.TableType;
+import com.starrocks.catalog.lake.LakeTablet;
 import com.starrocks.common.ClientPool;
 import com.starrocks.common.Config;
 import com.starrocks.common.util.MasterDaemon;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.thrift.BackendService;
 import com.starrocks.thrift.TNetworkAddress;
@@ -46,12 +49,12 @@ public class TabletStatMgr extends MasterDaemon {
     private static final Logger LOG = LogManager.getLogger(TabletStatMgr.class);
 
     public TabletStatMgr() {
-        super("tablet stat mgr", Config.tablet_stat_update_interval_second * 1000);
+        super("tablet stat mgr", Config.tablet_stat_update_interval_second * 1000L);
     }
 
     @Override
     protected void runAfterCatalogReady() {
-        ImmutableMap<Long, Backend> backends = Catalog.getCurrentSystemInfo().getIdToBackend();
+        ImmutableMap<Long, Backend> backends = GlobalStateMgr.getCurrentSystemInfo().getIdToBackend();
 
         long start = System.currentTimeMillis();
         for (Backend backend : backends.values()) {
@@ -82,9 +85,9 @@ public class TabletStatMgr extends MasterDaemon {
 
         // after update replica in all backends, update index row num
         start = System.currentTimeMillis();
-        List<Long> dbIds = Catalog.getCurrentCatalog().getDbIds();
+        List<Long> dbIds = GlobalStateMgr.getCurrentState().getDbIds();
         for (Long dbId : dbIds) {
-            Database db = Catalog.getCurrentCatalog().getDb(dbId);
+            Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
             if (db == null) {
                 continue;
             }
@@ -98,18 +101,10 @@ public class TabletStatMgr extends MasterDaemon {
                     OlapTable olapTable = (OlapTable) table;
                     for (Partition partition : olapTable.getAllPartitions()) {
                         long version = partition.getVisibleVersion();
-                        long versionHash = partition.getVisibleVersionHash();
                         for (MaterializedIndex index : partition.getMaterializedIndices(IndexExtState.VISIBLE)) {
                             long indexRowCount = 0L;
                             for (Tablet tablet : index.getTablets()) {
-                                long tabletRowCount = 0L;
-                                for (Replica replica : tablet.getReplicas()) {
-                                    if (replica.checkVersionCatchUp(version, versionHash, false)
-                                            && replica.getRowCount() > tabletRowCount) {
-                                        tabletRowCount = replica.getRowCount();
-                                    }
-                                }
-                                indexRowCount += tabletRowCount;
+                                indexRowCount += tablet.getRowCount(version);
                             } // end for tablets
                             index.setRowCount(indexRowCount);
                         } // end for indices
@@ -126,20 +121,58 @@ public class TabletStatMgr extends MasterDaemon {
     }
 
     private void updateTabletStat(Long beId, TTabletStatResult result) {
-        TabletInvertedIndex invertedIndex = Catalog.getCurrentInvertedIndex();
+        TabletInvertedIndex invertedIndex = GlobalStateMgr.getCurrentInvertedIndex();
 
         for (Map.Entry<Long, TTabletStat> entry : result.getTablets_stats().entrySet()) {
-            if (invertedIndex.getTabletMeta(entry.getKey()) == null) {
+            long tabletId = entry.getKey();
+            TabletMeta tabletMeta = invertedIndex.getTabletMeta(tabletId);
+            if (tabletMeta == null) {
                 // the replica is obsolete, ignore it.
                 continue;
             }
-            Replica replica = invertedIndex.getReplica(entry.getKey(), beId);
-            if (replica == null) {
-                // replica may be deleted from catalog, ignore it.
-                continue;
+
+            TTabletStat tabletStat = entry.getValue();
+            if (tabletMeta.isUseStarOS()) {
+                Database db = GlobalStateMgr.getCurrentState().getDb(tabletMeta.getDbId());
+                if (db == null) {
+                    continue;
+                }
+                db.writeLock();
+                try {
+                    Table table = db.getTable(tabletMeta.getTableId());
+                    if (table == null || !(table instanceof OlapTable)) {
+                        continue;
+                    }
+                    OlapTable olapTable = (OlapTable) table;
+                    Partition partition = olapTable.getPartition(tabletMeta.getPartitionId());
+                    if (partition == null) {
+                        continue;
+                    }
+                    MaterializedIndex index = partition.getIndex(tabletMeta.getIndexId());
+                    if (index == null) {
+                        continue;
+                    }
+                    Tablet tablet = index.getTablet(tabletId);
+                    if (tablet == null) {
+                        continue;
+                    }
+
+                    Preconditions.checkState(tablet instanceof LakeTablet);
+                    LakeTablet lakeTablet = (LakeTablet) tablet;
+                    lakeTablet.setDataSize(tabletStat.getData_size());
+                    lakeTablet.setRowCount(tabletStat.getRow_num());
+                } finally {
+                    db.writeUnlock();
+                }
+            } else {
+                Replica replica = invertedIndex.getReplica(entry.getKey(), beId);
+                if (replica == null) {
+                    // replica may be deleted from globalStateMgr, ignore it.
+                    continue;
+                }
+                // TODO(cmy) no db lock protected. I think it is ok even we get wrong row num
+                replica.updateStat(tabletStat.getData_size(), tabletStat.getRow_num());
             }
-            // TODO(cmy) no db lock protected. I think it is ok even we get wrong row num
-            replica.updateStat(entry.getValue().getData_size(), entry.getValue().getRow_num());
         }
     }
 }

@@ -1,43 +1,37 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer;
 
-import com.starrocks.analysis.SqlParser;
-import com.starrocks.analysis.SqlScanner;
 import com.starrocks.analysis.StatementBase;
-import com.starrocks.catalog.Catalog;
-import com.starrocks.common.util.SqlParserUtils;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.sql.analyzer.Analyzer;
-import com.starrocks.sql.analyzer.relation.Relation;
+import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.transformer.LogicalPlan;
 import com.starrocks.sql.optimizer.transformer.RelationTransformer;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
-import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.ErrorCollector;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
-import java.io.StringReader;
-import java.util.UUID;
 
 public class TransformerTest {
-    // use a unique dir so that it won't be conflict with other unit test which
-    // may also start a Mocked Frontend
-    private static String runningDir = "fe/mocked/TransformerTest/" + UUID.randomUUID().toString() + "/";
-
     private static ConnectContext connectContext;
     private static StarRocksAssert starRocksAssert;
     private static String DB_NAME = "test";
 
+    @Rule
+    public ErrorCollector collector = new ErrorCollector();
+
     @BeforeClass
     public static void beforeClass() throws Exception {
-        UtFrameUtils.createMinStarRocksCluster(runningDir);
+        UtFrameUtils.createMinStarRocksCluster();
 
         // create connect context
         connectContext = UtFrameUtils.createDefaultCtx();
@@ -104,12 +98,6 @@ public class TransformerTest {
                 ");");
     }
 
-    @AfterClass
-    public static void tearDown() {
-        File file = new File(runningDir);
-        file.delete();
-    }
-
     @Test
     public void testSingle() {
         runUnitTest("scan");
@@ -135,20 +123,23 @@ public class TransformerTest {
         runUnitTest("subquery");
     }
 
-    public static void analyzeAndBuildOperator(String originStmt, String operatorString, String except) {
+    public static void analyzeAndBuildOperator(String originStmt, String operatorString, String except,
+                                               ErrorCollector collector) {
         try {
-            SqlScanner input =
-                    new SqlScanner(new StringReader(originStmt), connectContext.getSessionVariable().getSqlMode());
-            SqlParser parser = new SqlParser(input);
-            StatementBase statementBase = SqlParserUtils.getFirstStmt(parser);
+            StatementBase statementBase = com.starrocks.sql.parser.SqlParser.parse(originStmt,
+                    connectContext.getSessionVariable().getSqlMode()).get(0);
 
-            Analyzer analyzer = new Analyzer(Catalog.getCurrentCatalog(), connectContext);
-            Relation relation = analyzer.analyze(statementBase);
-            LogicalPlan logicalPlan = new RelationTransformer(new ColumnRefFactory()).transform(relation);
+            Analyzer.analyze(statementBase, connectContext);
+            LogicalPlan logicalPlan = new RelationTransformer(new ColumnRefFactory(), connectContext)
+                    .transform(((QueryStatement) statementBase).getQueryRelation());
 
             OperatorStrings operatorPrinter = new OperatorStrings();
-            Assert.assertEquals(operatorString.substring(0, operatorString.length() - 1),
-                    operatorPrinter.printOperator(logicalPlan.getRoot()));
+            try {
+                Assert.assertEquals(operatorString.substring(0, operatorString.length() - 1),
+                        operatorPrinter.printOperator(logicalPlan.getRoot()));
+            } catch (Error error) {
+                collector.addError(new Throwable("\n" + originStmt, error));
+            }
         } catch (Exception ex) {
             if (!except.isEmpty()) {
                 Assert.assertEquals(ex.getMessage(), except);
@@ -197,7 +188,7 @@ public class TransformerTest {
                     mode = "except";
                     continue;
                 } else if (tempStr.equals("[end]")) {
-                    analyzeAndBuildOperator(sql, result, except);
+                    analyzeAndBuildOperator(sql, result, except, collector);
                     continue;
                 }
 

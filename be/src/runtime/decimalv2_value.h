@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_RUNTIME_DECIMALV2_VALUE_H
-#define STARROCKS_BE_SRC_RUNTIME_DECIMALV2_VALUE_H
+#pragma once
 
 #include <cctype>
 #include <climits>
@@ -33,7 +32,6 @@
 #include "common/logging.h"
 #include "runtime/decimal_value.h"
 #include "storage/decimal12.h"
-#include "udf/udf.h"
 #include "util/hash_util.hpp"
 
 namespace starrocks {
@@ -60,7 +58,7 @@ public:
     static const int128_t MAX_DECIMAL_VALUE = static_cast<int128_t>(MAX_INT64) * ONE_BILLION + MAX_FRAC_VALUE;
     static const int128_t MIN_DECIMAL_VALUE = -MAX_DECIMAL_VALUE;
 
-    DecimalV2Value() : _value(0) {}
+    DecimalV2Value() {}
     inline const int128_t& value() const { return _value; }
     inline int128_t& value() { return _value; }
 
@@ -194,10 +192,6 @@ public:
 
     static DecimalV2Value get_max_decimal() { return DecimalV2Value(MAX_INT_VALUE, MAX_FRAC_VALUE); }
 
-    static DecimalV2Value from_decimal_val(const DecimalV2Val& val) { return DecimalV2Value(val.value()); }
-
-    void to_decimal_val(DecimalV2Val* value) const { value->val = _value; }
-
     // set DecimalV2Value to zero
     void set_to_zero() { _value = 0; }
 
@@ -266,7 +260,7 @@ public:
     static DecimalV2Value ONE;
 
 private:
-    int128_t _value;
+    int128_t _value{0};
 };
 
 DecimalV2Value operator+(const DecimalV2Value& v1, const DecimalV2Value& v2);
@@ -290,5 +284,3 @@ struct hash<starrocks::DecimalV2Value> {
     size_t operator()(const starrocks::DecimalV2Value& v) const { return starrocks::hash_value(v); }
 };
 } // namespace std
-
-#endif // STARROCKS_BE_SRC_RUNTIME_DECIMALV2_VALUE_H

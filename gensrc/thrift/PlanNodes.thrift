@@ -27,6 +27,7 @@ include "Types.thrift"
 include "Opcodes.thrift"
 include "Descriptors.thrift"
 include "Partitions.thrift"
+include "RuntimeFilter.thrift"
 
 enum TPlanNodeType {
   OLAP_SCAN_NODE,
@@ -59,6 +60,9 @@ enum TPlanNodeType {
   HDFS_SCAN_NODE,
   PROJECT_NODE,
   TABLE_FUNCTION_NODE,
+  DECODE_NODE,
+  JDBC_SCAN_NODE,
+  LAKE_SCAN_NODE
 }
 
 // phases of an execution node
@@ -174,6 +178,10 @@ struct TBrokerScanRangeParams {
     10: optional bool strict_mode
     // If multi_column_separator is set, column_separator becomes ignore.
     11: optional string multi_column_separator;
+    // If multi_row_delimiter is set, row_delimiter will ignore.
+    12: optional string multi_row_delimiter;
+    // If non_blocking_read is set, stream_load_pipe will not block while performing read io
+    13: optional bool non_blocking_read;
 }
 
 // Broker scan range
@@ -213,6 +221,12 @@ struct THdfsScanRange {
 
     // file format of hdfs file
     6: optional Descriptors.THdfsFileFormat file_format
+
+    // text file desc
+    7: optional Descriptors.TTextFileDesc text_file_desc
+    
+    // for iceberg table scanrange should contains the full path of file
+    8: optional string full_path
 }
 
 // Specification of an individual data range which is held in its entirety
@@ -233,6 +247,7 @@ struct TMySQLScanNode {
   2: required string table_name
   3: required list<string> columns
   4: required list<string> filters
+  5: optional i64 limit
 }
 
 struct TFileScanNode {
@@ -241,6 +256,7 @@ struct TFileScanNode {
     // Partition info used to process partition select in broker load
     2: optional list<Exprs.TExpr> partition_exprs
     3: optional list<Partitions.TRangePartition> partition_infos
+    4: optional bool enable_pipeline_load
 }
 
 struct TEsScanNode {
@@ -278,32 +294,6 @@ struct TEsScanNode {
     4: optional map<string, string> fields_context
 }
 
-struct TMiniLoadEtlFunction {
-  1: required string function_name
-  2: required i32 param_column_index
-}
-
-struct TCsvScanNode {
-  1: required Types.TTupleId tuple_id
-  2: required list<string> file_paths
-
-  3: optional string column_separator
-  4: optional string row_delimiter
-
-  // <column_name, ColumnType>
-  5: optional map<string, Types.TColumnType> column_type_mapping
-
-  // columns specified in load command
-  6: optional list<string> columns
-  // <column_name, default_value_in_string>
-  7: optional list<string> unspecified_columns
-  // always string type, and only contain columns which are not specified
-  8: optional list<string> default_values
-
-  9: optional double max_filter_ratio
-  10:optional map<string, TMiniLoadEtlFunction> column_function_mapping
-}
-
 struct TSchemaScanNode {
   1: required Types.TTupleId tuple_id
 
@@ -319,14 +309,6 @@ struct TSchemaScanNode {
   11: optional Types.TUserIdentity current_user_ident   // to replace the user and user_ip
 }
 
-struct TMetaScanNode {
-  1: required Types.TTupleId tuple_id
-  2: required string table_name
-  3: optional string db
-  4: optional string table
-  5: optional string user
-}
-
 struct TOlapScanNode {
   1: required Types.TTupleId tuple_id
   2: required list<string> key_column_name
@@ -336,7 +318,35 @@ struct TOlapScanNode {
   // For profile attributes' printing: `Rollup` `Predicates`
   20: optional string rollup_name
   21: optional string sql_predicates
+  22: optional bool enable_column_expr_predicate
+  23: optional map<i32, i32> dict_string_id_to_int_ids
+  // which columns only be used to filter data in the stage of scan data
+  24: optional list<string> unused_output_column_name
 }
+
+struct TJDBCScanNode {
+  1: optional Types.TTupleId tuple_id
+  2: optional string table_name
+  3: optional list<string> columns
+  4: optional list<string> filters
+  5: optional i64 limit
+}
+
+struct TLakeScanNode {
+  1: required Types.TTupleId tuple_id
+  2: required list<string> key_column_name
+  3: required list<Types.TPrimitiveType> key_column_type
+  4: required bool is_preaggregation
+  5: optional string sort_column
+  // For profile attributes' printing: `Rollup` `Predicates`
+  6: optional string rollup_name
+  7: optional string sql_predicates
+  8: optional bool enable_column_expr_predicate
+  9: optional map<i32, i32> dict_string_id_to_int_ids
+  // which columns only be used to filter data in the stage of scan data
+  10: optional list<string> unused_output_column_name
+}
+
 struct TEqJoinCondition {
   // left-hand side of "<a> = <b>"
   1: required Exprs.TExpr left;
@@ -359,7 +369,6 @@ enum TJoinOp {
   RIGHT_OUTER_JOIN,
   FULL_OUTER_JOIN,
   CROSS_JOIN,
-  MERGE_JOIN,
 
   RIGHT_SEMI_JOIN,
   LEFT_ANTI_JOIN,
@@ -370,6 +379,16 @@ enum TJoinOp {
   // be rejected (ANTI-join), based on the other join conjuncts. This is in contrast
   // to LEFT_ANTI_JOIN where NULLs are not matches and therefore always returned.
   NULL_AWARE_LEFT_ANTI_JOIN
+}
+
+enum TJoinDistributionMode {
+  NONE,
+  BROADCAST,
+  PARTITIONED,
+  LOCAL_HASH_BUCKET,
+  SHUFFLE_HASH_BUCKET,
+  COLOCATE,
+  REPLICATED
 }
 
 struct THashJoinNode {
@@ -395,17 +414,48 @@ struct THashJoinNode {
   22: optional string sql_predicates
 
   // runtime filters built by this node.
-  50: optional list<TRuntimeFilterDescription> build_runtime_filters;
+  50: optional list<RuntimeFilter.TRuntimeFilterDescription> build_runtime_filters;
   51: optional bool build_runtime_filters_from_planner;
+
+  52: optional TJoinDistributionMode distribution_mode;
+  53: optional list<Exprs.TExpr> partition_exprs
+  54: optional list<Types.TSlotId> output_columns
 }
 
 struct TMergeJoinNode {
+  1: optional TJoinOp join_op
+
   // anything from the ON, USING or WHERE clauses that's an equi-join predicate
-  1: required list<TEqJoinCondition> cmp_conjuncts
+  2: optional list<TEqJoinCondition> eq_join_conjuncts
 
   // anything from the ON or USING clauses (but *not* the WHERE clause) that's not an
   // equi-join predicate
-  2: optional list<Exprs.TExpr> other_join_conjuncts
+  3: optional list<Exprs.TExpr> other_join_conjuncts
+  4: optional bool is_push_down
+
+  // If true, this join node can (but may choose not to) generate slot filters
+  // after constructing the build side that can be applied to the probe side.
+  5: optional bool add_probe_filters
+
+  // Mark left anti join whether rewritten from not in
+  20: optional bool is_rewritten_from_not_in
+
+  // for profiling
+  21: optional string sql_join_predicates
+  22: optional string sql_predicates
+
+  // runtime filters built by this node.
+  50: optional list<RuntimeFilter.TRuntimeFilterDescription> build_runtime_filters;
+  51: optional bool build_runtime_filters_from_planner;
+
+  52: optional TJoinDistributionMode distribution_mode;
+  53: optional list<Exprs.TExpr> partition_exprs
+  54: optional list<Types.TSlotId> output_columns
+}
+
+struct TNestLoopJoinNode {
+    1: optional TJoinOp join_op
+    2: optional list<RuntimeFilter.TRuntimeFilterDescription> build_runtime_filters;
 }
 
 enum TAggregationOp {
@@ -429,6 +479,8 @@ enum TAggregationOp {
   LAG,
   HLL_C,
   BITMAP_UNION,
+  ANY_VALUE,
+  NTILE
 }
 
 //struct TAggregateFunctionCall {
@@ -469,6 +521,8 @@ struct TAggregationNode {
   // For profile attributes' printing: `Grouping Keys` `Aggregate Functions`
   22: optional string sql_grouping_keys
   23: optional string sql_aggregate_functions
+
+  24: optional i32 agg_func_set_version = 1
 }
 
 struct TRepeatNode {
@@ -484,11 +538,6 @@ struct TRepeatNode {
   5: required set<Types.TSlotId> all_slot_ids
 }
 
-struct TPreAggregationNode {
-  1: required list<Exprs.TExpr> group_exprs
-  2: required list<Exprs.TExpr> aggregate_exprs
-}
-
 struct TSortInfo {
   1: required list<Exprs.TExpr> ordering_exprs
   2: required list<bool> is_asc_order
@@ -498,6 +547,12 @@ struct TSortInfo {
   // Expressions evaluated over the input row that materialize the tuple to be sorted.
   // Contains one expr per slot in the materialized tuple.
   4: optional list<Exprs.TExpr> sort_tuple_slot_exprs
+}
+
+enum TTopNType {
+  ROW_NUMBER,
+  RANK,
+  DENSE_RANK
 }
 
 struct TSortNode {
@@ -523,6 +578,13 @@ struct TSortNode {
   20: optional bool has_outer_join_child
   // For profile attributes' printing: `Sort Keys`
   21: optional string sql_sort_keys
+  // For pipeline execution engine, interpolate local shuffle before PartitionSortOperator
+  // in order to eliminate time-consuming LocalMergeSortSourceOperator and parallelize
+  // AnalyticNode
+  22: optional list<Exprs.TExpr> analytic_partition_exprs
+  23: optional list<Exprs.TExpr> partition_exprs
+  24: optional i64 partition_limit
+  25: optional TTopNType topn_type;
 }
 
 enum TAnalyticWindowType {
@@ -611,6 +673,11 @@ struct TAnalyticNode {
   // should be evaluated over a row that is composed of the child tuple and the buffered
   // tuple
   9: optional Exprs.TExpr order_by_eq
+
+  // For profile attributes' printing: `Partition Keys` `Aggregate Functions`
+  10: optional string sql_partition_keys
+  11: optional string sql_aggregate_functions
+
   20: optional bool has_outer_join_child
 }
 
@@ -671,6 +738,8 @@ struct TExchangeNode {
   2: optional TSortInfo sort_info
   // This is tHe number of rows to skip before returning results
   3: optional i64 offset
+  // Sender's partition type
+  4: optional Partitions.TPartitionType partition_type;
 }
 
 // This contains all of the information computed by the plan as part of the resource
@@ -707,17 +776,13 @@ struct TAssertNumRowsNode {
     3: optional TAssertion assertion;
 }
 
-struct TAdapterNode {
-    1: required Types.TTupleId tuple_id
-}
-
 struct THdfsScanNode {
     1: optional Types.TTupleId tuple_id
 
     // Conjuncts that can be evaluated while materializing the items (tuples) of
     // collection-typed slots. Maps from item tuple id to the list of conjuncts
     // to be evaluated.
-    2: optional map<Types.TTupleId, list<Exprs.TExpr>> collection_conjuncts
+    2: optional map<Types.TTupleId, list<Exprs.TExpr>> DEPRECATED_collection_conjuncts
 
     // Conjuncts that can be evaluated against parquet::Statistics using the tuple
     // referenced by 'min_max_tuple_id'.
@@ -727,7 +792,7 @@ struct THdfsScanNode {
     4: optional Types.TTupleId min_max_tuple_id
 
     // The conjuncts that are eligible for dictionary filtering.
-    5: optional map<Types.TSlotId, list<i32>> dictionary_filter_conjuncts
+    5: optional map<Types.TSlotId, list<i32>> DEPRECATED_dictionary_filter_conjuncts
 
     // conjuncts in TPlanNode contains non-partition filters if node_type is HDFS_SCAN_NODE.
     // partition_conjuncts contains partition filters that are not evaled by pruner.
@@ -735,6 +800,15 @@ struct THdfsScanNode {
 
     // hive colunm names in ordinal order.
     7: optional list<string> hive_column_names;
+
+    // table name it scans
+    8: optional string table_name;
+
+    // conjuncts in explained string
+    9: optional string sql_predicates;
+    10: optional string min_max_sql_predicates;
+    11: optional string partition_sql_predicates;
+
 }
 
 struct TProjectNode {
@@ -743,44 +817,19 @@ struct TProjectNode {
     2: optional map<Types.TSlotId, Exprs.TExpr> common_slot_map
 }
 
-enum TRuntimeFilterBuildJoinMode {
-  NONE,
-  BORADCAST,
-  PARTITIONED,
-  BUCKET_SHUFFLE,
-  COLOCATE
+struct TMetaScanNode {
+    // column id to column name
+    1: optional map<i32, string> id_to_names
 }
 
-struct TRuntimeFilterDescription {
-  // Filter unique id (within a query)
-  1: optional i32 filter_id
+struct TDecodeNode {
+    // dict int column id to string column id
+    1: optional map<i32, i32> dict_id_to_string_ids
+    2: optional map<Types.TSlotId, Exprs.TExpr> string_functions
+}
 
-  // Expr on which the filter is built on a hash join.
-  2: optional Exprs.TExpr build_expr
-
-  // The order of Expr in join predicate
-  3: optional i32 expr_order
-
-  // Map of target node id to the probe expr of target node.
-  4: optional map<Types.TPlanNodeId, Exprs.TExpr> plan_node_id_to_target_expr
-
-  // Indicates if there is at least one target scan node that is not in the same
-  // fragment as the join node that produced the runtime filter
-  6: optional bool has_remote_targets;
-
-  // The size of the bloom filter. For global rf, it should be specified.
-  // And for local rf, build side can choose bloom filter size at his will.
-  7: optional i64 bloom_filter_size
-
-  // address of merge nodes.
-  // multiple rf merge nodes can address straggler problem.
-  8: optional list<Types.TNetworkAddress> runtime_filter_merge_nodes;
-
-  // partitioned and bucket shuffle use different hash algorithm.
-  9: optional TRuntimeFilterBuildJoinMode build_join_mode;
-  // if this rf is generated by broadcast, and can be used by other process
-  // we just need one instance to send one copy of that rf.
-  10: optional Types.TUniqueId sender_finst_id;
+struct TCrossJoinNode {
+    1: optional list<RuntimeFilter.TRuntimeFilterDescription> build_runtime_filters;
 }
 
 struct TTableFunctionNode {
@@ -788,6 +837,12 @@ struct TTableFunctionNode {
     2: optional list<Types.TSlotId> param_columns
     3: optional list<Types.TSlotId> outer_columns
     4: optional list<Types.TSlotId> fn_result_columns
+}
+
+struct TConnectorScanNode {  
+  1: optional string connector_name
+  // // Scan node for hdfs
+  // 2: optional THdfsScanNode hdfs_scan_node
 }
 
 // This is essentially a union of all messages corresponding to subclasses
@@ -815,11 +870,11 @@ struct TPlanNode {
   15: optional TExchangeNode exchange_node
   17: optional TMySQLScanNode mysql_scan_node
   18: optional TOlapScanNode olap_scan_node
-  19: optional TCsvScanNode csv_scan_node
+  // 19 is reserved, please DON'T use
   20: optional TFileScanNode file_scan_node
-  21: optional TPreAggregationNode pre_agg_node
+  // 21 is reserved, please DON'T use
   22: optional TSchemaScanNode schema_scan_node
-  23: optional TMergeJoinNode merge_join_node
+  // 23 is reserved, please DON'T use
   24: optional TMetaScanNode meta_scan_node
   25: optional TAnalyticNode analytic_node
   28: optional TUnionNode union_node
@@ -829,16 +884,33 @@ struct TPlanNode {
   32: optional TAssertNumRowsNode assert_num_rows_node
   33: optional TIntersectNode intersect_node
   34: optional TExceptNode except_node
+  35: optional TMergeJoinNode merge_join_node
 
   // For vector query engine
-  50: optional TAdapterNode adapter_node
+  // 50 is reserved, please don't use
   51: optional bool use_vectorized
   // Scan node for hdfs
   52: optional THdfsScanNode hdfs_scan_node
   53: optional TProjectNode project_node
   54: optional TTableFunctionNode table_function_node
   // runtime filters be probed by this node.
-  55: optional list<TRuntimeFilterDescription> probe_runtime_filters
+  55: optional list<RuntimeFilter.TRuntimeFilterDescription> probe_runtime_filters
+  56: optional TDecodeNode decode_node
+  // a set of TPlanNodeIds of whom generate local runtime filters that take effects on this node
+  57: optional set<Types.TPlanNodeId> local_rf_waiting_set
+  // Columns that null values can be filtered out
+  58: optional list<Types.TSlotId> filter_null_value_columns;
+  // for outer join and cross join
+  59: optional bool need_create_tuple_columns;
+  // Scan node for jdbc
+  60: optional TJDBCScanNode jdbc_scan_node;
+
+  // generic scan node with connector.
+  61: optional TConnectorScanNode connector_scan_node;
+
+  62: optional TCrossJoinNode cross_join_node;
+
+  63: optional TLakeScanNode lake_scan_node
 }
 
 // A flattened representation of a tree of PlanNodes, obtained by depth-first

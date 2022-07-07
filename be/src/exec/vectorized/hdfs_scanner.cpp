@@ -1,21 +1,48 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exec/vectorized/hdfs_scanner.h"
 
-#include <hdfs/hdfs.h>
-
-#include <memory>
-
-#include "env/env_hdfs.h"
+#include "column/column_helper.h"
 #include "exec/exec_node.h"
-#include "exec/parquet/file_reader.h"
-#include "exec/vectorized/hdfs_scan_node.h"
-#include "exprs/expr.h"
-#include "runtime/runtime_state.h"
-#include "storage/vectorized/chunk_helper.h"
-#include "util/runtime_profile.h"
 
 namespace starrocks::vectorized {
+
+class CountedSeekableInputStream : public io::SeekableInputStreamWrapper {
+public:
+    explicit CountedSeekableInputStream(std::shared_ptr<io::SeekableInputStream> stream,
+                                        vectorized::HdfsScanStats* stats)
+            : io::SeekableInputStreamWrapper(stream.get(), kDontTakeOwnership), _stream(stream), _stats(stats) {}
+
+    ~CountedSeekableInputStream() override = default;
+
+    StatusOr<int64_t> read(void* data, int64_t size) override {
+        SCOPED_RAW_TIMER(&_stats->io_ns);
+        _stats->io_count += 1;
+        ASSIGN_OR_RETURN(auto nread, _stream->read(data, size));
+        _stats->bytes_read += nread;
+        return nread;
+    }
+
+    StatusOr<int64_t> read_at(int64_t offset, void* data, int64_t size) override {
+        SCOPED_RAW_TIMER(&_stats->io_ns);
+        _stats->io_count += 1;
+        ASSIGN_OR_RETURN(auto nread, _stream->read_at(offset, data, size));
+        _stats->bytes_read += nread;
+        return nread;
+    }
+
+    Status read_at_fully(int64_t offset, void* data, int64_t size) override {
+        SCOPED_RAW_TIMER(&_stats->io_ns);
+        _stats->io_count += 1;
+        RETURN_IF_ERROR(_stream->read_at_fully(offset, data, size));
+        _stats->bytes_read += size;
+        return Status::OK();
+    }
+
+private:
+    std::shared_ptr<io::SeekableInputStream> _stream;
+    vectorized::HdfsScanStats* _stats;
+};
 
 Status HdfsScanner::init(RuntimeState* runtime_state, const HdfsScannerParams& scanner_params) {
     _runtime_state = runtime_state;
@@ -47,14 +74,15 @@ Status HdfsScanner::init(RuntimeState* runtime_state, const HdfsScannerParams& s
     return status;
 }
 
-void HdfsScanner::_build_file_read_param() {
-    HdfsFileReaderParam& param = _file_read_param;
-    std::vector<ColumnPtr>& partition_values = param.partition_values;
+Status HdfsScanner::_build_scanner_context() {
+    HdfsScannerContext& ctx = _scanner_ctx;
+    std::vector<ColumnPtr>& partition_values = ctx.partition_values;
 
     // evaluate partition values.
     for (size_t i = 0; i < _scanner_params.partition_slots.size(); i++) {
         int part_col_idx = _scanner_params._partition_index_in_hdfs_partition_columns[i];
-        auto partition_value_column = _scanner_params.partition_values[part_col_idx]->evaluate(nullptr);
+        ASSIGN_OR_RETURN(auto partition_value_column,
+                         _scanner_params.partition_values[part_col_idx]->evaluate(nullptr));
         DCHECK(partition_value_column->is_constant());
         partition_values.emplace_back(std::move(partition_value_column));
     }
@@ -63,52 +91,53 @@ void HdfsScanner::_build_file_read_param() {
     for (size_t i = 0; i < _scanner_params.materialize_slots.size(); i++) {
         auto* slot = _scanner_params.materialize_slots[i];
 
-        HdfsFileReaderParam::ColumnInfo column;
+        HdfsScannerContext::ColumnInfo column;
         column.slot_desc = slot;
         column.col_idx = _scanner_params.materialize_index_in_chunk[i];
         column.col_type = slot->type();
         column.slot_id = slot->id();
         column.col_name = slot->col_name();
 
-        param.materialized_columns.emplace_back(std::move(column));
+        ctx.materialized_columns.emplace_back(std::move(column));
     }
 
     for (size_t i = 0; i < _scanner_params.partition_slots.size(); i++) {
         auto* slot = _scanner_params.partition_slots[i];
-        HdfsFileReaderParam::ColumnInfo column;
+        HdfsScannerContext::ColumnInfo column;
         column.slot_desc = slot;
         column.col_idx = _scanner_params.partition_index_in_chunk[i];
         column.col_type = slot->type();
         column.slot_id = slot->id();
         column.col_name = slot->col_name();
 
-        param.partition_columns.emplace_back(std::move(column));
+        ctx.partition_columns.emplace_back(std::move(column));
     }
 
-    param.tuple_desc = _scanner_params.tuple_desc;
-    param.conjunct_ctxs_by_slot = _conjunct_ctxs_by_slot;
-    param.scan_ranges = _scanner_params.scan_ranges;
-    param.min_max_conjunct_ctxs = _min_max_conjunct_ctxs;
-    param.min_max_tuple_desc = _scanner_params.min_max_tuple_desc;
-    param.timezone = _runtime_state->timezone();
-    param.stats = &_stats;
+    ctx.tuple_desc = _scanner_params.tuple_desc;
+    ctx.conjunct_ctxs_by_slot = _conjunct_ctxs_by_slot;
+    ctx.scan_ranges = _scanner_params.scan_ranges;
+    ctx.min_max_conjunct_ctxs = _min_max_conjunct_ctxs;
+    ctx.min_max_tuple_desc = _scanner_params.min_max_tuple_desc;
+    ctx.timezone = _runtime_state->timezone();
+    ctx.stats = &_stats;
+
+    return Status::OK();
 }
 
 Status HdfsScanner::get_next(RuntimeState* runtime_state, ChunkPtr* chunk) {
-#ifndef BE_TEST
-    SCOPED_TIMER(_scanner_params.parent->_scan_timer);
-#endif
+    RETURN_IF_CANCELLED(_runtime_state);
     Status status = do_get_next(runtime_state, chunk);
     if (status.ok()) {
         if (!_conjunct_ctxs.empty()) {
             SCOPED_RAW_TIMER(&_stats.expr_filter_ns);
-            ExecNode::eval_conjuncts(_conjunct_ctxs, (*chunk).get());
+            RETURN_IF_ERROR(ExecNode::eval_conjuncts(_conjunct_ctxs, (*chunk).get()));
         }
     } else if (status.is_end_of_file()) {
         // do nothing.
     } else {
-        LOG(ERROR) << "failed to read file: " << _scanner_params.fs->file_name();
+        LOG(ERROR) << "failed to read file: " << _scanner_params.path;
     }
+    _stats.num_rows_read += (*chunk)->num_rows();
     return status;
 }
 
@@ -116,116 +145,95 @@ Status HdfsScanner::open(RuntimeState* runtime_state) {
     if (_is_open) {
         return Status::OK();
     }
-    _build_file_read_param();
+    CHECK(_file == nullptr) << "File has already been opened";
+    ASSIGN_OR_RETURN(_raw_file, _scanner_params.fs->new_random_access_file(_scanner_params.path));
+    _file = std::make_unique<RandomAccessFile>(
+            std::make_shared<CountedSeekableInputStream>(_raw_file->stream(), &_stats), _raw_file->filename());
+    _build_scanner_context();
     auto status = do_open(runtime_state);
     if (status.ok()) {
         _is_open = true;
-        LOG(INFO) << "open file success: " << _scanner_params.fs->file_name();
+        if (_scanner_params.open_limit != nullptr) {
+            _scanner_params.open_limit->fetch_add(1, std::memory_order_relaxed);
+        }
+        LOG(INFO) << "open file success: " << _scanner_params.path;
     }
     return status;
 }
 
-Status HdfsScanner::close(RuntimeState* runtime_state) {
-    if (_is_closed) {
-        return Status::OK();
-    }
+void HdfsScanner::close(RuntimeState* runtime_state) noexcept {
+    DCHECK(!has_pending_token());
+    bool expect = false;
+    if (!_is_closed.compare_exchange_strong(expect, true)) return;
+    update_counter();
     Expr::close(_conjunct_ctxs, runtime_state);
     Expr::close(_min_max_conjunct_ctxs, runtime_state);
     for (auto& it : _conjunct_ctxs_by_slot) {
         Expr::close(it.second, runtime_state);
     }
-    auto status = do_close(runtime_state);
-    if (status.ok()) {
-        _is_closed = true;
+    do_close(runtime_state);
+    _file.reset(nullptr);
+    _raw_file.reset(nullptr);
+    if (_is_open && _scanner_params.open_limit != nullptr) {
+        _scanner_params.open_limit->fetch_sub(1, std::memory_order_relaxed);
     }
-    return status;
 }
 
-#ifndef BE_TEST
-struct HdfsReadStats {
-    int64_t bytes_total_read = 0;
-    int64_t bytes_read_local = 0;
-    int64_t bytes_read_short_circuit = 0;
-    int64_t bytes_read_dn_cache = 0;
-    int64_t bytes_read_remote = 0;
-};
-
-static void get_hdfs_statistics(hdfsFile file, HdfsReadStats* stats) {
-    struct hdfsReadStatistics* hdfs_stats = nullptr;
-    auto res = hdfsFileGetReadStatistics(file, &hdfs_stats);
-    if (res == 0) {
-        stats->bytes_total_read += hdfs_stats->totalBytesRead;
-        stats->bytes_read_local += hdfs_stats->totalLocalBytesRead;
-        stats->bytes_read_short_circuit += hdfs_stats->totalShortCircuitBytesRead;
-        stats->bytes_read_dn_cache += hdfs_stats->totalZeroCopyBytesRead;
-        stats->bytes_read_remote += hdfs_stats->totalBytesRead - hdfs_stats->totalLocalBytesRead;
-
-        hdfsFileFreeReadStatistics(hdfs_stats);
+void HdfsScanner::fianlize() {
+    if (_runtime_state != nullptr) {
+        close(_runtime_state);
     }
-    hdfsFileClearReadStatistics(file);
 }
-#endif
+
+void HdfsScanner::enter_pending_queue() {
+    _pending_queue_sw.start();
+}
+
+uint64_t HdfsScanner::exit_pending_queue() {
+    return _pending_queue_sw.reset();
+}
+
+void HdfsScanner::update_hdfs_counter(HdfsScanProfile* profile) {
+    static const char* const kHdfsIOProfileSectionPrefix = "HdfsIO";
+    if (_file == nullptr) return;
+
+    auto res = _file->get_numeric_statistics();
+    if (!res.ok()) return;
+
+    std::unique_ptr<io::NumericStatistics> statistics = std::move(res).value();
+    if (statistics == nullptr || statistics->size() == 0) return;
+
+    RuntimeProfile* runtime_profile = profile->runtime_profile;
+    ADD_TIMER(runtime_profile, kHdfsIOProfileSectionPrefix);
+    for (int64_t i = 0, sz = statistics->size(); i < sz; i++) {
+        auto&& name = statistics->name(i);
+        auto&& counter = ADD_CHILD_COUNTER(runtime_profile, name, TUnit::UNIT, kHdfsIOProfileSectionPrefix);
+        COUNTER_UPDATE(counter, statistics->value(i));
+    }
+}
+
+void HdfsScanner::do_update_counter(HdfsScanProfile* profile) {}
 
 void HdfsScanner::update_counter() {
-#ifndef BE_TEST
-    HdfsReadStats hdfs_stats;
-    auto hdfs_file = down_cast<HdfsRandomAccessFile*>(_scanner_params.fs.get())->hdfs_file();
-    get_hdfs_statistics(hdfs_file, &hdfs_stats);
+    HdfsScanProfile* profile = _scanner_params.profile;
+    if (profile == nullptr) return;
 
-    COUNTER_UPDATE(_scanner_params.parent->_bytes_total_read, hdfs_stats.bytes_total_read);
-    COUNTER_UPDATE(_scanner_params.parent->_bytes_read_local, hdfs_stats.bytes_read_local);
-    COUNTER_UPDATE(_scanner_params.parent->_bytes_read_short_circuit, hdfs_stats.bytes_read_short_circuit);
-    COUNTER_UPDATE(_scanner_params.parent->_bytes_read_dn_cache, hdfs_stats.bytes_read_dn_cache);
-    COUNTER_UPDATE(_scanner_params.parent->_bytes_read_remote, hdfs_stats.bytes_read_remote);
-#endif
+    update_hdfs_counter(profile);
+
+    COUNTER_UPDATE(profile->reader_init_timer, _stats.reader_init_ns);
+    COUNTER_UPDATE(profile->rows_read_counter, _stats.raw_rows_read);
+    COUNTER_UPDATE(profile->bytes_read_counter, _stats.bytes_read);
+    COUNTER_UPDATE(profile->expr_filter_timer, _stats.expr_filter_ns);
+    COUNTER_UPDATE(profile->io_timer, _stats.io_ns);
+    COUNTER_UPDATE(profile->io_counter, _stats.io_count);
+    COUNTER_UPDATE(profile->column_read_timer, _stats.column_read_ns);
+    COUNTER_UPDATE(profile->column_convert_timer, _stats.column_convert_ns);
+
+    // update scanner private profile.
+    do_update_counter(profile);
 }
 
-Status HdfsParquetScanner::do_init(RuntimeState* runtime_state, const HdfsScannerParams& scanner_params) {
-    return Status::OK();
-}
-
-Status HdfsParquetScanner::do_open(RuntimeState* runtime_state) {
-    // create file reader
-    _reader = std::make_shared<parquet::FileReader>(_scanner_params.fs.get(),
-                                                    _scanner_params.scan_ranges[0]->file_length);
-#ifndef BE_TEST
-    SCOPED_TIMER(_scanner_params.parent->_reader_init_timer);
-#endif
-    RETURN_IF_ERROR(_reader->init(_file_read_param));
-    return Status::OK();
-}
-
-Status HdfsParquetScanner::do_get_next(RuntimeState* runtime_state, ChunkPtr* chunk) {
-#ifndef BE_TEST
-    SCOPED_TIMER(_scanner_params.parent->_scan_timer);
-#endif
-    Status status = _reader->get_next(chunk);
-    return status;
-}
-
-void HdfsParquetScanner::update_counter() {
-    HdfsScanner::update_counter();
-
-#ifndef BE_TEST
-    COUNTER_UPDATE(_scanner_params.parent->_raw_rows_counter, _stats.raw_rows_read);
-    COUNTER_UPDATE(_scanner_params.parent->_expr_filter_timer, _stats.expr_filter_ns);
-    COUNTER_UPDATE(_scanner_params.parent->_io_timer, _stats.io_ns);
-    COUNTER_UPDATE(_scanner_params.parent->_io_counter, _stats.io_count);
-    COUNTER_UPDATE(_scanner_params.parent->_bytes_read_from_disk_counter, _stats.bytes_read_from_disk);
-    COUNTER_UPDATE(_scanner_params.parent->_column_read_timer, _stats.column_read_ns);
-    COUNTER_UPDATE(_scanner_params.parent->_column_convert_timer, _stats.column_convert_ns);
-    COUNTER_UPDATE(_scanner_params.parent->_value_decode_timer, _stats.value_decode_ns);
-    COUNTER_UPDATE(_scanner_params.parent->_level_decode_timer, _stats.level_decode_ns);
-    COUNTER_UPDATE(_scanner_params.parent->_page_read_timer, _stats.page_read_ns);
-    COUNTER_UPDATE(_scanner_params.parent->_footer_read_timer, _stats.footer_read_ns);
-    COUNTER_UPDATE(_scanner_params.parent->_column_reader_init_timer, _stats.column_reader_init_ns);
-    COUNTER_UPDATE(_scanner_params.parent->_group_chunk_read_timer, _stats.group_chunk_read_ns);
-    COUNTER_UPDATE(_scanner_params.parent->_group_dict_filter_timer, _stats.group_dict_filter_ns);
-    COUNTER_UPDATE(_scanner_params.parent->_group_dict_decode_timer, _stats.group_dict_decode_ns);
-#endif
-}
-
-void HdfsFileReaderParam::set_columns_from_file(const std::unordered_set<std::string>& names) {
+void HdfsScannerContext::set_columns_from_file(const std::unordered_set<std::string>& names) {
     for (auto& column : materialized_columns) {
         if (names.find(column.col_name) == names.end()) {
             not_existed_slots.push_back(column.slot_desc);
@@ -240,7 +248,16 @@ void HdfsFileReaderParam::set_columns_from_file(const std::unordered_set<std::st
     }
 }
 
-void HdfsFileReaderParam::append_not_exised_columns_to_chunk(vectorized::ChunkPtr* chunk, size_t row_count) {
+void HdfsScannerContext::update_not_existed_columns_of_chunk(vectorized::ChunkPtr* chunk, size_t row_count) {
+    if (not_existed_slots.empty() || row_count <= 0) return;
+
+    ChunkPtr& ck = (*chunk);
+    for (auto* slot_desc : not_existed_slots) {
+        ck->get_column_by_slot_id(slot_desc->id())->append_default(row_count);
+    }
+}
+
+void HdfsScannerContext::append_not_existed_columns_to_chunk(vectorized::ChunkPtr* chunk, size_t row_count) {
     if (not_existed_slots.size() == 0) return;
 
     ChunkPtr& ck = (*chunk);
@@ -254,21 +271,41 @@ void HdfsFileReaderParam::append_not_exised_columns_to_chunk(vectorized::ChunkPt
     }
 }
 
-bool HdfsFileReaderParam::should_skip_by_evaluating_not_existed_slots() {
+StatusOr<bool> HdfsScannerContext::should_skip_by_evaluating_not_existed_slots() {
     if (not_existed_slots.size() == 0) return false;
 
     // build chunk for evaluation.
     ChunkPtr chunk = std::make_shared<Chunk>();
-    append_not_exised_columns_to_chunk(&chunk, 1);
+    append_not_existed_columns_to_chunk(&chunk, 1);
     // do evaluation.
     {
         SCOPED_RAW_TIMER(&stats->expr_filter_ns);
-        ExecNode::eval_conjuncts(conjunct_ctxs_of_non_existed_slots, chunk.get());
+        RETURN_IF_ERROR(ExecNode::eval_conjuncts(conjunct_ctxs_of_non_existed_slots, chunk.get()));
     }
     return !(chunk->has_rows());
 }
 
-void HdfsFileReaderParam::append_partition_column_to_chunk(vectorized::ChunkPtr* chunk, size_t row_count) {
+void HdfsScannerContext::update_partition_column_of_chunk(vectorized::ChunkPtr* chunk, size_t row_count) {
+    if (partition_columns.empty() || row_count <= 0) return;
+
+    ChunkPtr& ck = (*chunk);
+    for (size_t i = 0; i < partition_columns.size(); i++) {
+        SlotDescriptor* slot_desc = partition_columns[i].slot_desc;
+        DCHECK(partition_values[i]->is_constant());
+        auto* const_column = vectorized::ColumnHelper::as_raw_column<vectorized::ConstColumn>(partition_values[i]);
+        ColumnPtr data_column = const_column->data_column();
+        auto chunk_part_column = ck->get_column_by_slot_id(slot_desc->id());
+
+        if (data_column->is_nullable()) {
+            chunk_part_column->append_nulls(1);
+        } else {
+            chunk_part_column->append(*data_column, 0, 1);
+        }
+        chunk_part_column->assign(row_count, 0);
+    }
+}
+
+void HdfsScannerContext::append_partition_column_to_chunk(vectorized::ChunkPtr* chunk, size_t row_count) {
     if (partition_columns.size() == 0) return;
 
     ChunkPtr& ck = (*chunk);
@@ -293,7 +330,7 @@ void HdfsFileReaderParam::append_partition_column_to_chunk(vectorized::ChunkPtr*
     }
 }
 
-bool HdfsFileReaderParam::can_use_dict_filter_on_slot(SlotDescriptor* slot) const {
+bool HdfsScannerContext::can_use_dict_filter_on_slot(SlotDescriptor* slot) const {
     if (!slot->type().is_string_type()) {
         return false;
     }

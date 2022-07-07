@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.transformer;
 
 import com.clearspring.analytics.util.Lists;
@@ -16,7 +16,6 @@ import com.starrocks.analysis.NullLiteral;
 import com.starrocks.analysis.OrderByElement;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.common.Pair;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.base.Ordering;
@@ -27,6 +26,7 @@ import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -80,13 +80,19 @@ public class WindowTransformer {
         List<OrderByElement> orderByElements = analyticExpr.getOrderByElements();
 
         // Set a window from UNBOUNDED PRECEDING to CURRENT_ROW for row_number().
-        if (callExpr.getFnName().getFunction().equalsIgnoreCase(AnalyticExpr.ROWNUMBER)) {
+        if (AnalyticExpr.isRowNumberFn(callExpr.getFn())) {
             Preconditions.checkState(windowFrame == null, "Unexpected window set for row_numer()");
-            windowFrame = new AnalyticWindow(AnalyticWindow.Type.ROWS,
-                    new AnalyticWindow.Boundary(AnalyticWindow.BoundaryType.UNBOUNDED_PRECEDING, null),
-                    new AnalyticWindow.Boundary(AnalyticWindow.BoundaryType.CURRENT_ROW, null));
-        }
-        if (AnalyticExpr.isOffsetFn(callExpr.getFn())) {
+            windowFrame = AnalyticWindow.DEFAULT_ROWS_WINDOW;
+        } else if (AnalyticExpr.isNtileFn(callExpr.getFn())) {
+            Preconditions.checkState(windowFrame == null, "Unexpected window set for NTILE()");
+            windowFrame = AnalyticWindow.DEFAULT_ROWS_WINDOW;
+
+            try {
+                callExpr.uncheckedCastChild(Type.BIGINT, 0);
+            } catch (AnalysisException e) {
+                throw new SemanticException(e.getMessage());
+            }
+        } else if (AnalyticExpr.isOffsetFn(callExpr.getFn())) {
             try {
                 Preconditions.checkState(windowFrame == null);
 
@@ -143,7 +149,7 @@ public class WindowTransformer {
         }
 
         // Reverse the ordering and window for windows ending with UNBOUNDED FOLLOWING,
-        // and and not starting with UNBOUNDED PRECEDING.
+        // and not starting with UNBOUNDED PRECEDING.
         if (windowFrame != null
                 && windowFrame.getRightBoundary().getType() == AnalyticWindow.BoundaryType.UNBOUNDED_FOLLOWING
                 && windowFrame.getLeftBoundary().getType() != AnalyticWindow.BoundaryType.UNBOUNDED_PRECEDING) {
@@ -187,15 +193,6 @@ public class WindowTransformer {
                     windowFrame.getRightBoundary());
         }
 
-        // min/max is not currently supported on sliding windows (i.e. start bound is not unbounded).
-        if (windowFrame != null
-                && (callExpr.getFnName().getFunction().equalsIgnoreCase(AnalyticExpr.MIN)
-                || (callExpr.getFnName().getFunction().equalsIgnoreCase(AnalyticExpr.MAX)))
-                && windowFrame.getLeftBoundary().getType() != AnalyticWindow.BoundaryType.UNBOUNDED_PRECEDING) {
-            throw new SemanticException(
-                    analyticExpr.toSql() + " is only supported with an UNBOUNDED PRECEDING start bound.");
-        }
-
         // remove duplicate partition expr
         Set<Expr> duplicateCheck = Sets.newHashSet();
         List<Expr> partitions = Lists.newArrayList();
@@ -220,7 +217,7 @@ public class WindowTransformer {
 
         analyticExpr.getOrderByElements().clear();
         analyticExpr.getOrderByElements().addAll(orderings);
-        return new WindowOperator(analyticExpr.getFnCall(), analyticExpr, analyticExpr.getPartitionExprs(),
+        return new WindowOperator(analyticExpr, analyticExpr.getPartitionExprs(),
                 orderByElements, windowFrame);
     }
 
@@ -229,7 +226,7 @@ public class WindowTransformer {
      * SortGroup represent the window functions that can be calculated in one SortNode
      * to reduce the generation of SortNode
      */
-    public static List<WindowTransformer.SortGroup> reorderWindowOperator(
+    public static List<WindowTransformer.PartitionGroup> reorderWindowOperator(
             List<WindowOperator> windowOperators, ColumnRefFactory columnRefFactory, OptExprBuilder subOpt) {
         /*
          * Step 1.
@@ -240,20 +237,23 @@ public class WindowTransformer {
         for (WindowTransformer.WindowOperator windowOperator : windowOperators) {
             Map<ColumnRefOperator, CallOperator> analyticCall = new HashMap<>();
 
-            for (Pair<FunctionCallExpr, AnalyticExpr> functionCallExpr : windowOperator.getWindowFunctions()) {
+            for (AnalyticExpr analyticExpr : windowOperator.getWindowFunctions()) {
+                // The conversion here cannot only convert functionCall,
+                // because it may conflict with the function of the same name
+                // in the aggregation and be converted into the expression generated on agg
+                // eg. select sum(v1), sum(v1) over(order by v2) from foo
                 ScalarOperator agg =
-                        SqlToScalarOperatorTranslator
-                                .translate(functionCallExpr.first, subOpt.getExpressionMapping(), null, null);
+                        SqlToScalarOperatorTranslator.translate(analyticExpr, subOpt.getExpressionMapping());
                 ColumnRefOperator columnRefOperator =
                         columnRefFactory.create(agg.toString(), agg.getType(), agg.isNullable());
                 analyticCall.put(columnRefOperator, (CallOperator) agg);
-                subOpt.getExpressionMapping().put(functionCallExpr.second, columnRefOperator);
+                subOpt.getExpressionMapping().put(analyticExpr, columnRefOperator);
             }
 
             List<ScalarOperator> partitions = new ArrayList<>();
             for (Expr partitionExpression : windowOperator.getPartitionExprs()) {
                 ScalarOperator operator = SqlToScalarOperatorTranslator
-                        .translate(partitionExpression, subOpt.getExpressionMapping(), null, null);
+                        .translate(partitionExpression, subOpt.getExpressionMapping());
                 partitions.add(operator);
             }
 
@@ -263,10 +263,26 @@ public class WindowTransformer {
                         (ColumnRefOperator) SqlToScalarOperatorTranslator
                                 .translate(orderByElement.getExpr(), subOpt.getExpressionMapping());
                 orderings.add(new Ordering(col, orderByElement.getIsAsc(),
-                        OrderByElement.nullsFirst(orderByElement.getNullsFirstParam(), orderByElement.getIsAsc())));
+                        OrderByElement.nullsFirst(orderByElement.getNullsFirstParam())));
             }
-            logicalWindowOperators
-                    .add(new LogicalWindowOperator(analyticCall, partitions, orderings, windowOperator.getWindow()));
+
+            // Each LogicalWindowOperator will belong to a SortGroup,
+            // so we need to record sortProperty to ensure that only one SortNode is enforced
+            List<Ordering> sortEnforceProperty = new ArrayList<>();
+            partitions.forEach(p -> sortEnforceProperty.add(new Ordering((ColumnRefOperator) p, true, true)));
+            for (Ordering ordering : orderings) {
+                if (sortEnforceProperty.stream().noneMatch(sp -> sp.getColumnRef().equals(ordering.getColumnRef()))) {
+                    sortEnforceProperty.add(ordering);
+                }
+            }
+
+            logicalWindowOperators.add(new LogicalWindowOperator.Builder()
+                    .setWindowCall(analyticCall)
+                    .setPartitionExpressions(partitions)
+                    .setOrderByElements(orderings)
+                    .setAnalyticWindow(windowOperator.getWindow())
+                    .setEnforceSortColumns(sortEnforceProperty.stream().distinct().collect(Collectors.toList()))
+                    .build());
         }
 
         /*
@@ -278,43 +294,32 @@ public class WindowTransformer {
         for (LogicalWindowOperator windowOperator : logicalWindowOperators) {
             boolean find = false;
             for (WindowTransformer.SortGroup windowInSorted : sortedGroups) {
-                if (!windowInSorted.getPartitionExprs().equals(windowOperator.getPartitionExpressions())) {
+                if (!isPrefixHyperPartitionSet(windowOperator.getPartitionExpressions(),
+                        windowInSorted.getPartitionExprs())
+                        && !isPrefixHyperPartitionSet(windowInSorted.getPartitionExprs(),
+                        windowOperator.getPartitionExpressions())) {
                     continue;
                 }
 
-                List<List<Ordering>> sortPrefix = IntStream.rangeClosed(0, windowInSorted.getOrderByElements().size())
-                        .mapToObj(i -> windowInSorted.getOrderByElements().subList(0, i)).collect(Collectors.toList());
-
-                if (sortPrefix.contains(windowOperator.getOrderByElements())) {
-                    windowInSorted.addWindowOperator(windowOperator);
-                    find = true;
-                    break;
+                if (isPrefixHyperSortSet(windowOperator.getEnforceSortColumns(),
+                        windowInSorted.getEnforceSortColumns())) {
+                    windowInSorted.setEnforceSortColumns(windowOperator.getEnforceSortColumns());
+                } else if (!isPrefixHyperSortSet(windowInSorted.getEnforceSortColumns(),
+                        windowOperator.getEnforceSortColumns())) {
+                    continue;
                 }
-            }
-
-            if (!find) {
-                List<List<Ordering>> sortPrefix = IntStream.rangeClosed(0, windowOperator.getOrderByElements().size())
-                        .mapToObj(i -> windowOperator.getOrderByElements().subList(0, i)).collect(Collectors.toList());
-
-                for (WindowTransformer.SortGroup windowInSorted : sortedGroups) {
-                    if (!windowInSorted.getPartitionExprs().equals(windowOperator.getPartitionExpressions())) {
-                        continue;
-                    }
-
-                    List<Ordering> orderings = windowInSorted.getOrderByElements();
-                    if (sortPrefix.contains(orderings)) {
-                        windowInSorted.setOrderByElements(windowOperator.getOrderByElements());
-                        windowInSorted.addWindowOperator(windowOperator);
-
-                        find = true;
-                        break;
-                    }
+                if (isPrefixHyperPartitionSet(windowOperator.getPartitionExpressions(),
+                        windowInSorted.getPartitionExprs())) {
+                    windowInSorted.setPartitionExpressions(windowOperator.getPartitionExpressions());
                 }
+                windowInSorted.addWindowOperator(windowOperator);
+                find = true;
+                break;
             }
 
             if (!find) {
                 WindowTransformer.SortGroup sortGroup = new WindowTransformer.SortGroup(
-                        windowOperator.getOrderByElements(), windowOperator.getPartitionExpressions());
+                        windowOperator.getEnforceSortColumns(), windowOperator.getPartitionExpressions());
                 sortGroup.addWindowOperator(windowOperator);
                 sortedGroups.add(sortGroup);
             }
@@ -322,33 +327,58 @@ public class WindowTransformer {
 
         /*
          * Step 3.
-         * Put the nodes with more sort columns at the bottom of the query plan
-         * to ensure that the Enforce operation can meet the conditions, and only one SortNode will be generated
+         * Put the nodes with more partition columns at the top of the query plan
+         * to ensure that the Enforce operation can meet the conditions, and only one ExchangeNode will be generated
          */
         sortedGroups.forEach(sortGroup -> sortGroup.getWindowOperators()
-                .sort((w1, w2) -> w2.getOrderByElements().size() - w1.getOrderByElements().size()));
+                .sort(Comparator.comparingInt(w -> w.getPartitionExpressions().size())));
 
         /*
          * Step4.
-         * The SortGroup with fewer partition columns are placed at the top level,
-         * and the nodes with the same partition are placed together to reduce the generation of Exchange nodes.
+         * The nodes with the same partition group are placed together to reduce the generation of Exchange nodes.
          */
-        sortedGroups.sort((o1, o2) -> {
-            if (o1.getPartitionExprs().size() > o2.getPartitionExprs().size()) {
-                return -1;
-            } else if (o1.getPartitionExprs().size() < o2.getPartitionExprs().size()) {
-                return 1;
-            } else {
-                int sortKey = 0;
-                for (int i = 0; i < o1.getPartitionExprs().size(); ++i) {
-                    sortKey += ((ColumnRefOperator) (o1.getPartitionExprs().get(i))).getId()
-                            - ((ColumnRefOperator) (o2.getPartitionExprs().get(i))).getId();
+        List<PartitionGroup> partitionGroups = new ArrayList<>();
+        for (SortGroup sortGroup : sortedGroups) {
+            boolean find = false;
+            for (PartitionGroup partitionGroup : partitionGroups) {
+                if (isPrefixHyperPartitionSet(sortGroup.partitionExpressions, partitionGroup.partitionExpressions)) {
+                    partitionGroup.addSortGroup(sortGroup);
+                    find = true;
+                    break;
+                } else if (isPrefixHyperPartitionSet(partitionGroup.partitionExpressions,
+                        sortGroup.partitionExpressions)) {
+                    partitionGroup.setPartitionExpressions(sortGroup.partitionExpressions);
+                    partitionGroup.addSortGroup(sortGroup);
+                    find = true;
+                    break;
                 }
-                return sortKey;
             }
-        });
+            if (!find) {
+                PartitionGroup partitionGroup = new PartitionGroup();
+                partitionGroup.setPartitionExpressions(sortGroup.partitionExpressions);
+                partitionGroup.addSortGroup(sortGroup);
+                partitionGroups.add(partitionGroup);
+            }
+        }
+        partitionGroups.forEach(partitionGroup -> partitionGroup.sortGroups.sort(
+                Comparator.comparingInt(s -> s.getPartitionExprs().size())));
+        partitionGroups.sort(Comparator.comparingInt(p -> p.partitionExpressions.size() * -1));
 
-        return sortedGroups;
+        return partitionGroups;
+    }
+
+    private static boolean isPrefixHyperPartitionSet(List<ScalarOperator> hyperSet, List<ScalarOperator> subSet) {
+        if (hyperSet.isEmpty() && subSet.isEmpty()) {
+            return true;
+        }
+
+        return hyperSet.containsAll(subSet) && !subSet.isEmpty();
+    }
+
+    private static boolean isPrefixHyperSortSet(List<Ordering> hyperSet, List<Ordering> subSet) {
+        List<List<Ordering>> partitionPrefix = IntStream.rangeClosed(0, hyperSet.size())
+                .mapToObj(i -> hyperSet.subList(0, i)).collect(Collectors.toList());
+        return partitionPrefix.contains(subSet);
     }
 
     /**
@@ -359,11 +389,11 @@ public class WindowTransformer {
      */
     public static class SortGroup {
         private final List<LogicalWindowOperator> windowOperators = new ArrayList<>();
-        private List<Ordering> orderByElements;
-        private final List<ScalarOperator> partitionExpressions;
+        private List<Ordering> enforceSortColumns;
+        private List<ScalarOperator> partitionExpressions;
 
-        public SortGroup(List<Ordering> orderByElements, List<ScalarOperator> partitionExpressions) {
-            this.orderByElements = orderByElements;
+        public SortGroup(List<Ordering> enforceSortColumns, List<ScalarOperator> partitionExpressions) {
+            this.enforceSortColumns = enforceSortColumns;
             this.partitionExpressions = partitionExpressions;
         }
 
@@ -371,12 +401,20 @@ public class WindowTransformer {
             return partitionExpressions;
         }
 
-        public List<Ordering> getOrderByElements() {
-            return orderByElements;
+        public void setPartitionExpressions(List<ScalarOperator> partitionExpressions) {
+            this.partitionExpressions = partitionExpressions;
         }
 
-        public void setOrderByElements(List<Ordering> orderByElements) {
-            this.orderByElements = orderByElements;
+        public List<Ordering> getEnforceSortColumns() {
+            if (enforceSortColumns == null) {
+                return new ArrayList<>();
+            } else {
+                return enforceSortColumns;
+            }
+        }
+
+        public void setEnforceSortColumns(List<Ordering> enforceSortColumns) {
+            this.enforceSortColumns = enforceSortColumns;
         }
 
         public void addWindowOperator(LogicalWindowOperator windowOperator) {
@@ -388,25 +426,49 @@ public class WindowTransformer {
         }
     }
 
+    public static class PartitionGroup {
+        private final List<SortGroup> sortGroups;
+        private List<ScalarOperator> partitionExpressions;
+
+        public PartitionGroup() {
+            sortGroups = new ArrayList<>();
+        }
+
+        public void addSortGroup(SortGroup sortGroup) {
+            sortGroups.add(sortGroup);
+        }
+
+        public List<SortGroup> getSortGroups() {
+            return sortGroups;
+        }
+
+        public void setPartitionExpressions(
+                List<ScalarOperator> partitionExpressions) {
+            this.partitionExpressions = partitionExpressions;
+        }
+    }
+
     public static class WindowOperator {
-        private final List<Pair<FunctionCallExpr, AnalyticExpr>> windowFunctions = Lists.newArrayList();
+        private final List<AnalyticExpr> windowFunctions = Lists.newArrayList();
         private final List<Expr> partitionExprs;
         private List<OrderByElement> orderByElements;
         private final AnalyticWindow window;
 
-        public WindowOperator(FunctionCallExpr windowFunctions, AnalyticExpr analyticExpr, List<Expr> partitionExprs,
+        public WindowOperator(AnalyticExpr analyticExpr, List<Expr> partitionExprs,
                               List<OrderByElement> orderByElements, AnalyticWindow window) {
-            this.windowFunctions.add(new Pair<>(windowFunctions, analyticExpr));
+            this.windowFunctions.add(analyticExpr);
             this.partitionExprs = partitionExprs;
             this.orderByElements = orderByElements;
             this.window = window;
         }
 
-        public void addFunction(FunctionCallExpr fnCall, AnalyticExpr analyticExpr) {
-            windowFunctions.add(new Pair<>(fnCall, analyticExpr));
+        public void addFunction(AnalyticExpr analyticExpr) {
+            if (!windowFunctions.contains(analyticExpr)) {
+                windowFunctions.add(analyticExpr);
+            }
         }
 
-        public List<Pair<FunctionCallExpr, AnalyticExpr>> getWindowFunctions() {
+        public List<AnalyticExpr> getWindowFunctions() {
             return windowFunctions;
         }
 

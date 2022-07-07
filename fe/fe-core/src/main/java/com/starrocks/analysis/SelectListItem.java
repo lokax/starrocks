@@ -23,7 +23,7 @@ package com.starrocks.analysis;
 
 import com.google.common.base.Preconditions;
 
-public class SelectListItem {
+public class SelectListItem implements ParseNode {
     private Expr expr;
     // for "[name.]*"
     private final TableName tblName;
@@ -102,6 +102,21 @@ public class SelectListItem {
         }
     }
 
+    public String toDigest() {
+        if (!isStar) {
+            Preconditions.checkNotNull(expr);
+            String aliasSql = null;
+            if (alias != null) {
+                aliasSql = "`" + alias + "`";
+            }
+            return expr.toDigest() + ((aliasSql == null) ? "" : " " + aliasSql);
+        } else if (tblName != null) {
+            return tblName.toString() + ".*";
+        } else {
+            return "*";
+        }
+    }
+
     /**
      * Return a column label for the select list item.
      */
@@ -117,5 +132,4 @@ public class SelectListItem {
         }
         return expr.toColumnLabel();
     }
-
 }

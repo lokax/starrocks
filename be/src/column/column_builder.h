@@ -1,8 +1,12 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
+#include <type_traits>
+#include <utility>
+
 #include "column/column_helper.h"
+#include "column/type_traits.h"
 #include "util/raw_container.h"
 
 namespace starrocks {
@@ -14,20 +18,21 @@ public:
     using DataColumnPtr = typename RunTimeColumnType<Type>::Ptr;
     using NullColumnPtr = NullColumn::Ptr;
     using DatumType = RunTimeCppType<Type>;
+    using MovableType = RunTimeCppMovableType<Type>;
 
-    ColumnBuilder() {
+    ColumnBuilder(int32_t chunk_size) {
         static_assert(!pt_is_decimal<Type>, "Not support Decimal32/64/128 types");
         _has_null = false;
         _column = RunTimeColumnType<Type>::create();
         _null_column = NullColumn::create();
-        reserve(config::vector_chunk_size);
+        reserve(chunk_size);
     }
 
-    ColumnBuilder(int precision, int scale) {
+    ColumnBuilder(int32_t chunk_size, int precision, int scale) {
         _has_null = false;
         _column = RunTimeColumnType<Type>::create();
         _null_column = NullColumn::create();
-        reserve(config::vector_chunk_size);
+        reserve(chunk_size);
 
         if constexpr (pt_is_decimal<Type>) {
             static constexpr auto max_precision = decimal_precision_limit<DatumType>;
@@ -39,7 +44,7 @@ public:
     }
 
     ColumnBuilder(DataColumnPtr column, NullColumnPtr null_column, bool has_null)
-            : _column(column), _null_column(null_column), _has_null(has_null) {}
+            : _column(std::move(column)), _null_column(std::move(null_column)), _has_null(has_null) {}
     //do nothing ctor, members are initialized by its offsprings.
     explicit ColumnBuilder<Type>(void*) {}
 
@@ -48,10 +53,21 @@ public:
         _column->append(value);
     }
 
+    void append(MovableType value) {
+        _null_column->append(DATUM_NOT_NULL);
+        _column->append(std::move(value));
+    }
+
     void append(const DatumType& value, bool is_null) {
         _has_null = _has_null | is_null;
         _null_column->append(is_null);
         _column->append(value);
+    }
+
+    void append(MovableType value, bool is_null) {
+        _has_null = _has_null | is_null;
+        _null_column->append(is_null);
+        _column->append(std::move(value));
     }
 
     void append_null() {
@@ -73,6 +89,8 @@ public:
             return _column;
         }
     }
+
+    ColumnPtr build_nullable_column() { return NullableColumn::create(_column, _null_column); }
 
     void reserve(int size) {
         _column->reserve(size);
@@ -140,9 +158,16 @@ public:
     // as the number of evolving columns; however, the offset is updated
     // only once, so we split the append into append_partial and append_complete
     // as follows
-    void append_partial(uint8_t* begin, uint8_t* end) {
+    void append_partial(const uint8_t* begin, const uint8_t* end) {
         Bytes& bytes = _column->get_bytes();
         bytes.insert(bytes.end(), begin, end);
+    }
+
+    void append_partial(const Slice& slice) {
+        const auto* begin = reinterpret_cast<const uint8_t*>(slice.data);
+        const auto* end = begin + slice.size;
+
+        append_partial(begin, end);
     }
 
     void append_complete(size_t i) {

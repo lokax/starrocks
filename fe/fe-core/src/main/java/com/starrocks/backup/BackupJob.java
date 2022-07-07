@@ -31,9 +31,9 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.analysis.TableRef;
 import com.starrocks.backup.Status.ErrCode;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.FsBroker;
+import com.starrocks.catalog.LocalTablet;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
 import com.starrocks.catalog.OlapTable;
@@ -45,6 +45,7 @@ import com.starrocks.catalog.Tablet;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.util.TimeUtils;
 import com.starrocks.common.util.UUIDUtil;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.task.AgentBatchTask;
 import com.starrocks.task.AgentTask;
 import com.starrocks.task.AgentTaskExecutor;
@@ -72,6 +73,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class BackupJob extends AbstractJob {
     private static final Logger LOG = LogManager.getLogger(BackupJob.class);
@@ -118,8 +120,8 @@ public class BackupJob extends AbstractJob {
     }
 
     public BackupJob(String label, long dbId, String dbName, List<TableRef> tableRefs, long timeoutMs,
-                     Catalog catalog, long repoId) {
-        super(JobType.BACKUP, label, dbId, dbName, timeoutMs, catalog, repoId);
+                     GlobalStateMgr globalStateMgr, long repoId) {
+        super(JobType.BACKUP, label, dbId, dbName, timeoutMs, globalStateMgr, repoId);
         this.tableRefs = tableRefs;
         this.state = BackupJobState.PENDING;
     }
@@ -239,7 +241,7 @@ public class BackupJob extends AbstractJob {
 
     @Override
     public synchronized void replayRun() {
-        // Backup process does not change any current catalog state,
+        // Backup process does not change any current globalStateMgr state,
         // So nothing need to be done when replaying log
     }
 
@@ -274,7 +276,7 @@ public class BackupJob extends AbstractJob {
 
         // get repo if not set
         if (repo == null) {
-            repo = catalog.getBackupHandler().getRepoMgr().getRepo(repoId);
+            repo = globalStateMgr.getBackupHandler().getRepoMgr().getRepo(repoId);
             if (repo == null) {
                 status = new Status(ErrCode.COMMON_ERROR, "failed to get repository: " + repoId);
                 cancelInternal();
@@ -338,14 +340,14 @@ public class BackupJob extends AbstractJob {
     }
 
     private void prepareAndSendSnapshotTask() {
-        Database db = catalog.getDb(dbId);
+        Database db = globalStateMgr.getDb(dbId);
         if (db == null) {
             status = new Status(ErrCode.NOT_FOUND, "database " + dbId + " does not exist");
             return;
         }
 
         // generate job id
-        jobId = catalog.getNextId();
+        jobId = globalStateMgr.getNextId();
         AgentBatchTask batchTask = new AgentBatchTask();
         db.readLock();
         try {
@@ -395,32 +397,29 @@ public class BackupJob extends AbstractJob {
                 // snapshot partitions
                 for (Partition partition : partitions) {
                     long visibleVersion = partition.getVisibleVersion();
-                    long visibleVersionHash = partition.getVisibleVersionHash();
                     List<MaterializedIndex> indexes = partition.getMaterializedIndices(IndexExtState.VISIBLE);
                     for (MaterializedIndex index : indexes) {
                         int schemaHash = tbl.getSchemaHashByIndexId(index.getId());
-                        List<Tablet> tablets = index.getTablets();
-                        for (Tablet tablet : tablets) {
-                            Replica replica = chooseReplica(tablet, visibleVersion, visibleVersionHash);
+                        for (Tablet tablet : index.getTablets()) {
+                            Replica replica = chooseReplica((LocalTablet) tablet, visibleVersion);
                             if (replica == null) {
                                 status = new Status(ErrCode.COMMON_ERROR,
-                                        "faild to choose replica to make snapshot for tablet " + tablet.getId()
-                                                + ". visible version: " + visibleVersion
-                                                + ", visible version hash: " + visibleVersionHash);
+                                        "failed to choose replica to make snapshot for tablet " + tablet.getId()
+                                                + ". visible version: " + visibleVersion);
                                 return;
                             }
                             SnapshotTask task = new SnapshotTask(null, replica.getBackendId(), tablet.getId(),
                                     jobId, dbId, tbl.getId(), partition.getId(),
                                     index.getId(), tablet.getId(),
-                                    visibleVersion, visibleVersionHash,
+                                    visibleVersion,
                                     schemaHash, timeoutMs, false /* not restore task */);
                             batchTask.addTask(task);
                             unfinishedTaskIds.put(tablet.getId(), replica.getBackendId());
                         }
                     }
 
-                    LOG.info("snapshot for partition {}, version: {}, version hash: {}",
-                            partition.getId(), visibleVersion, visibleVersionHash);
+                    LOG.info("snapshot for partition {}, version: {}",
+                            partition.getId(), visibleVersion);
                 }
             }
 
@@ -463,7 +462,7 @@ public class BackupJob extends AbstractJob {
             state = BackupJobState.UPLOAD_SNAPSHOT;
 
             // log
-            catalog.getEditLog().logBackupJob(this);
+            globalStateMgr.getEditLog().logBackupJob(this);
             LOG.info("finished to make snapshots. {}", this);
             return;
         }
@@ -494,7 +493,7 @@ public class BackupJob extends AbstractJob {
             LOG.info("backend {} has {} batch, total {} tasks, {}", beId, batchNum, totalNum, this);
 
             List<FsBroker> brokers = Lists.newArrayList();
-            Status st = repo.getBrokerAddress(beId, catalog, brokers);
+            Status st = repo.getBrokerAddress(beId, globalStateMgr, brokers);
             if (!st.ok()) {
                 status = st;
                 return;
@@ -512,7 +511,7 @@ public class BackupJob extends AbstractJob {
                     String dest = repo.getRepoTabletPathBySnapshotInfo(label, info);
                     srcToDest.put(src, dest);
                 }
-                long signature = catalog.getNextId();
+                long signature = globalStateMgr.getNextId();
                 UploadTask task = new UploadTask(null, beId, signature, jobId, dbId, srcToDest,
                         brokers.get(0), repo.getStorage().getProperties());
                 batchTask.addTask(task);
@@ -538,7 +537,7 @@ public class BackupJob extends AbstractJob {
             state = BackupJobState.SAVE_META;
 
             // log
-            catalog.getEditLog().logBackupJob(this);
+            globalStateMgr.getEditLog().logBackupJob(this);
             LOG.info("finished uploading snapshots. {}", this);
             return;
         }
@@ -558,9 +557,11 @@ public class BackupJob extends AbstractJob {
             File jobDir = new File(localJobDirPath.toString());
             if (jobDir.exists()) {
                 // if dir exists, delete it first
-                Files.walk(localJobDirPath,
-                        FileVisitOption.FOLLOW_LINKS).sorted(Comparator.reverseOrder()).map(Path::toFile)
-                        .forEach(File::delete);
+                try (Stream<Path> path = Files.walk(localJobDirPath,
+                        FileVisitOption.FOLLOW_LINKS)) {
+                    path.sorted(Comparator.reverseOrder()).map(Path::toFile)
+                            .forEach(File::delete);
+                }
             }
             if (!jobDir.mkdir()) {
                 status = new Status(ErrCode.COMMON_ERROR, "Failed to create tmp dir: " + localJobDirPath);
@@ -605,7 +606,7 @@ public class BackupJob extends AbstractJob {
         snapshotInfos.clear();
 
         // log
-        catalog.getEditLog().logBackupJob(this);
+        globalStateMgr.getEditLog().logBackupJob(this);
         LOG.info("finished to save meta the backup job info file to local.[{}], [{}] {}",
                 localMetaInfoFilePath, localJobInfoFilePath, this);
     }
@@ -641,7 +642,7 @@ public class BackupJob extends AbstractJob {
         state = BackupJobState.FINISHED;
 
         // log
-        catalog.getEditLog().logBackupJob(this);
+        globalStateMgr.getEditLog().logBackupJob(this);
         LOG.info("job is finished. {}", this);
     }
 
@@ -667,10 +668,10 @@ public class BackupJob extends AbstractJob {
     }
 
     /*
-     * Choose a replica order by replica id.
-     * This is to expect to choose the same replica at each backup job.
+     * Choose a replica whose version >= visibleVersion and dose not have failed version.
+     * Iterate replica order by replica id, the reason is to choose the same replica at each backup job.
      */
-    private Replica chooseReplica(Tablet tablet, long visibleVersion, long visibleVersionHash) {
+    private Replica chooseReplica(LocalTablet tablet, long visibleVersion) {
         List<Long> replicaIds = Lists.newArrayList();
         for (Replica replica : tablet.getReplicas()) {
             replicaIds.add(replica.getId());
@@ -679,8 +680,7 @@ public class BackupJob extends AbstractJob {
         Collections.sort(replicaIds);
         for (Long replicaId : replicaIds) {
             Replica replica = tablet.getReplicaById(replicaId);
-            if (replica.getLastFailedVersion() < 0 && (replica.getVersion() > visibleVersion
-                    || (replica.getVersion() == visibleVersion && replica.getVersionHash() == visibleVersionHash))) {
+            if (replica.getLastFailedVersion() < 0 && (replica.getVersion() >= visibleVersion)) {
                 return replica;
             }
         }
@@ -711,9 +711,11 @@ public class BackupJob extends AbstractJob {
             try {
                 File jobDir = new File(localJobDirPath.toString());
                 if (jobDir.exists()) {
-                    Files.walk(localJobDirPath,
-                            FileVisitOption.FOLLOW_LINKS).sorted(Comparator.reverseOrder()).map(Path::toFile)
-                            .forEach(File::delete);
+                    try (Stream<Path> path = Files.walk(localJobDirPath,
+                            FileVisitOption.FOLLOW_LINKS)) {
+                        path.sorted(Comparator.reverseOrder()).map(Path::toFile)
+                                .forEach(File::delete);
+                    }
                 }
             } catch (Exception e) {
                 LOG.warn("failed to clean the backup job dir: " + localJobDirPath.toString());
@@ -727,7 +729,7 @@ public class BackupJob extends AbstractJob {
         state = BackupJobState.CANCELLED;
 
         // log
-        catalog.getEditLog().logBackupJob(this);
+        globalStateMgr.getEditLog().logBackupJob(this);
         LOG.info("finished to cancel backup job. current state: {}. {}", curState.name(), this);
     }
 

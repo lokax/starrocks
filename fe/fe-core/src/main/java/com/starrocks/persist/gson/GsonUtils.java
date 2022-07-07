@@ -51,25 +51,43 @@ import com.google.gson.stream.JsonWriter;
 import com.starrocks.alter.AlterJobV2;
 import com.starrocks.alter.RollupJobV2;
 import com.starrocks.alter.SchemaChangeJobV2;
+import com.starrocks.analysis.Expr;
 import com.starrocks.catalog.AnyArrayType;
 import com.starrocks.catalog.AnyElementType;
 import com.starrocks.catalog.ArrayType;
 import com.starrocks.catalog.DistributionInfo;
+import com.starrocks.catalog.ExpressionRangePartitionInfo;
 import com.starrocks.catalog.HashDistributionInfo;
 import com.starrocks.catalog.HiveResource;
+import com.starrocks.catalog.HudiResource;
+import com.starrocks.catalog.IcebergResource;
+import com.starrocks.catalog.JDBCResource;
+import com.starrocks.catalog.LocalTablet;
 import com.starrocks.catalog.MapType;
 import com.starrocks.catalog.OdbcCatalogResource;
+import com.starrocks.catalog.PartitionInfo;
+import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.PseudoType;
 import com.starrocks.catalog.RandomDistributionInfo;
+import com.starrocks.catalog.RangePartitionInfo;
 import com.starrocks.catalog.Resource;
 import com.starrocks.catalog.ScalarType;
+import com.starrocks.catalog.SinglePartitionInfo;
 import com.starrocks.catalog.SparkResource;
 import com.starrocks.catalog.StructType;
+import com.starrocks.catalog.Tablet;
+import com.starrocks.catalog.lake.LakeTablet;
 import com.starrocks.load.loadv2.LoadJob.LoadJobStateUpdateInfo;
 import com.starrocks.load.loadv2.SparkLoadJob.SparkLoadJobStateUpdateInfo;
+import com.starrocks.qe.SqlModeHelper;
 import com.starrocks.sql.optimizer.dump.QueryDumpDeserializer;
 import com.starrocks.sql.optimizer.dump.QueryDumpInfo;
 import com.starrocks.sql.optimizer.dump.QueryDumpSerializer;
+import com.starrocks.sql.parser.SqlParser;
+import com.starrocks.system.BackendHbResponse;
+import com.starrocks.system.BrokerHbResponse;
+import com.starrocks.system.FrontendHbResponse;
+import com.starrocks.system.HeartbeatResponse;
 
 import java.io.IOException;
 import java.lang.reflect.Method;
@@ -117,12 +135,22 @@ public class GsonUtils {
                     .registerSubtype(HashDistributionInfo.class, HashDistributionInfo.class.getSimpleName())
                     .registerSubtype(RandomDistributionInfo.class, RandomDistributionInfo.class.getSimpleName());
 
+    private static final RuntimeTypeAdapterFactory<PartitionInfo> partitionInfoTypeAdapterFactory =
+            RuntimeTypeAdapterFactory
+                    .of(PartitionInfo.class, "clazz")
+                    .registerSubtype(RangePartitionInfo.class, RangePartitionInfo.class.getSimpleName())
+                    .registerSubtype(SinglePartitionInfo.class, SinglePartitionInfo.class.getSimpleName())
+                    .registerSubtype(ExpressionRangePartitionInfo.class, ExpressionRangePartitionInfo.class.getSimpleName());
+
     // runtime adapter for class "Resource"
     private static final RuntimeTypeAdapterFactory<Resource> resourceTypeAdapterFactory = RuntimeTypeAdapterFactory
             .of(Resource.class, "clazz")
             .registerSubtype(SparkResource.class, SparkResource.class.getSimpleName())
             .registerSubtype(HiveResource.class, HiveResource.class.getSimpleName())
-            .registerSubtype(OdbcCatalogResource.class, OdbcCatalogResource.class.getSimpleName());
+            .registerSubtype(IcebergResource.class, IcebergResource.class.getSimpleName())
+            .registerSubtype(HudiResource.class, HudiResource.class.getSimpleName())
+            .registerSubtype(OdbcCatalogResource.class, OdbcCatalogResource.class.getSimpleName())
+            .registerSubtype(JDBCResource.class, JDBCResource.class.getSimpleName());
 
     // runtime adapter for class "AlterJobV2"
     private static final RuntimeTypeAdapterFactory<AlterJobV2> alterJobV2TypeAdapterFactory = RuntimeTypeAdapterFactory
@@ -136,6 +164,19 @@ public class GsonUtils {
             .of(LoadJobStateUpdateInfo.class, "clazz")
             .registerSubtype(SparkLoadJobStateUpdateInfo.class, SparkLoadJobStateUpdateInfo.class.getSimpleName());
 
+    // runtime adapter for class "Tablet"
+    private static final RuntimeTypeAdapterFactory<Tablet> tabletTypeAdapterFactory = RuntimeTypeAdapterFactory
+            .of(Tablet.class, "clazz")
+            .registerSubtype(LocalTablet.class, LocalTablet.class.getSimpleName(), true)
+            .registerSubtype(LakeTablet.class, LakeTablet.class.getSimpleName());
+
+    // runtime adapter for HeartbeatResponse
+    private static final RuntimeTypeAdapterFactory<HeartbeatResponse> heartbeatResponseAdapterFactor = RuntimeTypeAdapterFactory
+            .of(HeartbeatResponse.class, "clazz")
+            .registerSubtype(BackendHbResponse.class, BackendHbResponse.class.getSimpleName())
+            .registerSubtype(FrontendHbResponse.class, FrontendHbResponse.class.getSimpleName())
+            .registerSubtype(BrokerHbResponse.class, BrokerHbResponse.class.getSimpleName());
+
     private static final JsonSerializer<LocalDateTime> localDateTimeTypeSerializer =
             (dateTime, type, jsonSerializationContext) -> new JsonPrimitive(dateTime.toEpochSecond(ZoneOffset.UTC));
 
@@ -147,6 +188,12 @@ public class GsonUtils {
 
     private static final JsonDeserializer<QueryDumpInfo> dumpInfoDeserializer = new QueryDumpDeserializer();
 
+    private static final JsonSerializer<Expr> expressionSerializer = new ExpressionSerializer();
+
+    private static final JsonDeserializer<Expr> expressionDeserializer = new ExpressionDeserializer();
+
+    private static final JsonDeserializer<PrimitiveType> primitiveTypeDeserializer = new PrimitiveTypeDeserializer();
+
     // the builder of GSON instance.
     // Add any other adapters if necessary.
     private static final GsonBuilder GSON_BUILDER = new GsonBuilder()
@@ -154,16 +201,22 @@ public class GsonUtils {
             .enableComplexMapKeySerialization()
             .registerTypeHierarchyAdapter(Table.class, new GuavaTableAdapter())
             .registerTypeHierarchyAdapter(Multimap.class, new GuavaMultimapAdapter())
-            .registerTypeAdapterFactory(new PostProcessTypeAdapterFactory())
+            .registerTypeAdapterFactory(new ProcessHookTypeAdapterFactory())
             .registerTypeAdapterFactory(columnTypeAdapterFactory)
             .registerTypeAdapterFactory(distributionInfoTypeAdapterFactory)
             .registerTypeAdapterFactory(resourceTypeAdapterFactory)
             .registerTypeAdapterFactory(alterJobV2TypeAdapterFactory)
             .registerTypeAdapterFactory(loadJobStateUpdateInfoTypeAdapterFactory)
+            .registerTypeAdapterFactory(tabletTypeAdapterFactory)
+            .registerTypeAdapterFactory(heartbeatResponseAdapterFactor)
+            .registerTypeAdapterFactory(partitionInfoTypeAdapterFactory)
             .registerTypeAdapter(LocalDateTime.class, localDateTimeTypeSerializer)
             .registerTypeAdapter(LocalDateTime.class, localDateTimeTypeDeserializer)
             .registerTypeAdapter(QueryDumpInfo.class, dumpInfoSerializer)
-            .registerTypeAdapter(QueryDumpInfo.class, dumpInfoDeserializer);
+            .registerTypeAdapter(QueryDumpInfo.class, dumpInfoDeserializer)
+            .registerTypeAdapter(PrimitiveType.class, primitiveTypeDeserializer)
+            .registerTypeHierarchyAdapter(Expr.class, expressionSerializer)
+            .registerTypeHierarchyAdapter(Expr.class, expressionDeserializer);
 
     // this instance is thread-safe.
     public static final Gson GSON = GSON_BUILDER.create();
@@ -365,9 +418,9 @@ public class GsonUtils {
         }
     }
 
-    public static class PostProcessTypeAdapterFactory implements TypeAdapterFactory {
+    public static class ProcessHookTypeAdapterFactory implements TypeAdapterFactory {
 
-        public PostProcessTypeAdapterFactory() {
+        public ProcessHookTypeAdapterFactory() {
         }
 
         @Override
@@ -375,8 +428,11 @@ public class GsonUtils {
             TypeAdapter<T> delegate = gson.getDelegateAdapter(this, type);
 
             return new TypeAdapter<T>() {
-                public void write(JsonWriter out, T value) throws IOException {
-                    delegate.write(out, value);
+                public void write(JsonWriter out, T obj) throws IOException {
+                    if (obj instanceof GsonPreProcessable) {
+                        ((GsonPreProcessable) obj).gsonPreProcess();
+                    }
+                    delegate.write(out, obj);
                 }
 
                 public T read(JsonReader reader) throws IOException {
@@ -390,4 +446,34 @@ public class GsonUtils {
         }
     }
 
+    private static class PrimitiveTypeDeserializer implements JsonDeserializer<PrimitiveType> {
+        @Override
+        public PrimitiveType deserialize(JsonElement json, Type typeOfT, JsonDeserializationContext context)
+                throws JsonParseException {
+            try {
+                return PrimitiveType.valueOf(json.getAsJsonPrimitive().getAsString());
+            } catch (Throwable t) {
+                return PrimitiveType.INVALID_TYPE;
+            }
+        }
+    }
+
+    private static class ExpressionSerializer implements JsonSerializer<Expr> {
+        @Override
+        public JsonElement serialize(Expr expr, Type type, JsonSerializationContext context) {
+            JsonObject expressionJson = new JsonObject();
+            expressionJson.addProperty("expr", expr.toSql());
+            return expressionJson;
+        }
+    }
+
+    private static class ExpressionDeserializer implements JsonDeserializer<Expr> {
+        @Override
+        public Expr deserialize(JsonElement jsonElement, Type type, JsonDeserializationContext context)
+                throws JsonParseException {
+            JsonObject expressionObject = jsonElement.getAsJsonObject();
+            String expressionSql = expressionObject.get("expr").getAsString();
+            return SqlParser.parseSqlToExpr(expressionSql, SqlModeHelper.MODE_DEFAULT);
+        }
+    }
 }

@@ -23,26 +23,24 @@ package com.starrocks.consistency;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.LocalTablet;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Replica;
 import com.starrocks.catalog.Replica.ReplicaState;
 import com.starrocks.catalog.Table;
-import com.starrocks.catalog.Tablet;
 import com.starrocks.catalog.TabletInvertedIndex;
 import com.starrocks.catalog.TabletMeta;
 import com.starrocks.common.Config;
 import com.starrocks.persist.ConsistencyCheckInfo;
-import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.task.AgentBatchTask;
 import com.starrocks.task.AgentTask;
 import com.starrocks.task.AgentTaskExecutor;
 import com.starrocks.task.AgentTaskQueue;
 import com.starrocks.task.CheckConsistencyTask;
-import com.starrocks.thrift.TResourceInfo;
 import com.starrocks.thrift.TTaskType;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -69,7 +67,6 @@ public class CheckConsistencyJob {
 
     private int checkedSchemaHash;
     private long checkedVersion;
-    private long checkedVersionHash;
 
     private long createTime;
     private long timeoutMs;
@@ -82,7 +79,6 @@ public class CheckConsistencyJob {
 
         this.checkedSchemaHash = -1;
         this.checkedVersion = -1L;
-        this.checkedVersionHash = -1L;
 
         this.createTime = System.currentTimeMillis();
         this.timeoutMs = 0L;
@@ -110,26 +106,20 @@ public class CheckConsistencyJob {
      *  false: cancel
      */
     public boolean sendTasks() {
-        TabletInvertedIndex invertedIndex = Catalog.getCurrentInvertedIndex();
+        TabletInvertedIndex invertedIndex = GlobalStateMgr.getCurrentInvertedIndex();
         TabletMeta tabletMeta = invertedIndex.getTabletMeta(tabletId);
         if (tabletMeta == null) {
             LOG.debug("tablet[{}] has been removed", tabletId);
             return false;
         }
 
-        Database db = Catalog.getCurrentCatalog().getDb(tabletMeta.getDbId());
+        Database db = GlobalStateMgr.getCurrentState().getDb(tabletMeta.getDbId());
         if (db == null) {
             LOG.debug("db[{}] does not exist", tabletMeta.getDbId());
             return false;
         }
 
-        // get user resource info
-        TResourceInfo resourceInfo = null;
-        if (ConnectContext.get() != null) {
-            resourceInfo = ConnectContext.get().toResourceCtx();
-        }
-
-        Tablet tablet = null;
+        LocalTablet tablet = null;
 
         AgentBatchTask batchTask = new AgentBatchTask();
         db.readLock();
@@ -160,14 +150,13 @@ public class CheckConsistencyJob {
                 return false;
             }
 
-            tablet = index.getTablet(tabletId);
+            tablet = (LocalTablet) index.getTablet(tabletId);
             if (tablet == null) {
                 LOG.debug("tablet[{}] does not exist", tabletId);
                 return false;
             }
 
             checkedVersion = partition.getVisibleVersion();
-            checkedVersionHash = partition.getVisibleVersionHash();
             checkedSchemaHash = olapTable.getSchemaHashByIndexId(tabletMeta.getIndexId());
 
             int sentTaskReplicaNum = 0;
@@ -183,13 +172,13 @@ public class CheckConsistencyJob {
                     maxDataSize = replica.getDataSize();
                 }
 
-                CheckConsistencyTask task = new CheckConsistencyTask(resourceInfo, replica.getBackendId(),
+                CheckConsistencyTask task = new CheckConsistencyTask(null, replica.getBackendId(),
                         tabletMeta.getDbId(),
                         tabletMeta.getTableId(),
                         tabletMeta.getPartitionId(),
                         tabletMeta.getIndexId(),
                         tabletId, checkedSchemaHash,
-                        checkedVersion, checkedVersionHash);
+                        checkedVersion);
 
                 // add task to send
                 batchTask.addTask(task);
@@ -215,10 +204,10 @@ public class CheckConsistencyJob {
         }
 
         if (state != JobState.RUNNING) {
-            // failed to send task. set tablet's checked version and version hash to avoid choosing it again
+            // failed to send task. set tablet's checked version to avoid choosing it again
             db.writeLock();
             try {
-                tablet.setCheckedVersion(checkedVersion, checkedVersionHash);
+                tablet.setCheckedVersion(checkedVersion);
             } finally {
                 db.writeUnlock();
             }
@@ -248,13 +237,13 @@ public class CheckConsistencyJob {
         }
 
         // check again. in case tablet has already been removed
-        TabletMeta tabletMeta = Catalog.getCurrentInvertedIndex().getTabletMeta(tabletId);
+        TabletMeta tabletMeta = GlobalStateMgr.getCurrentInvertedIndex().getTabletMeta(tabletId);
         if (tabletMeta == null) {
             LOG.warn("tablet[{}] has been removed", tabletId);
             return -1;
         }
 
-        Database db = Catalog.getCurrentCatalog().getDb(tabletMeta.getDbId());
+        Database db = GlobalStateMgr.getCurrentState().getDb(tabletMeta.getDbId());
         if (db == null) {
             LOG.warn("db[{}] does not exist", tabletMeta.getDbId());
             return -1;
@@ -282,7 +271,7 @@ public class CheckConsistencyJob {
                 return -1;
             }
 
-            Tablet tablet = index.getTablet(tabletId);
+            LocalTablet tablet = (LocalTablet) index.getTablet(tabletId);
             if (tablet == null) {
                 LOG.warn("tablet[{}] does not exist", tabletId);
                 return -1;
@@ -360,13 +349,13 @@ public class CheckConsistencyJob {
             tablet.setIsConsistent(isConsistent);
 
             // set checked version
-            tablet.setCheckedVersion(checkedVersion, checkedVersionHash);
+            tablet.setCheckedVersion(checkedVersion);
 
             // log
             ConsistencyCheckInfo info = new ConsistencyCheckInfo(db.getId(), table.getId(), partition.getId(),
                     index.getId(), tabletId, lastCheckTime,
-                    checkedVersion, checkedVersionHash, isConsistent);
-            Catalog.getCurrentCatalog().getEditLog().logFinishConsistencyCheck(info);
+                    checkedVersion, isConsistent);
+            GlobalStateMgr.getCurrentState().getEditLog().logFinishConsistencyCheck(info);
             return 1;
 
         } finally {

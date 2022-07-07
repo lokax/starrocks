@@ -21,7 +21,6 @@
 
 package com.starrocks.planner;
 
-import com.google.common.base.Preconditions;
 import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.Expr;
 import com.starrocks.common.UserException;
@@ -36,16 +35,12 @@ import java.util.List;
 /**
  * Node that applies conjuncts and a limit clause. Has exactly one child.
  */
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public class SelectNode extends PlanNode {
     private static final Logger LOG = LogManager.getLogger(SelectNode.class);
 
     public SelectNode(PlanNodeId id, PlanNode child, List<Expr> conjuncts) {
         super(id, child.getTupleIds(), "SELECT");
         addChild(child);
-        this.tblRefIds = child.tblRefIds;
         this.nullableTupleIds = child.nullableTupleIds;
         this.conjuncts.addAll(conjuncts);
     }
@@ -57,21 +52,10 @@ public class SelectNode extends PlanNode {
 
     @Override
     public void init(Analyzer analyzer) throws UserException {
-        analyzer.markConjunctsAssigned(conjuncts);
-        computeStats(analyzer);
-        createDefaultSmap(analyzer);
     }
 
     @Override
     public void computeStats(Analyzer analyzer) {
-        super.computeStats(analyzer);
-        if (getChild(0).cardinality == -1) {
-            cardinality = -1;
-        } else {
-            cardinality = Math.round(((double) getChild(0).cardinality) * computeSelectivity());
-            Preconditions.checkState(cardinality >= 0);
-        }
-        LOG.info("stats Select: cardinality=" + Long.toString(cardinality));
     }
 
     @Override
@@ -89,32 +73,7 @@ public class SelectNode extends PlanNode {
     }
 
     @Override
-    public boolean isVectorized() {
-        for (PlanNode node : getChildren()) {
-            if (!node.isVectorized()) {
-                return false;
-            }
-        }
-
-        for (Expr expr : conjuncts) {
-            if (!expr.isVectorized()) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    @Override
-    public void setUseVectorized(boolean flag) {
-        this.useVectorized = flag;
-
-        for (PlanNode node : getChildren()) {
-            node.setUseVectorized(flag);
-        }
-
-        for (Expr expr : conjuncts) {
-            expr.setUseVectorized(flag);
-        }
+    public boolean canUsePipeLine() {
+        return getChildren().stream().allMatch(PlanNode::canUsePipeLine);
     }
 }

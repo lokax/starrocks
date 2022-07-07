@@ -21,7 +21,7 @@
 
 #include "exec/scan_node.h"
 
-#include <functional>
+#include "exec/pipeline/scan/morsel.h"
 
 namespace starrocks {
 
@@ -30,7 +30,6 @@ const std::string ScanNode::_s_rows_read_counter = "RowsRead";
 const std::string ScanNode::_s_total_read_timer = "TotalRawReadTime(*)";
 const std::string ScanNode::_s_total_throughput_counter = "TotalReadThroughput";
 const std::string ScanNode::_s_materialize_tuple_timer = "MaterializeTupleTime(*)";
-const std::string ScanNode::_s_per_read_thread_throughput_counter = "PerReadThreadRawHdfsThroughput";
 const std::string ScanNode::_s_num_disks_accessed_counter = "NumDiskAccess";
 const std::string ScanNode::_s_scanner_thread_counters_prefix = "ScannerThreads";
 const std::string ScanNode::_s_scanner_thread_total_wallclock_time = "ScannerThreadsTotalWallClockTime";
@@ -50,12 +49,50 @@ Status ScanNode::prepare(RuntimeState* state) {
 #endif
     _materialize_tuple_timer =
             ADD_CHILD_TIMER(runtime_profile(), _s_materialize_tuple_timer, _s_scanner_thread_total_wallclock_time);
-    _per_read_thread_throughput_counter = runtime_profile()->add_derived_counter(
-            _s_per_read_thread_throughput_counter, TUnit::BYTES_PER_SECOND,
-            std::bind<int64_t>(&RuntimeProfile::units_per_second, _bytes_read_counter, _read_timer), "");
     _num_disks_accessed_counter = ADD_COUNTER(runtime_profile(), _s_num_disks_accessed_counter, TUnit::UNIT);
 
     return Status::OK();
+}
+
+StatusOr<pipeline::MorselQueueFactoryPtr> ScanNode::convert_scan_range_to_morsel_queue_factory(
+        const std::vector<TScanRangeParams>& global_scan_ranges,
+        const std::map<int32_t, std::vector<TScanRangeParams>>& scan_ranges_per_driver_seq, int node_id,
+        const TExecPlanFragmentParams& request, int pipeline_dop) {
+    if (scan_ranges_per_driver_seq.empty()) {
+        ASSIGN_OR_RETURN(auto morsel_queue, convert_scan_range_to_morsel_queue(global_scan_ranges, node_id, request,
+                                                                               global_scan_ranges.size()));
+        int scan_dop = std::min<int>(std::max<int>(1, morsel_queue->num_morsels()), pipeline_dop);
+        return std::make_unique<pipeline::SharedMorselQueueFactory>(std::move(morsel_queue), scan_dop);
+    } else {
+        size_t num_total_scan_ranges = 0;
+        for (const auto& [_, scan_ranges] : scan_ranges_per_driver_seq) {
+            num_total_scan_ranges += scan_ranges.size();
+        }
+
+        std::map<int, pipeline::MorselQueuePtr> queue_per_driver_seq;
+        for (const auto& [dop, scan_ranges] : scan_ranges_per_driver_seq) {
+            ASSIGN_OR_RETURN(auto queue,
+                             convert_scan_range_to_morsel_queue(scan_ranges, node_id, request, num_total_scan_ranges));
+            queue_per_driver_seq.emplace(dop, std::move(queue));
+        }
+
+        return std::make_unique<pipeline::IndividualMorselQueueFactory>(std::move(queue_per_driver_seq));
+    }
+}
+
+StatusOr<pipeline::MorselQueuePtr> ScanNode::convert_scan_range_to_morsel_queue(
+        const std::vector<TScanRangeParams>& scan_ranges, int node_id, const TExecPlanFragmentParams&, size_t) {
+    pipeline::Morsels morsels;
+    // If this scan node does not accept non-empty scan ranges, create a placeholder one.
+    if (!accept_empty_scan_ranges() && scan_ranges.empty()) {
+        morsels.emplace_back(std::make_unique<pipeline::ScanMorsel>(node_id, TScanRangeParams()));
+    } else {
+        for (const auto& scan_range : scan_ranges) {
+            morsels.emplace_back(std::make_unique<pipeline::ScanMorsel>(node_id, scan_range));
+        }
+    }
+
+    return std::make_unique<pipeline::FixedMorselQueue>(std::move(morsels));
 }
 
 } // namespace starrocks

@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.rule.transformation;
 
 import com.google.common.collect.Lists;
@@ -35,8 +35,7 @@ public class PushDownPredicateSetRule {
             }
 
             ReplaceColumnRefRewriter rewriter = new ReplaceColumnRefRewriter(operatorMap);
-            ScalarOperator filter = filterOperator.getPredicate().clone();
-            ScalarOperator rewriteExpr = rewriter.visit(filter, null);
+            ScalarOperator rewriteExpr = rewriter.rewrite(filterOperator.getPredicate());
 
             OptExpression filterOpExpression =
                     OptExpression.create(new LogicalFilterOperator(rewriteExpr), setOptExpression.inputAt(setChildIdx));

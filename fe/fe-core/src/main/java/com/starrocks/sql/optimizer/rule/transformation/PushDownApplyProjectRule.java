@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
@@ -42,22 +42,22 @@ public class PushDownApplyProjectRule extends TransformationRule {
 
         LogicalProjectOperator project = (LogicalProjectOperator) child.getOp();
         ReplaceColumnRefRewriter rewriter = new ReplaceColumnRefRewriter(project.getColumnRefMap());
-        ScalarOperator newScalarOperator = apply.getSubqueryOperator().accept(rewriter, null);
+        ScalarOperator newScalarOperator = rewriter.rewrite(apply.getSubqueryOperator());
         ScalarOperator newPredicate = null;
         if (null != apply.getPredicate()) {
-            newPredicate = apply.getPredicate().accept(rewriter, null);
+            newPredicate = rewriter.rewrite(apply.getPredicate());
         }
 
         OptExpression newApply = new OptExpression(
                 new LogicalApplyOperator(apply.getOutput(), newScalarOperator, apply.getCorrelationColumnRefs(),
                         apply.getCorrelationConjuncts(), newPredicate, apply.isNeedCheckMaxRows(),
-                        apply.isFromAndScope()));
+                        apply.isUseSemiAnti()));
 
         newApply.getInputs().add(input.getInputs().get(0));
         newApply.getInputs().addAll(child.getInputs());
 
         ColumnRefFactory factory = context.getColumnRefFactory();
-        Map<ColumnRefOperator, ScalarOperator> allOutput = Maps.newHashMap(project.getColumnRefMap());
+        Map<ColumnRefOperator, ScalarOperator> allOutput = Maps.newHashMap();
 
         // add all left outer column
         Arrays.stream(input.getInputs().get(0).getOutputColumns().getColumnIds()).mapToObj(factory::getColumnRef)

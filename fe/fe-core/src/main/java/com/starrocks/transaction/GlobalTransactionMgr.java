@@ -23,16 +23,27 @@ package com.starrocks.transaction;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
 import com.starrocks.common.DuplicatedRequestException;
+import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.LabelAlreadyUsedException;
 import com.starrocks.common.Pair;
 import com.starrocks.common.UserException;
 import com.starrocks.common.io.Writable;
 import com.starrocks.persist.EditLog;
+import com.starrocks.rpc.FrontendServiceProxy;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.thrift.TAbortRemoteTxnRequest;
+import com.starrocks.thrift.TAbortRemoteTxnResponse;
+import com.starrocks.thrift.TBeginRemoteTxnRequest;
+import com.starrocks.thrift.TBeginRemoteTxnResponse;
+import com.starrocks.thrift.TCommitRemoteTxnRequest;
+import com.starrocks.thrift.TCommitRemoteTxnResponse;
+import com.starrocks.thrift.TNetworkAddress;
+import com.starrocks.thrift.TStatusCode;
+import com.starrocks.thrift.TTabletCommitInfo;
 import com.starrocks.thrift.TUniqueId;
 import com.starrocks.transaction.TransactionState.LoadJobSourceType;
 import com.starrocks.transaction.TransactionState.TxnCoordinator;
@@ -41,7 +52,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
+import java.io.DataInputStream;
 import java.io.DataOutput;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -54,7 +67,8 @@ import java.util.concurrent.TimeUnit;
  * 1. begin
  * 2. commit
  * 3. abort
- * Attention: all api in txn manager should get db lock or load lock first, then get txn manager's lock, or there will be dead lock
+ * Attention: all api in txn manager should get db lock or load lock first, then get txn manager's lock, or
+ * there will be dead lock
  */
 public class GlobalTransactionMgr implements Writable {
     private static final Logger LOG = LogManager.getLogger(GlobalTransactionMgr.class);
@@ -64,10 +78,10 @@ public class GlobalTransactionMgr implements Writable {
     private TransactionIdGenerator idGenerator = new TransactionIdGenerator();
     private TxnStateCallbackFactory callbackFactory = new TxnStateCallbackFactory();
 
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
 
-    public GlobalTransactionMgr(Catalog catalog) {
-        this.catalog = catalog;
+    public GlobalTransactionMgr(GlobalStateMgr globalStateMgr) {
+        this.globalStateMgr = globalStateMgr;
     }
 
     public TxnStateCallbackFactory getCallbackFactory() {
@@ -83,7 +97,8 @@ public class GlobalTransactionMgr implements Writable {
     }
 
     public void addDatabaseTransactionMgr(Long dbId) {
-        if (dbIdToDatabaseTransactionMgrs.putIfAbsent(dbId, new DatabaseTransactionMgr(dbId, catalog, idGenerator)) ==
+        if (dbIdToDatabaseTransactionMgrs.putIfAbsent(dbId,
+                new DatabaseTransactionMgr(dbId, globalStateMgr, idGenerator)) ==
                 null) {
             LOG.debug("add database transaction manager for db {}", dbId);
         }
@@ -92,6 +107,134 @@ public class GlobalTransactionMgr implements Writable {
     public void removeDatabaseTransactionMgr(Long dbId) {
         if (dbIdToDatabaseTransactionMgrs.remove(dbId) != null) {
             LOG.debug("remove database transaction manager for db {}", dbId);
+        }
+    }
+
+    // begin transaction in remote StarRocks cluster
+    public long beginRemoteTransaction(long dbId, List<Long> tableIds, String label,
+                                       String host, int port, TxnCoordinator coordinator,
+                                       LoadJobSourceType sourceType, long timeoutSecond)
+            throws AnalysisException, BeginTransactionException {
+        if (Config.disable_load_job) {
+            throw new AnalysisException("disable_load_job is set to true, all load jobs are prevented");
+        }
+
+        switch (sourceType) {
+            case BACKEND_STREAMING:
+                checkValidTimeoutSecond(timeoutSecond, Config.max_stream_load_timeout_second,
+                        Config.min_load_timeout_second);
+                break;
+            default:
+                checkValidTimeoutSecond(timeoutSecond, Config.max_load_timeout_second, Config.min_load_timeout_second);
+        }
+
+        TNetworkAddress addr = new TNetworkAddress(host, port);
+        TBeginRemoteTxnRequest request = new TBeginRemoteTxnRequest();
+        request.setDb_id(dbId);
+        for (Long tableId : tableIds) {
+            request.addToTable_ids(tableId);
+        }
+        request.setLabel(label);
+        request.setSource_type(sourceType.ordinal());
+        request.setTimeout_second(timeoutSecond);
+        TBeginRemoteTxnResponse response;
+        try {
+            response = FrontendServiceProxy.call(addr,
+                    Config.thrift_rpc_timeout_ms,
+                    Config.thrift_rpc_retry_times,
+                    client -> client.beginRemoteTxn(request));
+        } catch (Exception e) {
+            LOG.warn("call fe {} beginRemoteTransaction rpc method failed, label: {}", addr, label, e);
+            throw new BeginTransactionException(e.getMessage());
+        }
+        if (response.status.getStatus_code() != TStatusCode.OK) {
+            String errStr;
+            if (response.status.getError_msgs() != null) {
+                errStr = String.join(",", response.status.getError_msgs());
+            } else {
+                errStr = "";
+            }
+            LOG.warn("call fe {} beginRemoteTransaction rpc method failed, label: {}, error: {}", addr, label, errStr);
+            throw new BeginTransactionException(errStr);
+        } else {
+            if (response.getTxn_id() <= 0) {
+                LOG.warn("beginRemoteTransaction returns invalid txn_id: {}, label: {}",
+                        response.getTxn_id(), label);
+                throw new BeginTransactionException("beginRemoteTransaction returns invalid txn id");
+            }
+            LOG.info("begin remote txn, label: {}, txn_id: {}", label, response.getTxn_id());
+            return response.getTxn_id();
+        }
+    }
+
+    // commit transaction in remote StarRocks cluster
+    public boolean commitRemoteTransaction(long dbId, long transactionId,
+                                           String host, int port, List<TTabletCommitInfo> tabletCommitInfos)
+            throws TransactionCommitFailedException {
+
+        TNetworkAddress addr = new TNetworkAddress(host, port);
+        TCommitRemoteTxnRequest request = new TCommitRemoteTxnRequest();
+        request.setDb_id(dbId);
+        request.setTxn_id(transactionId);
+        request.setCommit_infos(tabletCommitInfos);
+        TCommitRemoteTxnResponse response;
+        try {
+            response = FrontendServiceProxy.call(addr,
+                    Config.thrift_rpc_timeout_ms,
+                    Config.thrift_rpc_retry_times,
+                    client -> client.commitRemoteTxn(request));
+        } catch (Exception e) {
+            LOG.warn("call fe {} commitRemoteTransaction rpc method failed, txn_id: {} e: {}", addr, transactionId, e);
+            throw new TransactionCommitFailedException(e.getMessage());
+        }
+        if (response.status.getStatus_code() != TStatusCode.OK) {
+            String errStr;
+            if (response.status.getError_msgs() != null) {
+                errStr = String.join(",", response.status.getError_msgs());
+            } else {
+                errStr = "";
+            }
+            LOG.warn("call fe {} commitRemoteTransaction rpc method failed, txn_id: {}, error: {}", addr, transactionId,
+                    errStr);
+            throw new TransactionCommitFailedException(errStr);
+        } else {
+            LOG.info("commit remote, txn_id: {}", transactionId);
+            return true;
+        }
+    }
+
+    // abort transaction in remote StarRocks cluster
+    public void abortRemoteTransaction(long dbId, long transactionId,
+                                       String host, int port, String errorMsg)
+            throws AbortTransactionException {
+
+        TNetworkAddress addr = new TNetworkAddress(host, port);
+        TAbortRemoteTxnRequest request = new TAbortRemoteTxnRequest();
+        request.setDb_id(dbId);
+        request.setTxn_id(transactionId);
+        request.setError_msg(errorMsg);
+        TAbortRemoteTxnResponse response;
+        try {
+            response = FrontendServiceProxy.call(addr,
+                    Config.thrift_rpc_timeout_ms,
+                    Config.thrift_rpc_retry_times,
+                    client -> client.abortRemoteTxn(request));
+        } catch (Exception e) {
+            LOG.warn("call fe {} abortRemoteTransaction rpc method failed, txn_id: {} e: {}", addr, transactionId, e);
+            throw new AbortTransactionException(e.getMessage());
+        }
+        if (response.status.getStatus_code() != TStatusCode.OK) {
+            String errStr;
+            if (response.status.getError_msgs() != null) {
+                errStr = String.join(",", response.status.getError_msgs());
+            } else {
+                errStr = "";
+            }
+            LOG.warn("call fe {} abortRemoteTransaction rpc method failed, txn_id: {}, error: {}", addr, transactionId,
+                    errStr);
+            throw new AbortTransactionException(errStr);
+        } else {
+            LOG.info("abort remote, txn_id: {}", transactionId);
         }
     }
 
@@ -198,7 +341,8 @@ public class GlobalTransactionMgr implements Writable {
         StopWatch stopWatch = new StopWatch();
         stopWatch.start();
         if (!db.tryWriteLock(timeoutMillis, TimeUnit.MILLISECONDS)) {
-            throw new UserException("get database write lock timeout, database=" + db.getFullName());
+            throw new UserException("get database write lock timeout, database="
+                    + db.getFullName() + ", timeoutMillis=" + timeoutMillis);
         }
         try {
             commitTransaction(db.getId(), transactionId, tabletCommitInfos, txnCommitAttachment);
@@ -213,7 +357,7 @@ public class GlobalTransactionMgr implements Writable {
             return false;
         }
         DatabaseTransactionMgr dbTransactionMgr = getDatabaseTransactionMgr(db.getId());
-        return dbTransactionMgr.publishTransaction(db, transactionId, publishTimeoutMillis);
+        return dbTransactionMgr.waitTransactionVisible(db, transactionId, publishTimeoutMillis);
     }
 
     public void abortTransaction(long dbId, long transactionId, String reason) throws UserException {
@@ -274,9 +418,10 @@ public class GlobalTransactionMgr implements Writable {
         dbTransactionMgr.finishTransaction(transactionId, errorReplicaIds);
     }
 
-    public boolean canTxnFinished(TransactionState txn, Set<Long> errReplicas) throws UserException {
+    public boolean canTxnFinished(TransactionState txn, Set<Long> errReplicas,
+                                  Set<Long> unfinishedBackends) throws UserException {
         DatabaseTransactionMgr dbTransactionMgr = getDatabaseTransactionMgr(txn.getDbId());
-        return dbTransactionMgr.canTxnFinished(txn, errReplicas);
+        return dbTransactionMgr.canTxnFinished(txn, errReplicas, unfinishedBackends);
     }
 
     /**
@@ -306,10 +451,17 @@ public class GlobalTransactionMgr implements Writable {
      * expired: txn is in VISIBLE or ABORTED, and is expired.
      * timeout: txn is in PREPARE, but timeout
      */
-    public void removeExpiredAndTimeoutTxns() {
+    public void abortTimeoutTxns() {
         long currentMillis = System.currentTimeMillis();
         for (DatabaseTransactionMgr dbTransactionMgr : dbIdToDatabaseTransactionMgrs.values()) {
-            dbTransactionMgr.removeExpiredAndTimeoutTxns(currentMillis);
+            dbTransactionMgr.abortTimeoutTxns(currentMillis);
+        }
+    }
+
+    public void removeExpiredTxns() {
+        long currentMillis = System.currentTimeMillis();
+        for (DatabaseTransactionMgr dbTransactionMgr : dbIdToDatabaseTransactionMgrs.values()) {
+            dbTransactionMgr.removeExpiredTxns(currentMillis);
         }
     }
 
@@ -336,7 +488,6 @@ public class GlobalTransactionMgr implements Writable {
         } catch (AnalysisException e) {
             LOG.warn("replay upsert transaction [" + transactionState.getTransactionId() + "] failed", e);
         }
-
     }
 
     public void replayDeleteTransactionState(TransactionState transactionState) {
@@ -354,7 +505,7 @@ public class GlobalTransactionMgr implements Writable {
         for (long dbId : dbIds) {
             List<Comparable> info = new ArrayList<Comparable>();
             info.add(dbId);
-            Database db = Catalog.getCurrentCatalog().getDb(dbId);
+            Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
             if (db == null) {
                 continue;
             }
@@ -422,40 +573,35 @@ public class GlobalTransactionMgr implements Writable {
     }
 
     public void readFields(DataInput in) throws IOException {
+        long now = System.currentTimeMillis();
         int numTransactions = in.readInt();
         for (int i = 0; i < numTransactions; ++i) {
             TransactionState transactionState = new TransactionState();
             transactionState.readFields(in);
+            if (transactionState.isExpired(now)) {
+                LOG.info("discard expired transaction state: {}", transactionState);
+                continue;
+            }
             try {
                 DatabaseTransactionMgr dbTransactionMgr = getDatabaseTransactionMgr(transactionState.getDbId());
                 dbTransactionMgr.unprotectUpsertTransactionState(transactionState, true);
             } catch (AnalysisException e) {
-                LOG.warn("failed to get db transaction manager for txn: {}", transactionState);
+                LOG.warn("failed to get db transaction manager for {}", transactionState);
                 throw new IOException("Read transaction states failed", e);
             }
         }
         idGenerator.readFields(in);
     }
 
-    public TransactionState getTransactionStateByCallbackIdAndStatus(long dbId, long callbackId,
-                                                                     Set<TransactionStatus> status) {
-        try {
-            DatabaseTransactionMgr dbTransactionMgr = getDatabaseTransactionMgr(dbId);
-            return dbTransactionMgr.getTransactionStateByCallbackIdAndStatus(callbackId, status);
-        } catch (AnalysisException e) {
-            LOG.warn("Get transaction by callbackId and status failed", e);
-            return null;
+    public long loadTransactionState(DataInputStream dis, long checksum) throws IOException {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_45) {
+            int size = dis.readInt();
+            long newChecksum = checksum ^ size;
+            readFields(dis);
+            LOG.info("finished replay transactionState from image");
+            return newChecksum;
         }
-    }
-
-    public TransactionState getTransactionStateByCallbackId(long dbId, long callbackId) {
-        try {
-            DatabaseTransactionMgr dbTransactionMgr = getDatabaseTransactionMgr(dbId);
-            return dbTransactionMgr.getTransactionStateByCallbackId(callbackId);
-        } catch (AnalysisException e) {
-            LOG.warn("Get transaction by callbackId failed", e);
-            return null;
-        }
+        return checksum;
     }
 
     public List<Pair<Long, Long>> getTransactionIdByCoordinateBe(String coordinateHost, int limit) {
@@ -488,5 +634,13 @@ public class GlobalTransactionMgr implements Writable {
     public void updateDatabaseUsedQuotaData(long dbId, long usedQuotaDataBytes) throws AnalysisException {
         DatabaseTransactionMgr dbTransactionMgr = getDatabaseTransactionMgr(dbId);
         dbTransactionMgr.updateDatabaseUsedQuotaData(usedQuotaDataBytes);
+    }
+
+    public long saveTransactionState(DataOutputStream dos, long checksum) throws IOException {
+        int size = getTransactionNum();
+        checksum ^= size;
+        dos.writeInt(size);
+        write(dos);
+        return checksum;
     }
 }

@@ -1,11 +1,14 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "column/object_column.h"
 
 #include "gutil/casts.h"
-#include "storage/hll.h"
-#include "util/bitmap_value.h"
+#include "types/bitmap_value.h"
+#include "types/hll.h"
+#include "util/json.h"
 #include "util/mysql_row_buffer.h"
+#include "util/percentile_value.h"
+#include "util/phmap/phmap.h"
 
 namespace starrocks::vectorized {
 
@@ -27,7 +30,9 @@ size_t ObjectColumn<T>::byte_size(size_t idx) const {
 
 template <typename T>
 void ObjectColumn<T>::assign(size_t n, size_t idx) {
-    _pool[0] = std::move(_pool[idx]);
+    if (idx != 0) {
+        _pool[0] = std::move(_pool[idx]);
+    }
     _pool.resize(1);
     _pool.reserve(n);
 
@@ -88,7 +93,7 @@ void ObjectColumn<T>::append_value_multiple_times(const starrocks::vectorized::C
 };
 
 template <typename T>
-bool ObjectColumn<T>::append_strings(const vector<starrocks::Slice>& strs) {
+bool ObjectColumn<T>::append_strings(const Buffer<starrocks::Slice>& strs) {
     _pool.reserve(_pool.size() + strs.size());
     for (const Slice& s : strs) {
         _pool.emplace_back(s);
@@ -104,7 +109,7 @@ void ObjectColumn<T>::append_value_multiple_times(const void* value, size_t coun
     _pool.reserve(_pool.size() + count);
 
     for (int i = 0; i < count; ++i) {
-        _pool.emplace_back(*slice);
+        _pool.emplace_back(*reinterpret_cast<T*>(slice->data));
     }
 
     _cache_ok = false;
@@ -121,6 +126,28 @@ void ObjectColumn<T>::append_default(size_t count) {
     for (int i = 0; i < count; ++i) {
         append_default();
     }
+}
+
+template <typename T>
+void ObjectColumn<T>::fill_default(const Filter& filter) {
+    for (size_t i = 0; i < filter.size(); i++) {
+        if (filter[i] == 1) {
+            _pool[i] = {};
+        }
+    }
+    _cache_ok = false;
+}
+
+template <typename T>
+Status ObjectColumn<T>::update_rows(const Column& src, const uint32_t* indexes) {
+    const auto& obj_col = down_cast<const ObjectColumn<T>&>(src);
+    size_t replace_num = src.size();
+    for (size_t i = 0; i < replace_num; i++) {
+        DCHECK_LT(indexes[i], _pool.size());
+        _pool[indexes[i]] = *obj_col.get_object(i);
+    }
+    _cache_ok = false;
+    return Status::OK();
 }
 
 template <typename T>
@@ -148,7 +175,7 @@ const uint8_t* ObjectColumn<T>::deserialize_and_append(const uint8_t* pos) {
 }
 
 template <typename T>
-void ObjectColumn<T>::deserialize_and_append_batch(std::vector<Slice>& srcs, size_t batch_size) {
+void ObjectColumn<T>::deserialize_and_append_batch(Buffer<Slice>& srcs, size_t chunk_size) {
     DCHECK(false) << "Don't support object column deserialize and append";
 }
 
@@ -156,43 +183,6 @@ template <typename T>
 uint32_t ObjectColumn<T>::serialize_size(size_t idx) const {
     DCHECK(false) << "Don't support object column byte size";
     return 0;
-}
-
-template <typename T>
-size_t ObjectColumn<T>::serialize_size() const {
-    // | count(4 byte) | size (8 byte)| object(size byte) | size(8 byte) |....
-    return byte_size() + sizeof(uint32_t) + _pool.size() * sizeof(uint64_t);
-}
-
-template <typename T>
-uint8_t* ObjectColumn<T>::serialize_column(uint8_t* dst) {
-    encode_fixed32_le(dst, _pool.size());
-    dst += sizeof(uint32_t);
-
-    for (int i = 0; i < _pool.size(); ++i) {
-        uint64_t actual = _pool[i].serialize(dst + sizeof(uint64_t));
-        encode_fixed64_le(dst, actual);
-
-        dst += sizeof(uint64_t);
-        dst += actual;
-    }
-    return dst;
-}
-
-template <typename T>
-const uint8_t* ObjectColumn<T>::deserialize_column(const uint8_t* src) {
-    uint32_t count = decode_fixed32_le(src);
-    src += sizeof(uint32_t);
-
-    for (int i = 0; i < count; ++i) {
-        uint64_t size = decode_fixed64_le(src);
-        src += sizeof(uint64_t);
-
-        _pool.emplace_back(Slice(src, size));
-        src += size;
-    }
-
-    return src;
 }
 
 template <typename T>
@@ -224,7 +214,7 @@ int ObjectColumn<T>::compare_at(size_t left, size_t right, const starrocks::vect
 }
 
 template <typename T>
-void ObjectColumn<T>::fvn_hash(uint32_t* hash, uint16_t from, uint16_t to) const {
+void ObjectColumn<T>::fnv_hash(uint32_t* hash, uint32_t from, uint32_t to) const {
     std::string s;
     for (int i = from; i < to; ++i) {
         s.resize(_pool[i].serialize_size());
@@ -234,8 +224,14 @@ void ObjectColumn<T>::fvn_hash(uint32_t* hash, uint16_t from, uint16_t to) const
 }
 
 template <typename T>
-void ObjectColumn<T>::crc32_hash(uint32_t* hash, uint16_t from, uint16_t to) const {
+void ObjectColumn<T>::crc32_hash(uint32_t* hash, uint32_t from, uint32_t to) const {
     DCHECK(false) << "object column shouldn't call crc32_hash ";
+}
+
+template <typename T>
+int64_t ObjectColumn<T>::xor_checksum(uint32_t from, uint32_t to) const {
+    DCHECK(false) << "object column shouldn't call xor_checksum";
+    return 0;
 }
 
 template <typename T>
@@ -292,8 +288,17 @@ std::string ObjectColumn<BitmapValue>::debug_item(uint32_t idx) const {
     return _pool[idx].to_string();
 }
 
+template <typename T>
+StatusOr<ColumnPtr> ObjectColumn<T>::upgrade_if_overflow() {
+    if (capacity_limit_reached()) {
+        return Status::InternalError("Size of ObjectColumn exceed the limit");
+    }
+    return nullptr;
+}
+
 template class ObjectColumn<HyperLogLog>;
 template class ObjectColumn<BitmapValue>;
 template class ObjectColumn<PercentileValue>;
+template class ObjectColumn<JsonValue>;
 
 } // namespace starrocks::vectorized

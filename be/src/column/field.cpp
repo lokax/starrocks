@@ -1,33 +1,15 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "column/field.h"
 
+#include <utility>
+
 #include "column/datum.h"
+#include "storage/chunk_helper.h"
 #include "storage/key_coder.h"
 #include "storage/types.h"
-#include "storage/vectorized/chunk_helper.h"
 
-namespace starrocks {
-namespace vectorized {
-
-Field::Field(ColumnId id, const std::string& name, FieldType type, int precision, int scale, bool nullable)
-        : _id(id), _name(name), _type(get_type_info(type, precision, scale)), _is_nullable(nullable) {}
-
-FieldPtr Field::with_type(const TypeInfoPtr& type) {
-    return std::make_shared<Field>(_id, _name, type, _is_nullable);
-}
-
-FieldPtr Field::with_name(const std::string& name) {
-    return std::make_shared<Field>(_id, name, _type, _is_nullable);
-}
-
-FieldPtr Field::with_nullable(bool is_nullable) {
-    return std::make_shared<Field>(_id, _name, _type, is_nullable);
-}
-
-FieldPtr Field::copy() const {
-    return std::make_shared<Field>(*this);
-}
+namespace starrocks::vectorized {
 
 void Field::encode_ascending(const Datum& value, std::string* buf) const {
     if (_short_key_length > 0) {
@@ -52,16 +34,4 @@ ColumnPtr Field::create_column() const {
     return ChunkHelper::column_from_field(*this);
 }
 
-std::string Field::to_string() const {
-    std::stringstream os;
-    os << id() << ":";
-    os << name() << " ";
-    os << type()->type() << " ";
-    os << (is_nullable() ? "NULL" : "NOT NULL");
-    os << (is_key() ? " KEY" : "");
-    os << " " << aggregate_method();
-    return os.str();
-}
-
-} // namespace vectorized
-} // namespace starrocks
+} // namespace starrocks::vectorized

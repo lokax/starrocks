@@ -66,9 +66,6 @@ import java.util.TreeMap;
  * this node, ie, they only reference tuples materialized by this node or one of
  * its children (= are bound by tupleIds).
  */
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 abstract public class PlanNode extends TreeNode<PlanNode> {
     private static final Logger LOG = LogManager.getLogger(PlanNode.class);
 
@@ -80,11 +77,6 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
 
     // ids materialized by the tree rooted at this node
     protected ArrayList<TupleId> tupleIds;
-
-    // ids of the TblRefs "materialized" by this node; identical with tupleIds_
-    // if the tree rooted at this node only materializes BaseTblRefs;
-    // useful during plan generation
-    protected ArrayList<TupleId> tblRefIds;
 
     // A set of nullable TupleId produced by this node. It is a subset of tupleIds.
     // A tuple is nullable within a particular plan tree if it's the "nullable" side of
@@ -112,9 +104,6 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
 
     protected Map<ColumnRefOperator, ColumnStatistic> columnStatistics;
 
-    // use vectorized flag
-    protected boolean useVectorized = false;
-
     // For vector query engine
     // case 1: If agg node hash outer join child
     // Vector agg node must handle all agg and group by column by nullable
@@ -124,21 +113,21 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     // we should generate nullable columns for group by columns
     protected boolean hasNullableGenerateChild = false;
 
-    protected boolean isColocate = false; //the flag for colocate join
+    protected boolean isColocate = false; // the flag for colocate join
+
+    protected boolean isReplicated = false; // the flag for replication join
 
     // Runtime filters be consumed by this node.
     protected List<RuntimeFilterDescription> probeRuntimeFilters = Lists.newArrayList();
-
-    public List<RuntimeFilterDescription> getProbeRuntimeFilters() {
-        return probeRuntimeFilters;
-    }
+    protected Set<Integer> localRfWaitingSet = Sets.newHashSet();
+    protected ExprSubstitutionMap outputSmap;
+    protected ExprSubstitutionMap withoutTupleIsNullOutputSmap;
 
     protected PlanNode(PlanNodeId id, ArrayList<TupleId> tupleIds, String planNodeName) {
         this.id = id;
         this.limit = -1;
         // make a copy, just to be on the safe side
         this.tupleIds = Lists.newArrayList(tupleIds);
-        this.tblRefIds = Lists.newArrayList(tupleIds);
         this.cardinality = -1;
         this.planNodeName = planNodeName;
         this.numInstances = 1;
@@ -148,7 +137,6 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         this.id = id;
         this.limit = -1;
         this.tupleIds = Lists.newArrayList();
-        this.tblRefIds = Lists.newArrayList();
         this.cardinality = -1;
         this.planNodeName = planNodeName;
         this.numInstances = 1;
@@ -161,7 +149,6 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         this.id = id;
         this.limit = node.limit;
         this.tupleIds = Lists.newArrayList(node.tupleIds);
-        this.tblRefIds = Lists.newArrayList(node.tblRefIds);
         this.nullableTupleIds = Sets.newHashSet(node.nullableTupleIds);
         this.conjuncts = Expr.cloneList(node.conjuncts, null);
         this.cardinality = -1;
@@ -170,9 +157,38 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     }
 
     /**
-     * Sets tblRefIds_, tupleIds_, and nullableTupleIds_.
-     * The default implementation is a no-op.
+     * Computes and returns the sum of two cardinalities. If an overflow occurs,
+     * the maximum Long value is returned (Long.MAX_VALUE).
      */
+    public static long addCardinalities(long a, long b) {
+        try {
+            return LongMath.checkedAdd(a, b);
+        } catch (ArithmeticException e) {
+            LOG.warn("overflow when adding cardinalities: " + a + ", " + b);
+            return Long.MAX_VALUE;
+        }
+    }
+
+    public List<RuntimeFilterDescription> getProbeRuntimeFilters() {
+        return probeRuntimeFilters;
+    }
+
+    public void clearProbeRuntimeFilters() {
+        probeRuntimeFilters.removeIf(RuntimeFilterDescription::isHasRemoteTargets);
+    }
+
+    public void fillLocalRfWaitingSet(Set<Integer> runtimeFilterBuildNode) {
+        for (RuntimeFilterDescription filter : probeRuntimeFilters) {
+            if (runtimeFilterBuildNode.contains(filter.getBuildPlanNodeId())) {
+                localRfWaitingSet.add(filter.getBuildPlanNodeId());
+            }
+        }
+    }
+
+    public Set<Integer> getLocalRfWaitingSet() {
+        return localRfWaitingSet;
+    }
+
     public void computeTupleIds() {
         Preconditions.checkState(children.isEmpty() || !tupleIds.isEmpty());
     }
@@ -181,7 +197,6 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
      * Clears tblRefIds_, tupleIds_, and nullableTupleIds_.
      */
     protected void clearTupleIds() {
-        tblRefIds.clear();
         tupleIds.clear();
         nullableTupleIds.clear();
     }
@@ -207,12 +222,12 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         fragmentId = id;
     }
 
-    public void setFragment(PlanFragment fragment) {
-        fragment_ = fragment;
-    }
-
     public PlanFragment getFragment() {
         return fragment_;
+    }
+
+    public void setFragment(PlanFragment fragment) {
+        fragment_ = fragment;
     }
 
     public long getLimit() {
@@ -254,14 +269,6 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         return tupleIds;
     }
 
-    public ArrayList<TupleId> getTblRefIds() {
-        return tblRefIds;
-    }
-
-    public void setTblRefIds(ArrayList<TupleId> ids) {
-        tblRefIds = ids;
-    }
-
     public Set<TupleId> getNullableTupleIds() {
         Preconditions.checkState(nullableTupleIds != null);
         return nullableTupleIds;
@@ -278,9 +285,12 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         this.conjuncts.addAll(conjuncts);
     }
 
-    public void transferConjuncts(PlanNode recipient) {
-        recipient.conjuncts.addAll(conjuncts);
-        conjuncts.clear();
+    public boolean isReplicated() {
+        return isReplicated;
+    }
+
+    public void setReplicated(boolean replicated) {
+        isReplicated = replicated;
     }
 
     /**
@@ -289,19 +299,6 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     protected void computeMemLayout(Analyzer analyzer) {
         for (TupleId id : tupleIds) {
             analyzer.getDescTbl().getTupleDesc(id).computeMemLayout();
-        }
-    }
-
-    /**
-     * Computes and returns the sum of two cardinalities. If an overflow occurs,
-     * the maximum Long value is returned (Long.MAX_VALUE).
-     */
-    public static long addCardinalities(long a, long b) {
-        try {
-            return LongMath.checkedAdd(a, b);
-        } catch (ArithmeticException e) {
-            LOG.warn("overflow when adding cardinalities: " + a + ", " + b);
-            return Long.MAX_VALUE;
         }
     }
 
@@ -355,7 +352,6 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
             }
             expBuilder.append("\n");
         }
-        expBuilder.append(detailPrefix).append("use vectorized: ").append(useVectorized).append("\n");
         // Print the children
         // if (children != null && children.size() > 0) {
         if (traverseChildren) {
@@ -470,7 +466,8 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
 
     protected String getColumnStatistics(String prefix) {
         StringBuilder outputBuilder = new StringBuilder();
-        TreeMap<ColumnRefOperator, ColumnStatistic> sortMap = new TreeMap<>(Comparator.comparingInt(ColumnRefOperator::getId));
+        TreeMap<ColumnRefOperator, ColumnStatistic> sortMap =
+                new TreeMap<>(Comparator.comparingInt(ColumnRefOperator::getId));
         sortMap.putAll(columnStatistics);
         sortMap.forEach((key, value) -> {
             outputBuilder.append(prefix).append("* ").append(key.getName());
@@ -505,7 +502,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         msg.node_id = id.asInt();
         msg.num_children = children.size();
         msg.limit = limit;
-        msg.setUse_vectorized(useVectorized);
+        msg.setUse_vectorized(true);
         for (TupleId tid : tupleIds) {
             msg.addToRow_tuples(tid.asInt());
             msg.addToNullable_tuples(nullableTupleIds.contains(tid));
@@ -523,10 +520,12 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
                 child.treeToThriftHelper(container);
             }
         }
-        if (probeRuntimeFilters.size() != 0) {
+        if (!probeRuntimeFilters.isEmpty()) {
             msg.setProbe_runtime_filters(
                     RuntimeFilterDescription.toThriftRuntimeFilterDescriptions(probeRuntimeFilters));
         }
+        msg.setLocal_rf_waiting_set(getLocalRfWaitingSet());
+        msg.setNeed_create_tuple_columns(false);
     }
 
     /**
@@ -534,9 +533,9 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
      * Call this once on the root of the plan tree before calling toThrift().
      * Subclasses need to override this.
      */
-    public void finalize(Analyzer analyzer) throws UserException {
+    public void finalizeStats(Analyzer analyzer) throws UserException {
         for (PlanNode child : children) {
-            child.finalize(analyzer);
+            child.finalizeStats(analyzer);
         }
         computeStats(analyzer);
     }
@@ -561,7 +560,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     }
 
     public void computeStatistics(Statistics statistics) {
-        cardinality = (long) statistics.getOutputRowCount();
+        cardinality = Math.round(statistics.getOutputRowCount());
         avgRowSize = (float) statistics.getColumnStatistics().values().stream().
                 mapToDouble(columnStatistic -> columnStatistic.getAverageRowSize()).sum();
         columnStatistics = statistics.getColumnStatistics();
@@ -578,19 +577,8 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         return prod;
     }
 
-    protected ExprSubstitutionMap outputSmap;
-    protected ExprSubstitutionMap withoutTupleIsNullOutputSmap;
-
     public ExprSubstitutionMap getOutputSmap() {
         return outputSmap;
-    }
-
-    public void setOutputSmap(ExprSubstitutionMap smap) {
-        outputSmap = smap;
-    }
-
-    public void setWithoutTupleIsNullOutputSmap(ExprSubstitutionMap smap) {
-        withoutTupleIsNullOutputSmap = smap;
     }
 
     public ExprSubstitutionMap getWithoutTupleIsNullOutputSmap() {
@@ -598,16 +586,13 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     }
 
     public void init(Analyzer analyzer) throws UserException {
-        assignConjuncts(analyzer);
-        computeStats(analyzer);
-        createDefaultSmap(analyzer);
     }
 
     /**
      * Assign remaining unassigned conjuncts.
      */
     protected void assignConjuncts(Analyzer analyzer) {
-        List<Expr> unassigned = analyzer.getUnassignedConjuncts(this);
+        List<Expr> unassigned = analyzer.getUnassignedConjuncts(this.getTupleIds());
         conjuncts.addAll(unassigned);
         analyzer.markConjunctsAssigned(unassigned);
     }
@@ -629,25 +614,6 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
 
         for (int i = 2; i < getChildren().size(); ++i) {
             result = ExprSubstitutionMap.combine(result, getChild(i).getOutputSmap());
-        }
-
-        return result;
-    }
-
-    protected ExprSubstitutionMap getCombinedChildWithoutTupleIsNullSmap() {
-        if (getChildren().size() == 0) {
-            return new ExprSubstitutionMap();
-        }
-        if (getChildren().size() == 1) {
-            return getChild(0).getWithoutTupleIsNullOutputSmap();
-        }
-        ExprSubstitutionMap result = ExprSubstitutionMap.combine(
-                getChild(0).getWithoutTupleIsNullOutputSmap(),
-                getChild(1).getWithoutTupleIsNullOutputSmap());
-
-        for (int i = 2; i < getChildren().size(); ++i) {
-            result = ExprSubstitutionMap.combine(
-                    result, getChild(i).getWithoutTupleIsNullOutputSmap());
         }
 
         return result;
@@ -682,9 +648,9 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
             return true;
         }
 
-        List<HashJoinNode> joinNodes = Lists.newArrayList();
-        collectAll(Predicates.instanceOf(HashJoinNode.class), joinNodes);
-        for (HashJoinNode node : joinNodes) {
+        List<JoinNode> joinNodes = Lists.newArrayList();
+        collectAll(Predicates.instanceOf(JoinNode.class), joinNodes);
+        for (JoinNode node : joinNodes) {
             if (node.getJoinOp().isOuterJoin()) {
                 return true;
             }
@@ -743,12 +709,6 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         return getVerboseExplain(exprs, TExplainLevel.VERBOSE);
     }
 
-    /**
-     * Returns true if stats-related variables are valid.
-     */
-    protected boolean hasValidStats() {
-        return (numNodes == -1 || numNodes >= 0) && (cardinality == -1 || cardinality >= 0);
-    }
 
     public int getNumInstances() {
         return numInstances;
@@ -781,31 +741,28 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         isColocate = colocate;
     }
 
-    /**
-     * check support vectorized engine
-     * re-implement it if children need
-     */
-    public boolean isVectorized() {
-        return false;
-    }
-
-    /**
-     * set use vectorized engine
-     * re-implement it if children need
-     */
-    public void setUseVectorized(boolean flag) {
-        this.useVectorized = flag;
-    }
-
-    public boolean isUseVectorized() {
-        return useVectorized;
-    }
-
     public boolean canUsePipeLine() {
         return false;
     }
 
+    public boolean canPushDownRuntimeFilter() {
+        // RuntimeFilter can only be pushed into multicast fragment iff.
+        // this runtime filter is applied to all consumers. It's quite hard to do
+        // thorough analysis, so we disable it for safety.
+        if (fragment_ instanceof MultiCastPlanFragment) {
+            return false;
+        }
+        return true;
+    }
+
+    public void checkRuntimeFilterOnNullValue(RuntimeFilterDescription description, Expr probeExpr) {
+    }
+
     public boolean pushDownRuntimeFilters(RuntimeFilterDescription description, Expr probeExpr) {
+        if (!canPushDownRuntimeFilter()) {
+            return false;
+        }
+
         // theoretically runtime filter can be applied on multiple child nodes.
         boolean accept = false;
         for (PlanNode node : children) {
@@ -813,14 +770,26 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
                 accept = true;
             }
         }
+        boolean isBound = probeExpr.isBoundByTupleIds(getTupleIds());
+        if (isBound) {
+            checkRuntimeFilterOnNullValue(description, probeExpr);
+        }
         if (accept) {
             return true;
         }
-        if (probeExpr.isBoundByTupleIds(getTupleIds()) && description.canProbeUse(this)) {
+        if (isBound && description.canProbeUse(this)) {
             description.addProbeExpr(id.asInt(), probeExpr);
             probeRuntimeFilters.add(description);
             return true;
         }
         return false;
+    }
+
+    public boolean canDoReplicatedJoin() {
+        boolean canDoReplicatedJoin = false;
+        for (PlanNode childNode : children) {
+            canDoReplicatedJoin |= childNode.canDoReplicatedJoin();
+        }
+        return canDoReplicatedJoin;
     }
 }

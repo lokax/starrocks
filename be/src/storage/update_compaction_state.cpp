@@ -1,29 +1,40 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "storage/update_compaction_state.h"
 
+#include "storage/chunk_helper.h"
 #include "storage/primary_key_encoder.h"
-#include "storage/rowset/beta_rowset.h"
 #include "storage/rowset/rowset.h"
 #include "storage/storage_engine.h"
 #include "storage/update_manager.h"
-#include "storage/vectorized/chunk_helper.h"
+#include "util/stack_util.h"
 
-namespace starrocks {
+namespace starrocks::vectorized {
 
-namespace vectorized {
-
-CompactionState::CompactionState() {}
+CompactionState::CompactionState() = default;
 
 CompactionState::~CompactionState() {
     StorageEngine::instance()->update_manager()->compaction_state_mem_tracker()->release(_memory_usage);
+    if (!_status.ok()) {
+        LOG(WARNING) << "bad CompactionState, status:" << _status;
+    }
 }
 
 Status CompactionState::load(Rowset* rowset) {
     if (UNLIKELY(!_status.ok())) {
         return _status;
     }
-    std::call_once(_load_once_flag, [&] { _status = _do_load(rowset); });
+    std::call_once(_load_once_flag, [&] {
+        _status = _do_load(rowset);
+        if (!_status.ok()) {
+            LOG(WARNING) << "load CompactionState error: " << _status
+                         << " tablet:" << rowset->rowset_meta()->tablet_id() << " stack:\n"
+                         << get_stack_trace();
+            if (_status.is_mem_limit_exceeded()) {
+                LOG(WARNING) << CurrentThread::mem_tracker()->debug_string();
+            }
+        }
+    });
     return _status;
 }
 
@@ -43,15 +54,14 @@ Status CompactionState::_do_load(Rowset* rowset) {
         CHECK(false) << "create column for primary key encoder failed";
     }
 
+    ASSIGN_OR_RETURN(auto fs, FileSystem::CreateSharedFromString(rowset->rowset_path()));
     auto update_manager = StorageEngine::instance()->update_manager();
     auto tracker = update_manager->compaction_state_mem_tracker();
     segment_states.resize(rowset->num_segments());
     for (auto i = 0; i < rowset->num_segments(); i++) {
-        std::unique_ptr<fs::ReadableBlock> rblock;
-        std::string rssid_file = BetaRowset::segment_srcrssid_file_path(rowset->rowset_path(), rowset->rowset_id(), i);
-        RETURN_IF_ERROR(fs::fs_util::block_manager()->open_block(rssid_file, &rblock));
-        uint64_t file_size = 0;
-        RETURN_IF_ERROR(rblock->size(&file_size));
+        std::string rssid_file = Rowset::segment_srcrssid_file_path(rowset->rowset_path(), rowset->rowset_id(), i);
+        ASSIGN_OR_RETURN(auto read_file, fs->new_random_access_file(rssid_file));
+        ASSIGN_OR_RETURN(auto file_size, read_file->get_size());
         std::vector<uint32_t>& src_rssids = segment_states[i].src_rssids;
         src_rssids.resize(file_size / sizeof(uint32_t));
         _memory_usage += file_size;
@@ -63,14 +73,12 @@ Status CompactionState::_do_load(Rowset* rowset) {
                        << " size:" << rowset->data_disk_size() << " seg:" << i << " memory:" << _memory_usage
                        << " stats:" << update_manager->memory_stats();
         }
-        Slice read_slice(reinterpret_cast<const char*>(src_rssids.data()), file_size);
-        RETURN_IF_ERROR(rblock->read(0, read_slice));
+        RETURN_IF_ERROR(read_file->read_at_fully(0, src_rssids.data(), file_size));
     }
 
     RowsetReleaseGuard guard(rowset->shared_from_this());
     OlapReaderStatistics stats;
-    auto beta_rowset = down_cast<BetaRowset*>(rowset);
-    auto res = beta_rowset->get_segment_iterators2(pkey_schema, NULL, 0, &stats);
+    auto res = rowset->get_segment_iterators2(pkey_schema, nullptr, 0, &stats);
     if (!res.ok()) {
         return res.status();
     }
@@ -84,12 +92,12 @@ Status CompactionState::_do_load(Rowset* rowset) {
 
     for (size_t i = 0; i < itrs.size(); i++) {
         auto itr = itrs[i].get();
-        if (itr == NULL) {
+        if (itr == nullptr) {
             continue;
         }
         auto& dest = segment_states[i].pkeys;
         auto col = pk_column->clone();
-        auto num_rows = beta_rowset->segments()[i]->num_rows();
+        auto num_rows = rowset->segments()[i]->num_rows();
         col->reserve(num_rows);
         while (true) {
             chunk->reset();
@@ -124,6 +132,4 @@ Status CompactionState::_do_load(Rowset* rowset) {
     return Status::OK();
 }
 
-} // namespace vectorized
-
-} // namespace starrocks
+} // namespace starrocks::vectorized

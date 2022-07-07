@@ -25,17 +25,21 @@ import com.google.common.collect.Lists;
 import com.starrocks.analysis.AddBackendClause;
 import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.DropBackendClause;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.StarOSAgent;
 import com.starrocks.catalog.TabletInvertedIndex;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.FeConstants;
 import com.starrocks.persist.EditLog;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.system.SystemInfoService;
 import mockit.Expectations;
+import mockit.Mock;
+import mockit.MockUp;
 import mockit.Mocked;
 import org.junit.Assert;
 import org.junit.Before;
@@ -54,7 +58,7 @@ public class SystemInfoServiceTest {
     @Mocked
     private EditLog editLog;
     @Mocked
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
     private SystemInfoService systemInfoService;
     private TabletInvertedIndex invertedIndex;
     @Mocked
@@ -85,46 +89,46 @@ public class SystemInfoServiceTest {
                 db.readUnlock();
                 minTimes = 0;
 
-                catalog.getNextId();
+                globalStateMgr.getNextId();
                 minTimes = 0;
                 result = backendId;
 
-                catalog.getEditLog();
+                globalStateMgr.getEditLog();
                 minTimes = 0;
                 result = editLog;
 
-                catalog.getDb(anyLong);
+                globalStateMgr.getDb(anyLong);
                 minTimes = 0;
                 result = db;
 
-                catalog.getCluster(anyString);
+                globalStateMgr.getCluster(anyString);
                 minTimes = 0;
                 result = new Cluster("cluster", 1);
 
-                catalog.clear();
+                globalStateMgr.clear();
                 minTimes = 0;
 
-                Catalog.getCurrentCatalog();
+                GlobalStateMgr.getCurrentState();
                 minTimes = 0;
-                result = catalog;
+                result = globalStateMgr;
 
                 systemInfoService = new SystemInfoService();
-                Catalog.getCurrentSystemInfo();
+                GlobalStateMgr.getCurrentSystemInfo();
                 minTimes = 0;
                 result = systemInfoService;
 
                 invertedIndex = new TabletInvertedIndex();
-                Catalog.getCurrentInvertedIndex();
+                GlobalStateMgr.getCurrentInvertedIndex();
                 minTimes = 0;
                 result = invertedIndex;
 
-                Catalog.getCurrentCatalogJournalVersion();
+                GlobalStateMgr.getCurrentStateJournalVersion();
                 minTimes = 0;
                 result = FeConstants.meta_version;
             }
         };
 
-        analyzer = new Analyzer(catalog, new ConnectContext(null));
+        analyzer = new Analyzer(globalStateMgr, new ConnectContext(null));
     }
 
     public void mkdir(String dirString) {
@@ -179,7 +183,7 @@ public class SystemInfoServiceTest {
     }
 
     public void clearAllBackend() {
-        Catalog.getCurrentSystemInfo().dropAllBackend();
+        GlobalStateMgr.getCurrentSystemInfo().dropAllBackend();
     }
 
     @Test(expected = AnalysisException.class)
@@ -206,27 +210,27 @@ public class SystemInfoServiceTest {
         AddBackendClause stmt = new AddBackendClause(Lists.newArrayList("192.168.0.1:1234"));
         stmt.analyze(analyzer);
         try {
-            Catalog.getCurrentSystemInfo().addBackends(stmt.getHostPortPairs(), true);
+            GlobalStateMgr.getCurrentSystemInfo().addBackends(stmt.getHostPortPairs());
         } catch (DdlException e) {
             Assert.fail();
         }
 
         try {
-            Catalog.getCurrentSystemInfo().addBackends(stmt.getHostPortPairs(), true);
+            GlobalStateMgr.getCurrentSystemInfo().addBackends(stmt.getHostPortPairs());
         } catch (DdlException e) {
             Assert.assertTrue(e.getMessage().contains("already exists"));
         }
 
-        Assert.assertNotNull(Catalog.getCurrentSystemInfo().getBackend(backendId));
-        Assert.assertNotNull(Catalog.getCurrentSystemInfo().getBackendWithHeartbeatPort("192.168.0.1", 1234));
+        Assert.assertNotNull(GlobalStateMgr.getCurrentSystemInfo().getBackend(backendId));
+        Assert.assertNotNull(GlobalStateMgr.getCurrentSystemInfo().getBackendWithHeartbeatPort("192.168.0.1", 1234));
 
-        Assert.assertTrue(Catalog.getCurrentSystemInfo().getBackendIds(false).size() == 1);
-        Assert.assertTrue(Catalog.getCurrentSystemInfo().getBackendIds(false).get(0) == backendId);
+        Assert.assertTrue(GlobalStateMgr.getCurrentSystemInfo().getBackendIds(false).size() == 1);
+        Assert.assertTrue(GlobalStateMgr.getCurrentSystemInfo().getBackendIds(false).get(0) == backendId);
 
-        Assert.assertTrue(Catalog.getCurrentSystemInfo().getBackendReportVersion(backendId) == 0L);
+        Assert.assertTrue(GlobalStateMgr.getCurrentSystemInfo().getBackendReportVersion(backendId) == 0L);
 
-        Catalog.getCurrentSystemInfo().updateBackendReportVersion(backendId, 2L, 20000L);
-        Assert.assertTrue(Catalog.getCurrentSystemInfo().getBackendReportVersion(backendId) == 2L);
+        GlobalStateMgr.getCurrentSystemInfo().updateBackendReportVersion(backendId, 2L, 20000L);
+        Assert.assertTrue(GlobalStateMgr.getCurrentSystemInfo().getBackendReportVersion(backendId) == 2L);
     }
 
     @Test
@@ -235,7 +239,7 @@ public class SystemInfoServiceTest {
         AddBackendClause stmt = new AddBackendClause(Lists.newArrayList("192.168.0.1:1234"));
         stmt.analyze(analyzer);
         try {
-            Catalog.getCurrentSystemInfo().addBackends(stmt.getHostPortPairs(), true);
+            GlobalStateMgr.getCurrentSystemInfo().addBackends(stmt.getHostPortPairs());
         } catch (DdlException e) {
             e.printStackTrace();
         }
@@ -243,17 +247,65 @@ public class SystemInfoServiceTest {
         DropBackendClause dropStmt = new DropBackendClause(Lists.newArrayList("192.168.0.1:1234"));
         dropStmt.analyze(analyzer);
         try {
-            Catalog.getCurrentSystemInfo().dropBackends(dropStmt.getHostPortPairs());
+            GlobalStateMgr.getCurrentSystemInfo().dropBackends(dropStmt);
         } catch (DdlException e) {
             e.printStackTrace();
             Assert.fail();
         }
 
         try {
-            Catalog.getCurrentSystemInfo().dropBackends(dropStmt.getHostPortPairs());
+            GlobalStateMgr.getCurrentSystemInfo().dropBackends(dropStmt);
         } catch (DdlException e) {
             Assert.assertTrue(e.getMessage().contains("does not exist"));
         }
+
+        // test removeWorker
+        Config.integrate_starmgr = true;
+        StarOSAgent starosAgent = new StarOSAgent();
+        new Expectations(starosAgent) {
+            {
+                try {
+                    starosAgent.removeWorker("192.168.0.1:1235");
+                    minTimes = 0;
+                    result = null;
+                } catch (DdlException e) {
+                    e.printStackTrace();
+                }
+            }
+        };
+
+        new MockUp<GlobalStateMgr>() {
+            @Mock
+            StarOSAgent getStarOSAgent() {
+                return starosAgent;
+            }
+        };
+
+        AddBackendClause stmt2 = new AddBackendClause(Lists.newArrayList("192.168.0.1:1235"));
+        stmt2.analyze(analyzer);
+        try {
+            GlobalStateMgr.getCurrentSystemInfo().addBackends(stmt2.getHostPortPairs());
+        } catch (DdlException e) {
+            e.printStackTrace();
+        }
+
+        DropBackendClause dropStmt2 = new DropBackendClause(Lists.newArrayList("192.168.0.1:1235"));
+        dropStmt2.analyze(analyzer);
+        try {
+            GlobalStateMgr.getCurrentSystemInfo().dropBackends(dropStmt2);
+        } catch (DdlException e) {
+            e.printStackTrace();
+            Assert.assertTrue(e.getMessage()
+                    .contains("starletPort has not been updated by heartbeat from this backend"));
+        }
+
+        try {
+            GlobalStateMgr.getCurrentSystemInfo().dropBackends(dropStmt2);
+        } catch (DdlException e) {
+            Assert.assertTrue(e.getMessage().contains("does not exist"));
+        }
+
+        Config.integrate_starmgr = false;
     }
 
     @Test
@@ -264,13 +316,13 @@ public class SystemInfoServiceTest {
         File file = new File(dir, "image");
         file.createNewFile();
         DataOutputStream dos = new DataOutputStream(new FileOutputStream(file));
-        SystemInfoService systemInfoService = Catalog.getCurrentSystemInfo();
+        SystemInfoService systemInfoService = GlobalStateMgr.getCurrentSystemInfo();
         Backend back1 = new Backend(1L, "localhost", 3);
         back1.updateOnce(4, 6, 8);
         systemInfoService.replayAddBackend(back1);
         long checksum1 = systemInfoService.saveBackends(dos, 0);
-        catalog.clear();
-        catalog = null;
+        globalStateMgr.clear();
+        globalStateMgr = null;
         dos.close();
 
         DataInputStream dis = new DataInputStream(new BufferedInputStream(new FileInputStream(file)));

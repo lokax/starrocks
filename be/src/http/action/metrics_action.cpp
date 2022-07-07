@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/http/action/metrics_action.cpp
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -28,6 +24,7 @@
 
 #include <string>
 
+#include "common/tracer.h"
 #include "http/http_channel.h"
 #include "http/http_headers.h"
 #include "http/http_request.h"
@@ -39,7 +36,7 @@ namespace starrocks {
 
 class PrometheusMetricsVisitor : public MetricsVisitor {
 public:
-    virtual ~PrometheusMetricsVisitor() {}
+    ~PrometheusMetricsVisitor() override = default;
     void visit(const std::string& prefix, const std::string& name, MetricCollector* collector) override;
     std::string to_string() const { return _ss.str(); }
 
@@ -55,7 +52,7 @@ private:
 // starrocks_be_process_thread_num LONG 240
 class SimpleCoreMetricsVisitor : public MetricsVisitor {
 public:
-    virtual ~SimpleCoreMetricsVisitor() {}
+    ~SimpleCoreMetricsVisitor() override = default;
     void visit(const std::string& prefix, const std::string& name, MetricCollector* collector) override;
     std::string to_string() const { return _ss.str(); }
 
@@ -145,8 +142,8 @@ void SimpleCoreMetricsVisitor::visit(const std::string& prefix, const std::strin
 
 class JsonMetricsVisitor : public MetricsVisitor {
 public:
-    JsonMetricsVisitor() {}
-    virtual ~JsonMetricsVisitor() {}
+    JsonMetricsVisitor() = default;
+    ~JsonMetricsVisitor() override = default;
     void visit(const std::string& prefix, const std::string& name, MetricCollector* collector) override;
     std::string to_string() {
         rapidjson::StringBuffer strBuf;
@@ -194,6 +191,7 @@ void JsonMetricsVisitor::visit(const std::string& prefix, const std::string& nam
 }
 
 void MetricsAction::handle(HttpRequest* req) {
+    auto scoped_span = trace::Scope(Tracer::Instance().start_trace("http_handle_metrics"));
     const std::string& type = req->param("type");
     std::string str;
     if (type == "core") {

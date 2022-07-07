@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.task;
 
@@ -37,13 +37,11 @@ public class OptimizeGroupTask extends OptimizerTask {
         }
 
         for (GroupExpression expression : group.getLogicalExpressions()) {
-            pushTask(new OptimizeExpressionTask(context, expression, false));
+            pushTask(new OptimizeExpressionTask(context, expression));
         }
 
         for (GroupExpression expression : group.getPhysicalExpressions()) {
             pushTask((new EnforceAndCostTask(context, expression)));
         }
-
-        group.setHasExplored();
     }
 }

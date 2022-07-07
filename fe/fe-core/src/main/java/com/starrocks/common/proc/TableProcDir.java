@@ -27,7 +27,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.EsTable;
-import com.starrocks.catalog.HiveTable;
+import com.starrocks.catalog.HiveMetaStoreTable;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Table.TableType;
@@ -86,14 +86,15 @@ public class TableProcDir implements ProcDirInterface {
         }
 
         if (entryName.equals(PARTITIONS)) {
-            if (table.getType() == TableType.OLAP) {
+            if (table.isNativeTable()) {
                 return new PartitionsProcDir(db, (OlapTable) table, false);
             } else if (table.getType() == TableType.ELASTICSEARCH) {
                 return new EsPartitionsProcDir(db, (EsTable) table);
-            } else if (table.getType() == TableType.HIVE) {
-                return new HivePartitionsProcDir((HiveTable) table);
+            } else if (table instanceof HiveMetaStoreTable) {
+                return new HMSTablePartitionsProcDir((HiveMetaStoreTable) table);
             } else {
-                throw new AnalysisException("Table[" + table.getName() + "] is not a OLAP/ELASTICSEARCH/HIVE table");
+                throw new AnalysisException(
+                        "Table[" + table.getName() + "] is not a OLAP/MATERIALIZED_VIEW/ELASTICSEARCH/HIVE/HUDI table");
             }
         } else if (entryName.equals(TEMP_PARTITIONS)) {
             if (table.getType() == TableType.OLAP) {

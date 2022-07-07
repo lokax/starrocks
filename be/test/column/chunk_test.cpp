@@ -1,30 +1,13 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/test/column/chunk_test.cpp
-
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "column/chunk.h"
 
 #include <gtest/gtest.h>
 
+#include "column/binary_column.h"
 #include "column/field.h"
 #include "column/fixed_length_column.h"
+#include "column/vectorized_fwd.h"
 
 namespace starrocks::vectorized {
 
@@ -74,6 +57,57 @@ public:
         }
     }
 };
+
+// NOLINTNEXTLINE
+TEST_F(ChunkTest, test_chunk_upgrade_if_overflow) {
+#ifdef NDEBUG
+    size_t row_count = 1 << 30;
+    auto c1 = BinaryColumn::create();
+    c1->resize(row_count);
+    auto c2 = BinaryColumn::create();
+    for (size_t i = 0; i < row_count; i++) {
+        c2->append(std::to_string(i));
+    }
+    auto chunk = std::make_shared<Chunk>();
+    chunk->append_column(c1, 1);
+    chunk->append_column(c2, 2);
+
+    Status st = chunk->upgrade_if_overflow();
+    ASSERT_TRUE(st.ok());
+    ASSERT_TRUE(chunk->get_column_by_slot_id(1)->is_binary());
+    ASSERT_TRUE(chunk->get_column_by_slot_id(2)->is_large_binary());
+#endif
+}
+
+// NOLINTNEXTLINE
+TEST_F(ChunkTest, test_chunk_downgrade) {
+    auto c1 = BinaryColumn::create();
+    c1->append_string("1");
+    auto c2 = BinaryColumn::create();
+    c2->append_string("11");
+    auto chunk = std::make_shared<Chunk>();
+    chunk->append_column(c1, 1);
+    chunk->append_column(c2, 2);
+    ASSERT_FALSE(chunk->has_large_column());
+
+    auto ret = chunk->downgrade();
+    ASSERT_TRUE(ret.ok());
+    ASSERT_FALSE(chunk->has_large_column());
+
+    auto c3 = LargeBinaryColumn::create();
+    c3->append_string("1");
+    auto c4 = LargeBinaryColumn::create();
+    c4->append_string("2");
+    chunk = std::make_shared<Chunk>();
+    chunk->append_column(c3, 1);
+    chunk->append_column(c4, 2);
+    ASSERT_TRUE(chunk->has_large_column());
+
+    ret = chunk->downgrade();
+    ASSERT_FALSE(chunk->has_large_column());
+    ASSERT_TRUE(ret.ok());
+    ASSERT_FALSE(chunk->has_large_column());
+}
 
 // NOLINTNEXTLINE
 TEST_F(ChunkTest, test_construct) {
@@ -144,36 +178,6 @@ TEST_F(ChunkTest, get_column_by_index) {
 }
 
 // NOLINTNEXTLINE
-TEST_F(ChunkTest, test_serde) {
-    auto chunk = std::make_unique<Chunk>(make_columns(2), make_schema(2));
-
-    std::string buffer;
-    buffer.resize(chunk->serialize_size());
-    chunk->serialize((uint8_t*)buffer.data());
-
-    RuntimeChunkMeta meta;
-    meta.slot_id_to_index.init(2);
-    meta.slot_id_to_index.insert(0, 0);
-    meta.slot_id_to_index.insert(1, 1);
-    meta.is_nulls.resize(2, false);
-    meta.is_consts.resize(2, false);
-    meta.types.resize(2);
-    meta.types[0] = TypeDescriptor(PrimitiveType::TYPE_INT);
-    meta.types[1] = TypeDescriptor(PrimitiveType::TYPE_INT);
-
-    std::unique_ptr<Chunk> new_chunk = chunk->clone_empty_with_schema();
-    new_chunk->deserialize((uint8_t*)buffer.data(), buffer.size(), meta);
-
-    ASSERT_EQ(new_chunk->num_rows(), chunk->num_rows());
-    for (size_t i = 0; i < chunk->columns().size(); ++i) {
-        ASSERT_EQ(chunk->columns()[i]->size(), new_chunk->columns()[i]->size());
-        for (size_t j = 0; j < chunk->columns()[i]->size(); ++j) {
-            ASSERT_EQ(chunk->columns()[i]->get(j).get_int32(), new_chunk->columns()[i]->get(j).get_int32());
-        }
-    }
-}
-
-// NOLINTNEXTLINE
 TEST_F(ChunkTest, test_copy_one_row) {
     auto chunk = std::make_unique<Chunk>(make_columns(2), make_schema(2));
 
@@ -222,7 +226,7 @@ TEST_F(ChunkTest, test_reset) {
     chk->reset();
     ASSERT_EQ(1, chk->num_columns());
     ASSERT_EQ(1, chk->get_slot_id_to_index_map().size());
-    ASSERT_EQ(0, *(chk->get_slot_id_to_index_map().seek(1)));
+    ASSERT_EQ(0, chk->get_slot_id_to_index_map().find(1)->second);
     ASSERT_EQ(0, chk->num_rows());
     ASSERT_EQ(DEL_NOT_SATISFIED, chk->delete_state());
 }
@@ -249,6 +253,20 @@ TEST_F(ChunkTest, test_append_chunk_safe) {
             ASSERT_EQ(column->get(j + 100).get_int32(), j);
         }
     }
+}
+
+// NOLINTNEXTLINE
+TEST_F(ChunkTest, test_clone_unique) {
+    auto chunk = std::make_shared<Chunk>();
+
+    auto c1 = make_column(0);
+    auto c2 = make_column(20);
+    chunk->append_column(c1, 0);
+    chunk->append_column(c2, 1);
+
+    auto copy = chunk->clone_unique();
+    copy->check_or_die();
+    ASSERT_EQ(copy->num_rows(), chunk->num_rows());
 }
 
 } // namespace starrocks::vectorized

@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -8,7 +8,7 @@
 #include "column/vectorized_fwd.h"
 #include "exprs/agg/aggregate.h"
 #include "gutil/casts.h"
-#include "util/bitmap_value.h"
+#include "types/bitmap_value.h"
 
 namespace starrocks::vectorized {
 struct BitmapValuePacked {
@@ -29,7 +29,7 @@ public:
         }
     }
 
-    void merge(FunctionContext* ctx, const Column* column, AggDataPtr state, size_t row_num) const override {
+    void merge(FunctionContext* ctx, const Column* column, AggDataPtr __restrict state, size_t row_num) const override {
         const BitmapColumn* col = down_cast<const BitmapColumn*>(column);
         DCHECK(col->is_object());
         if (!this->data(state).initial) {
@@ -40,20 +40,21 @@ public:
         }
     }
 
-    void serialize_to_column(FunctionContext* ctx, ConstAggDataPtr state, Column* to) const override {
-        BitmapValue bitmap = this->data(state).bitmap;
+    void serialize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
         BitmapColumn* col = down_cast<BitmapColumn*>(to);
-        col->append(&bitmap);
+        BitmapValue& bitmap = const_cast<BitmapValue&>(this->data(state).bitmap);
+        col->append(std::move(bitmap));
     }
 
-    void convert_to_serialize_format(const Columns& src, size_t chunk_size, ColumnPtr* dst) const override {
-        *dst = std::move(src[0]);
+    void convert_to_serialize_format(FunctionContext* ctx, const Columns& src, size_t chunk_size,
+                                     ColumnPtr* dst) const override {
+        *dst = src[0];
     }
 
-    void finalize_to_column(FunctionContext* ctx, ConstAggDataPtr state, Column* to) const override {
-        BitmapValue bitmap = this->data(state).bitmap;
+    void finalize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
+        BitmapValue& bitmap = const_cast<BitmapValue&>(this->data(state).bitmap);
         BitmapColumn* col = down_cast<BitmapColumn*>(to);
-        col->append(&bitmap);
+        col->append(std::move(bitmap));
     }
 
     std::string get_name() const override { return "bitmap_intersect"; }

@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 #include <exprs/vectorized/arithmetic_operation.h>
 #include <gtest/gtest.h>
 namespace starrocks::vectorized {
@@ -14,10 +14,10 @@ TEST_F(ArithmeticOperationTest, test_decimal_div_integer) {
             {"-99999.99", -99999, "1.00000990"},
             {"-99999.99", 1, "-99999.99000000"},
             {"-99999.99", -1, "99999.99000000"},
-            {"0", 99999, "0"},
-            {"0", -99999, "0"},
-            {"0", 1, "0"},
-            {"0", -1, "0"},
+            {"0", 99999, "0.00000000"},
+            {"0", -99999, "0.00000000"},
+            {"0", 1, "0.00000000"},
+            {"0", -1, "0.00000000"},
             {"0.01", 99999, "0.00000010"},
             {"0.01", -99999, "-0.00000010"},
             {"0.01", 1, "0.01000000"},

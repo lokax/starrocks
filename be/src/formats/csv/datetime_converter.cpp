@@ -1,11 +1,11 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "formats/csv/datetime_converter.h"
 
 #include "column/fixed_length_column.h"
 #include "common/logging.h"
 #include "gutil/casts.h"
-#include "runtime/timestamp_value.h"
+#include "types/timestamp_value.h"
 
 namespace starrocks::vectorized::csv {
 

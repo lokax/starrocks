@@ -28,18 +28,61 @@
 
 namespace starrocks {
 
+// (k1 int, k2 varchar(20), k3 int) duplicated key (k1, k2)
+void inline create_tablet_schema(TabletSchema* tablet_schema) {
+    TabletSchemaPB tablet_schema_pb;
+    tablet_schema_pb.set_keys_type(DUP_KEYS);
+    tablet_schema_pb.set_num_short_key_columns(2);
+    tablet_schema_pb.set_num_rows_per_row_block(1024);
+    tablet_schema_pb.set_compress_kind(COMPRESS_NONE);
+    tablet_schema_pb.set_next_column_unique_id(4);
+
+    ColumnPB* column_1 = tablet_schema_pb.add_column();
+    column_1->set_unique_id(1);
+    column_1->set_name("k1");
+    column_1->set_type("INT");
+    column_1->set_is_key(true);
+    column_1->set_length(4);
+    column_1->set_index_length(4);
+    column_1->set_is_nullable(true);
+    column_1->set_is_bf_column(false);
+
+    ColumnPB* column_2 = tablet_schema_pb.add_column();
+    column_2->set_unique_id(2);
+    column_2->set_name("k2");
+    column_2->set_type("INT"); // TODO change to varchar(20) when dict encoding for string is supported
+    column_2->set_length(4);
+    column_2->set_index_length(4);
+    column_2->set_is_nullable(true);
+    column_2->set_is_key(true);
+    column_2->set_is_nullable(true);
+    column_2->set_is_bf_column(false);
+
+    ColumnPB* column_3 = tablet_schema_pb.add_column();
+    column_3->set_unique_id(3);
+    column_3->set_name("v1");
+    column_3->set_type("INT");
+    column_3->set_length(4);
+    column_3->set_is_key(false);
+    column_3->set_is_nullable(false);
+    column_3->set_is_bf_column(false);
+    column_3->set_aggregation("SUM");
+
+    tablet_schema->init_from_pb(tablet_schema_pb);
+}
+
 inline TabletColumn create_int_key(int32_t id, bool is_nullable = true, bool is_bf_column = false,
                                    bool has_bitmap_index = false) {
     TabletColumn column;
-    column._unique_id = id;
-    column._col_name = std::to_string(id);
-    column._type = OLAP_FIELD_TYPE_INT;
-    column._is_key = true;
-    column._is_nullable = is_nullable;
-    column._length = 4;
-    column._index_length = 4;
-    column._is_bf_column = is_bf_column;
-    column._has_bitmap_index = has_bitmap_index;
+    column.set_unique_id(id);
+    column.set_name(std::to_string(id));
+    column.set_type(OLAP_FIELD_TYPE_INT);
+    column.set_is_key(true);
+    column.set_is_nullable(is_nullable);
+    column.set_length(4);
+    column.set_index_length(4);
+    column.set_is_bf_column(is_bf_column);
+    column.set_has_bitmap_index(has_bitmap_index);
     return column;
 }
 
@@ -47,68 +90,66 @@ inline TabletColumn create_int_value(int32_t id, FieldAggregationMethod agg_meth
                                      bool is_nullable = true, const std::string default_value = "",
                                      bool is_bf_column = false, bool has_bitmap_index = false) {
     TabletColumn column;
-    column._unique_id = id;
-    column._col_name = std::to_string(id);
-    column._type = OLAP_FIELD_TYPE_INT;
-    column._is_key = false;
-    column._aggregation = agg_method;
-    column._is_nullable = is_nullable;
-    column._length = 4;
-    column._index_length = 4;
+    column.set_unique_id(id);
+    column.set_name(std::to_string(id));
+    column.set_type(OLAP_FIELD_TYPE_INT);
+    column.set_is_key(false);
+    column.set_aggregation(agg_method);
+    column.set_is_nullable(is_nullable);
+    column.set_length(4);
+    column.set_index_length(4);
     if (default_value != "") {
-        column._has_default_value = true;
-        column._default_value = default_value;
+        column.set_default_value(default_value);
     }
-    column._is_bf_column = is_bf_column;
-    column._has_bitmap_index = has_bitmap_index;
+    column.set_is_bf_column(is_bf_column);
+    column.set_has_bitmap_index(has_bitmap_index);
     return column;
 }
 
 inline TabletColumn create_char_key(int32_t id, bool is_nullable = true, int length = 8) {
     TabletColumn column;
-    column._unique_id = id;
-    column._col_name = std::to_string(id);
-    column._type = OLAP_FIELD_TYPE_CHAR;
-    column._is_key = true;
-    column._is_nullable = is_nullable;
-    column._length = length;
-    column._index_length = 1;
+    column.set_unique_id(id);
+    column.set_name(std::to_string(id));
+    column.set_type(OLAP_FIELD_TYPE_CHAR);
+    column.set_is_key(true);
+    column.set_is_nullable(is_nullable);
+    column.set_length(length);
+    column.set_index_length(1);
     return column;
 }
 
 inline TabletColumn create_varchar_key(int32_t id, bool is_nullable = true, int length = 8) {
     TabletColumn column;
-    column._unique_id = id;
-    column._col_name = std::to_string(id);
-    column._type = OLAP_FIELD_TYPE_VARCHAR;
-    column._is_key = true;
-    column._is_nullable = is_nullable;
-    column._length = length;
-    column._index_length = 4;
+    column.set_unique_id(id);
+    column.set_name(std::to_string(id));
+    column.set_type(OLAP_FIELD_TYPE_VARCHAR);
+    column.set_is_key(true);
+    column.set_is_nullable(is_nullable);
+    column.set_length(length);
+    column.set_index_length(4);
     return column;
 }
 
 inline TabletColumn create_array(int32_t id, bool is_nullable = true, int length = 24) {
     TabletColumn column;
-    column._unique_id = id;
-    column._col_name = std::to_string(id);
-    column._type = OLAP_FIELD_TYPE_ARRAY;
-    column._is_key = true;
-    column._is_nullable = is_nullable;
-    column._length = length;
-    column._index_length = length;
+    column.set_unique_id(id);
+    column.set_name(std::to_string(id));
+    column.set_type(OLAP_FIELD_TYPE_ARRAY);
+    column.set_is_key(true);
+    column.set_is_nullable(is_nullable);
+    column.set_length(length);
+    column.set_index_length(length);
     return column;
 }
 
 template <FieldType type>
 inline TabletColumn create_with_default_value(std::string default_value) {
     TabletColumn column;
-    column._type = type;
-    column._is_nullable = true;
-    column._aggregation = OLAP_FIELD_AGGREGATION_NONE;
-    column._has_default_value = true;
-    column._default_value = default_value;
-    column._length = 4;
+    column.set_type(type);
+    column.set_is_nullable(true);
+    column.set_aggregation(OLAP_FIELD_AGGREGATION_NONE);
+    column.set_default_value(default_value);
+    column.set_length(4);
     return column;
 }
 

@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rule.implementation;
 
@@ -22,16 +22,16 @@ public class OlapScanImplementationRule extends ImplementationRule {
     @Override
     public List<OptExpression> transform(OptExpression input, OptimizerContext context) {
         LogicalOlapScanOperator scan = (LogicalOlapScanOperator) input.getOp();
-        PhysicalOlapScanOperator physicalOlapScan = new PhysicalOlapScanOperator(scan.getOlapTable(),
-                scan.getOutputColumns(),
-                scan.getColumnRefMap(),
-                scan.getColumnToIds());
-
-        physicalOlapScan.setSelectedIndexId(scan.getSelectedIndexId());
-        physicalOlapScan.setSelectedPartitionId(Lists.newArrayList(scan.getSelectedPartitionId()));
-        physicalOlapScan.setSelectedTabletId(Lists.newArrayList(scan.getSelectedTabletId()));
-        physicalOlapScan.setPredicate(scan.getPredicate());
-        physicalOlapScan.setLimit(scan.getLimit());
+        PhysicalOlapScanOperator physicalOlapScan = new PhysicalOlapScanOperator(
+                scan.getTable(),
+                scan.getColRefToColumnMetaMap(),
+                scan.getDistributionSpec(),
+                scan.getLimit(),
+                scan.getPredicate(),
+                scan.getSelectedIndexId(),
+                scan.getSelectedPartitionId(),
+                scan.getSelectedTabletId(),
+                scan.getProjection());
 
         OptExpression result = new OptExpression(physicalOlapScan);
         return Lists.newArrayList(result);

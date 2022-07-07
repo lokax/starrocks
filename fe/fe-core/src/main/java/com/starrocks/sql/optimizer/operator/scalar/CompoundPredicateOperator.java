@@ -1,9 +1,12 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.operator.scalar;
 
 import com.google.common.base.Preconditions;
+import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 
+import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 
 public class CompoundPredicateOperator extends PredicateOperator {
@@ -80,12 +83,19 @@ public class CompoundPredicateOperator extends PredicateOperator {
         return Objects.hash(super.hashCode(), type);
     }
 
-    @Override
-    public boolean isStrictPredicate() {
-        if (type == CompoundType.NOT) {
-            return false; // Always return false for NOT
-        }
+    public static ScalarOperator or(List<ScalarOperator> nodes) {
+        return Utils.createCompound(CompoundPredicateOperator.CompoundType.OR, nodes);
+    }
 
-        return getChild(0).isStrictPredicate() && getChild(1).isStrictPredicate();
+    public static ScalarOperator or(ScalarOperator... nodes) {
+        return Utils.createCompound(CompoundPredicateOperator.CompoundType.OR, Arrays.asList(nodes));
+    }
+
+    public static ScalarOperator and(List<ScalarOperator> nodes) {
+        return Utils.createCompound(CompoundPredicateOperator.CompoundType.AND, nodes);
+    }
+
+    public static ScalarOperator and(ScalarOperator... nodes) {
+        return Utils.createCompound(CompoundPredicateOperator.CompoundType.AND, Arrays.asList(nodes));
     }
 }

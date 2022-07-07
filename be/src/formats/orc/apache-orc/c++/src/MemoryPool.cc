@@ -22,10 +22,8 @@
 
 #include "orc/MemoryPool.hh"
 
-#include <immintrin.h>
-#include <string.h>
-
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 
 #include "Adaptor.hh"
@@ -39,7 +37,7 @@ MemoryPool::~MemoryPool() {
 
 class MemoryPoolImpl : public MemoryPool {
 public:
-    virtual ~MemoryPoolImpl() override;
+    ~MemoryPoolImpl() override;
 
     char* malloc(uint64_t size) override;
     void free(char* p) override;
@@ -117,6 +115,12 @@ void DataBuffer<T>::reserve(uint64_t newCapacity) {
 inline int CountTrailingZerosNonZero32(uint32_t n) {
     return __builtin_ctz(n);
 }
+
+#ifdef __x86_64__
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+#endif
 
 // it's copied from `filter_range` in column_helper.h with some minor changes.
 template <class T>

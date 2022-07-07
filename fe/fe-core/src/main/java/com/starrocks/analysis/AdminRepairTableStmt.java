@@ -23,7 +23,6 @@ package com.starrocks.analysis;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.cluster.ClusterNamespace;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.ErrorCode;
@@ -31,6 +30,7 @@ import com.starrocks.common.ErrorReport;
 import com.starrocks.common.UserException;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
 
 import java.util.List;
 
@@ -50,7 +50,7 @@ public class AdminRepairTableStmt extends DdlStmt {
         super.analyze(analyzer);
 
         // check auth
-        if (!Catalog.getCurrentCatalog().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
+        if (!GlobalStateMgr.getCurrentState().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "ADMIN");
         }
 
@@ -61,7 +61,7 @@ public class AdminRepairTableStmt extends DdlStmt {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
             }
         } else {
-            dbName = ClusterNamespace.getFullName(getClusterName(), tblRef.getName().getDb());
+            dbName = ClusterNamespace.getFullName(tblRef.getName().getDb());
         }
 
         tblRef.getName().setDb(dbName);
@@ -74,7 +74,7 @@ public class AdminRepairTableStmt extends DdlStmt {
             partitions.addAll(partitionNames.getPartitionNames());
         }
 
-        timeoutS = 4 * 3600; // default 4 hours
+        timeoutS = 4 * 3600L; // default 4 hours
     }
 
     public String getDbName() {

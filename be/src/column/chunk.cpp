@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "column/chunk.h"
 
@@ -8,34 +8,70 @@
 #include "gen_cpp/data.pb.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/descriptors.h"
+#include "simd/simd.h"
 #include "util/coding.h"
 
 namespace starrocks::vectorized {
 
 Chunk::Chunk() {
-    _slot_id_to_index.init(4);
-    _tuple_id_to_index.init(1);
+    _slot_id_to_index.reserve(4);
+    _tuple_id_to_index.reserve(1);
+}
+
+Status Chunk::upgrade_if_overflow() {
+    for (auto& column : _columns) {
+        auto ret = column->upgrade_if_overflow();
+        if (!ret.ok()) {
+            return ret.status();
+        } else if (ret.value() != nullptr) {
+            column = ret.value();
+        } else {
+            continue;
+        }
+    }
+    return Status::OK();
+}
+
+Status Chunk::downgrade() {
+    for (auto& column : _columns) {
+        auto ret = column->downgrade();
+        if (!ret.ok()) {
+            return ret.status();
+        } else if (ret.value() != nullptr) {
+            column = ret.value();
+        } else {
+            continue;
+        }
+    }
+    return Status::OK();
+}
+
+bool Chunk::has_large_column() const {
+    for (const auto& column : _columns) {
+        if (column->has_large_column()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 Chunk::Chunk(Columns columns, SchemaPtr schema) : _columns(std::move(columns)), _schema(std::move(schema)) {
     // bucket size cannot be 0.
-    _cid_to_index.init(std::max<size_t>(1, columns.size() * 2));
-    _slot_id_to_index.init(std::max<size_t>(1, _columns.size() * 2));
-    _tuple_id_to_index.init(1);
+    _cid_to_index.reserve(std::max<size_t>(1, columns.size() * 2));
+    _slot_id_to_index.reserve(std::max<size_t>(1, _columns.size() * 2));
+    _tuple_id_to_index.reserve(1);
     rebuild_cid_index();
     check_or_die();
 }
 
 // TODO: FlatMap don't support std::move
-Chunk::Chunk(Columns columns, const butil::FlatMap<SlotId, size_t>& slot_map)
-        : _columns(std::move(columns)), _slot_id_to_index(slot_map) {
+Chunk::Chunk(Columns columns, const SlotHashMap& slot_map) : _columns(std::move(columns)), _slot_id_to_index(slot_map) {
     // when use _slot_id_to_index, we don't need to rebuild_cid_index
-    _tuple_id_to_index.init(1);
+    _tuple_id_to_index.reserve(1);
 }
 
 // TODO: FlatMap don't support std::move
-Chunk::Chunk(Columns columns, const butil::FlatMap<SlotId, size_t>& slot_map,
-             const butil::FlatMap<SlotId, size_t>& tuple_map)
+Chunk::Chunk(Columns columns, const SlotHashMap& slot_map, const TupleHashMap& tuple_map)
         : _columns(std::move(columns)), _slot_id_to_index(slot_map), _tuple_id_to_index(tuple_map) {
     // when use _slot_id_to_index, we don't need to rebuild_cid_index
 }
@@ -62,13 +98,13 @@ void Chunk::set_num_rows(size_t count) {
     }
 }
 
-std::string Chunk::get_column_name(size_t idx) const {
+std::string_view Chunk::get_column_name(size_t idx) const {
     DCHECK_LT(idx, _columns.size());
     return _schema->field(idx)->name();
 }
 
 void Chunk::append_column(ColumnPtr column, const FieldPtr& field) {
-    DCHECK(_cid_to_index.seek(field->id()) == nullptr);
+    DCHECK(!_cid_to_index.contains(field->id()));
     _cid_to_index[field->id()] = _columns.size();
     _columns.emplace_back(std::move(column));
     _schema->append(field);
@@ -129,92 +165,6 @@ void Chunk::rebuild_cid_index() {
     }
 }
 
-size_t Chunk::serialize_size() const {
-    size_t size = 0;
-    for (const auto& column : _columns) {
-        size += column->serialize_size();
-    }
-    size += sizeof(uint32_t) + sizeof(uint32_t); // version + num rows
-    return size;
-}
-
-void Chunk::serialize(uint8_t* dst) const {
-    uint32_t version = 1;
-    encode_fixed32_le(dst, version);
-    dst += sizeof(uint32_t);
-
-    encode_fixed32_le(dst, num_rows());
-    dst += sizeof(uint32_t);
-
-    for (const auto& column : _columns) {
-        dst = column->serialize_column(dst);
-    }
-}
-
-size_t Chunk::serialize_with_meta(starrocks::ChunkPB* chunk) const {
-    chunk->clear_slot_id_map();
-    chunk->mutable_slot_id_map()->Reserve(static_cast<int>(_slot_id_to_index.size()) * 2);
-    for (const auto& kv : _slot_id_to_index) {
-        chunk->mutable_slot_id_map()->Add(kv.first);
-        chunk->mutable_slot_id_map()->Add(kv.second);
-    }
-
-    chunk->clear_tuple_id_map();
-    chunk->mutable_tuple_id_map()->Reserve(static_cast<int>(_tuple_id_to_index.size()) * 2);
-    for (const auto& kv : _tuple_id_to_index) {
-        chunk->mutable_tuple_id_map()->Add(kv.first);
-        chunk->mutable_tuple_id_map()->Add(kv.second);
-    }
-
-    chunk->clear_is_nulls();
-    chunk->mutable_is_nulls()->Reserve(_columns.size());
-    for (const auto& column : _columns) {
-        chunk->mutable_is_nulls()->Add(column->is_nullable());
-    }
-
-    chunk->clear_is_consts();
-    chunk->mutable_is_consts()->Reserve(_columns.size());
-    for (const auto& column : _columns) {
-        chunk->mutable_is_consts()->Add(column->is_constant());
-    }
-
-    DCHECK_EQ(_columns.size(), _tuple_id_to_index.size() + _slot_id_to_index.size());
-
-    size_t size = serialize_size();
-    chunk->mutable_data()->resize(size);
-    serialize((uint8_t*)chunk->mutable_data()->data());
-    return size;
-}
-
-Status Chunk::deserialize(const uint8_t* src, size_t len, const RuntimeChunkMeta& meta) {
-    _slot_id_to_index = meta.slot_id_to_index;
-    _tuple_id_to_index = meta.tuple_id_to_index;
-    _columns.resize(_slot_id_to_index.size() + _tuple_id_to_index.size());
-
-    uint32_t version = decode_fixed32_le(src);
-    DCHECK_EQ(version, 1);
-    src += sizeof(uint32_t);
-
-    size_t rows = decode_fixed32_le(src);
-    src += sizeof(uint32_t);
-
-    for (size_t i = 0; i < meta.is_nulls.size(); ++i) {
-        _columns[i] = ColumnHelper::create_column(meta.types[i], meta.is_nulls[i], meta.is_consts[i], rows);
-    }
-
-    for (const auto& column : _columns) {
-        src = column->deserialize_column(src);
-    }
-
-    size_t except = serialize_size();
-    if (UNLIKELY(len != except)) {
-        return Status::InternalError(
-                strings::Substitute("deserialize chunk data failed. len: $0, except: $1", len, except));
-    }
-    DCHECK_EQ(rows, num_rows());
-    return Status::OK();
-}
-
 std::unique_ptr<Chunk> Chunk::clone_empty() const {
     return clone_empty(num_rows());
 }
@@ -242,8 +192,7 @@ std::unique_ptr<Chunk> Chunk::clone_empty_with_slot(size_t size) const {
 }
 
 std::unique_ptr<Chunk> Chunk::clone_empty_with_schema() const {
-    int size = num_rows();
-    return clone_empty_with_schema(size);
+    return clone_empty_with_schema(num_rows());
 }
 
 std::unique_ptr<Chunk> Chunk::clone_empty_with_schema(size_t size) const {
@@ -268,6 +217,16 @@ std::unique_ptr<Chunk> Chunk::clone_empty_with_tuple(size_t size) const {
     return std::make_unique<Chunk>(columns, _slot_id_to_index, _tuple_id_to_index);
 }
 
+std::unique_ptr<Chunk> Chunk::clone_unique() const {
+    std::unique_ptr<Chunk> chunk = clone_empty_with_tuple(0);
+    for (size_t idx = 0; idx < _columns.size(); idx++) {
+        ColumnPtr column = _columns[idx]->clone_shared();
+        chunk->_columns[idx] = std::move(column);
+    }
+    chunk->check_or_die();
+    return chunk;
+}
+
 void Chunk::append_selective(const Chunk& src, const uint32_t* indexes, uint32_t from, uint32_t size) {
     DCHECK_EQ(_columns.size(), src.columns().size());
     for (size_t i = 0; i < _columns.size(); ++i) {
@@ -275,7 +234,20 @@ void Chunk::append_selective(const Chunk& src, const uint32_t* indexes, uint32_t
     }
 }
 
-size_t Chunk::filter(const Buffer<uint8_t>& selection) {
+void Chunk::rolling_append_selective(Chunk& src, const uint32_t* indexes, uint32_t from, uint32_t size) {
+    size_t num_columns = _columns.size();
+    DCHECK_EQ(num_columns, src.columns().size());
+
+    for (size_t i = 0; i < num_columns; ++i) {
+        _columns[i]->append_selective(*src.columns()[i].get(), indexes, from, size);
+        src.columns()[i].reset();
+    }
+}
+
+size_t Chunk::filter(const Buffer<uint8_t>& selection, bool force) {
+    if (!force && SIMD::count_zero(selection) == 0) {
+        return num_rows();
+    }
     for (auto& column : _columns) {
         column->filter(selection);
     }
@@ -302,14 +274,6 @@ size_t Chunk::memory_usage() const {
     size_t memory_usage = 0;
     for (const auto& column : _columns) {
         memory_usage += column->memory_usage();
-    }
-    return memory_usage;
-}
-
-size_t Chunk::shrink_memory_usage() const {
-    size_t memory_usage = 0;
-    for (const auto& column : _columns) {
-        memory_usage += column->shrink_memory_usage();
     }
     return memory_usage;
 }
@@ -354,6 +318,7 @@ void Chunk::check_or_die() {
     } else {
         for (const ColumnPtr& c : _columns) {
             CHECK_EQ(num_rows(), c->size());
+            c->check_or_die();
         }
     }
 
@@ -378,6 +343,16 @@ std::string Chunk::debug_row(uint32_t index) const {
     }
     os << _columns[_columns.size() - 1]->debug_item(index) << "]";
     return os.str();
+}
+
+void Chunk::merge(Chunk&& src) {
+    DCHECK_EQ(src.num_rows(), num_rows());
+    for (auto& it : src._slot_id_to_index) {
+        SlotId slot_id = it.first;
+        size_t index = it.second;
+        ColumnPtr& c = src._columns[index];
+        append_column(c, slot_id);
+    }
 }
 
 void Chunk::append(const Chunk& src, size_t offset, size_t count) {

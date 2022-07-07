@@ -22,12 +22,8 @@
 package com.starrocks.http.rest;
 
 import com.google.common.base.Strings;
-import com.starrocks.analysis.InlineViewRef;
-import com.starrocks.analysis.SelectStmt;
 import com.starrocks.analysis.StatementBase;
 import com.starrocks.analysis.TableName;
-import com.starrocks.analysis.TableRef;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Table;
 import com.starrocks.cluster.ClusterNamespace;
@@ -39,19 +35,21 @@ import com.starrocks.http.BaseResponse;
 import com.starrocks.http.IllegalArgException;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.planner.PlanFragment;
-import com.starrocks.planner.Planner;
-import com.starrocks.planner.ScanNode;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.qe.OriginStatement;
-import com.starrocks.qe.SessionVariable;
-import com.starrocks.qe.StmtExecutor;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.StatementPlanner;
+import com.starrocks.sql.analyzer.AnalyzerUtils;
+import com.starrocks.sql.ast.QueryStatement;
+import com.starrocks.sql.ast.SelectRelation;
+import com.starrocks.sql.ast.SubqueryRelation;
+import com.starrocks.sql.ast.TableRelation;
+import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.thrift.TDataSink;
 import com.starrocks.thrift.TDataSinkType;
 import com.starrocks.thrift.TInternalScanRange;
 import com.starrocks.thrift.TMemoryScratchSink;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TPlanFragment;
-import com.starrocks.thrift.TQueryOptions;
 import com.starrocks.thrift.TQueryPlanInfo;
 import com.starrocks.thrift.TScanRangeLocations;
 import com.starrocks.thrift.TTabletVersionInfo;
@@ -117,9 +115,10 @@ public class TableQueryPlanAction extends RestBaseAction {
             try {
                 jsonObject = new JSONObject(postContent);
             } catch (JSONException e) {
-                throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST, "malformed json [ " + postContent + " ]");
+                throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST,
+                        "malformed json [ " + postContent + " ]");
             }
-            sql = String.valueOf(jsonObject.opt("sql"));
+            sql = jsonObject.optString("sql");
             if (Strings.isNullOrEmpty(sql)) {
                 throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST,
                         "POST body must contains [sql] root object");
@@ -127,10 +126,10 @@ public class TableQueryPlanAction extends RestBaseAction {
             LOG.info("receive SQL statement [{}] from external service [ user [{}]] for database [{}] table [{}]",
                     sql, ConnectContext.get().getCurrentUserIdentity(), dbName, tableName);
 
-            String fullDbName = ClusterNamespace.getFullName(ConnectContext.get().getClusterName(), dbName);
+            String fullDbName = ClusterNamespace.getFullName(dbName);
             // check privilege for select, otherwise return HTTP 401
             checkTblAuth(ConnectContext.get().getCurrentUserIdentity(), fullDbName, tableName, PrivPredicate.SELECT);
-            Database db = Catalog.getCurrentCatalog().getDb(fullDbName);
+            Database db = GlobalStateMgr.getCurrentState().getDb(fullDbName);
             if (db == null) {
                 throw new StarRocksHttpException(HttpResponseStatus.NOT_FOUND,
                         "Database [" + dbName + "] " + "does not exists");
@@ -185,68 +184,75 @@ public class TableQueryPlanAction extends RestBaseAction {
      * @throws StarRocksHttpException
      */
     private void handleQuery(ConnectContext context, String requestDb, String requestTable, String sql,
-                             Map<String, Object> result) throws StarRocksHttpException {
-        // use SE to resolve sql
-        StmtExecutor stmtExecutor = new StmtExecutor(context, new OriginStatement(sql, 0), false);
+                             Map<String, Object> result) {
+        StatementBase statementBase;
+        ExecPlan execPlan;
         try {
-            SessionVariable sessionVariable = context.getSessionVariable();
-            // MemoryScratchSink does not implement send_chunk interface and TPlanFragmentExecParams
-            // use_vectorized is not set, so set vectorized_engine_enable false in query.
-            sessionVariable.setVectorizedEngineEnable(false);
-            TQueryOptions tQueryOptions = sessionVariable.toThrift();
-            // Conduct Planner create SingleNodePlan#createPlanFragments
-            tQueryOptions.num_nodes = 1;
-            // analyze sql
-            stmtExecutor.analyze(tQueryOptions);
+            /*
+             * SingleNodeExecPlan is set in TableQueryPlanAction to generate a single-node Plan,
+             * currently only used in Spark/Flink Connector
+             */
+            context.getSessionVariable().setSingleNodeExecPlan(true);
+            statementBase =
+                    com.starrocks.sql.parser.SqlParser.parse(sql, context.getSessionVariable().getSqlMode()).get(0);
+            execPlan = new StatementPlanner().plan(statementBase, context);
+            context.getSessionVariable().setSingleNodeExecPlan(false);
         } catch (Exception e) {
-            throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST, e.getMessage());
+            throw new StarRocksHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
+                    "The Sql is invalid");
         }
-        // the parsed logical statement
-        StatementBase query = stmtExecutor.getParsedStmt();
+
         // only process select semantic
-        if (!(query instanceof SelectStmt)) {
+        if (!(statementBase instanceof QueryStatement)) {
             throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST,
                     "Select statement needed, but found [" + sql + " ]");
         }
-        SelectStmt stmt = (SelectStmt) query;
-        // just only process sql like `select * from table where <predicate>`, only support executing scan semantic
-        if (stmt.hasAggInfo() || stmt.hasAnalyticInfo()
-                || stmt.hasOrderByClause() || stmt.hasOffset() || stmt.hasLimit() || stmt.isExplain()) {
+
+        SelectRelation stmt = (SelectRelation) ((QueryStatement) statementBase).getQueryRelation();
+        // only process sql like `select * from table where <predicate>`, only support executing scan semantic
+        if (stmt.hasAggregation() || stmt.hasAnalyticInfo()
+                || stmt.hasOrderByClause() || stmt.hasOffset() || stmt.hasLimit() || statementBase.isExplain()) {
             throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST,
                     "only support single table filter-prune-scan, but found [ " + sql + "]");
         }
-        // process only one table by one http query
-        List<TableRef> fromTables = stmt.getTableRefs();
-        if (fromTables.size() != 1) {
-            throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST, "Select statement must hava only one table");
+
+        // only process one table by one http query
+        if (AnalyzerUtils.collectAllTable(statementBase).size() != 1) {
+            if (stmt.getRelation() instanceof TableRelation) {
+                throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST,
+                        "Select statement must have only one table");
+            }
         }
 
-        TableRef fromTable = fromTables.get(0);
-        if (fromTable instanceof InlineViewRef) {
+        if (stmt.getRelation() instanceof SubqueryRelation) {
             throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST,
                     "Select statement must not embed another statement");
         }
+
         // check consistent http requested resource with sql referenced
         // if consistent in this way, can avoid check privilege
-        TableName tableAndDb = fromTables.get(0).getName();
+        TableName tableAndDb = stmt.getRelation().getResolveTableName();
         if (!(tableAndDb.getDb().equals(requestDb) && tableAndDb.getTbl().equals(requestTable))) {
             throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST,
                     "requested database and table must consistent with sql: request [ "
                             + requestDb + "." + requestTable + "]" + "and sql [" + tableAndDb.toString() + "]");
         }
 
-        // acquired Planner to get PlanNode and fragment templates
-        Planner planner = stmtExecutor.planner();
+        if (execPlan == null) {
+            throw new StarRocksHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
+                    "The Sql is invalid");
+        }
+
         // acquire ScanNode to obtain pruned tablet
         // in this way, just retrieve only one scannode
-        List<ScanNode> scanNodes = planner.getScanNodes();
-        if (scanNodes.size() != 1) {
+        if (execPlan.getScanNodes().size() != 1) {
             throw new StarRocksHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
-                    "Planner should plan just only one ScanNode but found [ " + scanNodes.size() + "]");
+                    "Planner should plan just only one ScanNode but found [ " + execPlan.getScanNodes().size() + "]");
         }
-        List<TScanRangeLocations> scanRangeLocations = scanNodes.get(0).getScanRangeLocations(0);
+        List<TScanRangeLocations> scanRangeLocations =
+                execPlan.getScanNodes().get(0).getScanRangeLocations(0);
         // acquire the PlanFragment which the executable template
-        List<PlanFragment> fragments = planner.getFragments();
+        List<PlanFragment> fragments = execPlan.getFragments();
         if (fragments.size() != 1) {
             throw new StarRocksHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
                     "Planner should plan just only one PlanFragment but found [ " + fragments.size() + "]");
@@ -263,32 +269,32 @@ public class TableQueryPlanAction extends RestBaseAction {
         tPlanFragment.output_sink = tDataSink;
 
         tQueryPlanInfo.plan_fragment = tPlanFragment;
-        tQueryPlanInfo.desc_tbl = query.getAnalyzer().getDescTbl().toThrift();
+        tQueryPlanInfo.desc_tbl = execPlan.getDescTbl().toThrift();
         // set query_id
         UUID uuid = UUID.randomUUID();
         tQueryPlanInfo.query_id = new TUniqueId(uuid.getMostSignificantBits(), uuid.getLeastSignificantBits());
 
-        Map<Long, TTabletVersionInfo> tablet_info = new HashMap<>();
+        Map<Long, TTabletVersionInfo> tabletInfo = new HashMap<>();
         // acquire resolved tablet distribution
         Map<String, Node> tabletRoutings = assemblePrunedPartitions(scanRangeLocations);
         tabletRoutings.forEach((tabletId, node) -> {
             long tablet = Long.parseLong(tabletId);
-            tablet_info.put(tablet, new TTabletVersionInfo(tablet, node.version, node.versionHash, node.schemaHash));
+            tabletInfo.put(tablet, new TTabletVersionInfo(tablet, node.version, 0, node.schemaHash));
         });
-        tQueryPlanInfo.tablet_info = tablet_info;
+        tQueryPlanInfo.tablet_info = tabletInfo;
 
         // serialize TQueryPlanInfo and encode plan with Base64 to string in order to translate by json format
         TSerializer serializer = new TSerializer();
-        String opaqued_query_plan;
+        String opaquedQueryPlan;
         try {
-            byte[] query_plan_stream = serializer.serialize(tQueryPlanInfo);
-            opaqued_query_plan = Base64.getEncoder().encodeToString(query_plan_stream);
+            byte[] queryPlanStream = serializer.serialize(tQueryPlanInfo);
+            opaquedQueryPlan = Base64.getEncoder().encodeToString(queryPlanStream);
         } catch (TException e) {
             throw new StarRocksHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
                     "TSerializer failed to serialize PlanFragment, reason [ " + e.getMessage() + " ]");
         }
         result.put("partitions", tabletRoutings);
-        result.put("opaqued_query_plan", opaqued_query_plan);
+        result.put("opaqued_query_plan", opaquedQueryPlan);
         result.put("status", 200);
     }
 
@@ -303,8 +309,7 @@ public class TableQueryPlanAction extends RestBaseAction {
         for (TScanRangeLocations scanRangeLocations : scanRangeLocationsList) {
             // only process starrocks scan range
             TInternalScanRange scanRange = scanRangeLocations.scan_range.internal_scan_range;
-            Node tabletRouting = new Node(Long.parseLong(scanRange.version),
-                    Long.parseLong(scanRange.version_hash), Integer.parseInt(scanRange.schema_hash));
+            Node tabletRouting = new Node(Long.parseLong(scanRange.version), Integer.parseInt(scanRange.schema_hash));
             for (TNetworkAddress address : scanRange.hosts) {
                 tabletRouting.addRouting(address.hostname + ":" + address.port);
             }
@@ -318,12 +323,10 @@ public class TableQueryPlanAction extends RestBaseAction {
         // ["host1:port1", "host2:port2", "host3:port3"]
         public List<String> routings = new ArrayList<>();
         public long version;
-        public long versionHash;
         public int schemaHash;
 
-        public Node(long version, long versionHash, int schemaHash) {
+        public Node(long version, int schemaHash) {
             this.version = version;
-            this.versionHash = versionHash;
             this.schemaHash = schemaHash;
         }
 

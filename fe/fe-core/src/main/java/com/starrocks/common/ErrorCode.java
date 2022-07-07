@@ -149,7 +149,8 @@ public enum ErrorCode {
             "Number of partitions in unpartitioned table is not 1"),
     ERR_NO_ALTER_OPERATION(5023, new byte[] {'H', 'Y', '0', '0', '0'},
             "No operation in alter statement"),
-    ERR_EXECUTE_TIMEOUT(5024, new byte[] {'H', 'Y', '0', '0', '0'}, "Execute timeout"),
+    ERR_QUERY_TIMEOUT(5024, new byte[] {'H', 'Y', '0', '0', '0'},
+            "Query timeout. Increase the query_timeout session variable and retry"),
     ERR_FAILED_WHEN_INSERT(5025, new byte[] {'H', 'Y', '0', '0', '0'}, "Failed when INSERT execute"),
     ERR_UNSUPPORTED_TYPE_IN_CTAS(5026, new byte[] {'H', 'Y', '0', '0', '0'},
             "Unsupported type '%s' in create table as select statement"),
@@ -164,8 +165,7 @@ public enum ErrorCode {
     ERR_CLUSTER_BE_NOT_ENOUGH(5036, new byte[] {'H', 'Y', '0', '0', '0'}, "BE is not enough"),
     ERR_CLUSTER_DELETE_DB_EXIST(5037, new byte[] {'H', 'Y', '0', '0', '0'},
             "All databases in cluster must be dropped before dropping cluster"),
-    ERR_CLUSTER_DELETE_BE_ID_ERROR(5037, new byte[] {'H', 'Y', '0', '0', '0'}, "There is no BE's id in the System"),
-    ERR_CLUSTER_NO_CLUSTER_NAME(5038, new byte[] {'H', 'Y', '0', '0', '0'}, "There is no cluster name"),
+    ERR_CLUSTER_DELETE_BE_ID_ERROR(5038, new byte[] {'H', 'Y', '0', '0', '0'}, "There is no BE's id in the System"),
     ERR_CLUSTER_UNKNOWN_ERROR(5040, new byte[] {'4', '2', '0', '0', '0'}, "Unknown cluster '%s'"),
     ERR_CLUSTER_NAME_NULL(5041, new byte[] {'4', '2', '0', '0', '0'}, "No cluster name"),
     ERR_CLUSTER_NO_PERMISSIONS(5042, new byte[] {'4', '2', '0', '0', '0'}, "No permissions"),
@@ -250,7 +250,19 @@ public enum ErrorCode {
     ERROR_CREATE_TABLE_LIKE_EMPTY(5073, new byte[] {'4', '2', '0', '0', '0'},
             "Origin create table stmt is empty"),
     ERROR_REFRESH_EXTERNAL_TABLE_FAILED(5074, new byte[] {'4', '2', '0', '0', '0'},
-            "refresh external table failed: %s");
+            "refresh external table failed: %s"),
+    ERROR_CREATE_TABLE_LIKE_UNSUPPORTED_VIEW(5075, new byte[] {'4', '2', '0', '0', '0'},
+            "Create table like does not support create view."),
+    ERROR_SET_CONFIG_FAILED(5076, new byte[] {'4', '2', '0', '0', '0'},
+            "set config failed: %s"),
+    ERR_QUERY_EXCEPTION(5077, new byte[] {'4', '2', '0', '0', '0'},
+            "Query cancelled by crash of backends."),
+    ERR_BAD_CATALOG_ERROR(5078, new byte[] {'4', '2', '0', '0', '0'},
+            "Unknown catalog '%s'"),
+    ERROR_NO_WG_ERROR(5079, new byte[] {'4', '2', '0', '0', '0'},
+            "Unknown workgroup '%s' "),
+    ERR_BAD_CATALOG_AND_DB_ERROR(5080, new byte[] {'4', '2', '0', '0', '0'},
+            "Unknown catalog.db '%s'");
 
     ErrorCode(int code, byte[] sqlState, String errorMsg) {
         this.code = code;

@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/mysql/MysqlPassword.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -29,6 +25,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.UnsupportedEncodingException;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
@@ -78,11 +75,11 @@ import java.util.Random;
 public class MysqlPassword {
     private static final Logger LOG = LogManager.getLogger(MysqlPassword.class);
     // TODO(zhaochun): this is duplicated with handshake packet.
-    public static final byte EMPTY_PASSWORD[] = new byte[0];
+    public static final byte[] EMPTY_PASSWORD = new byte[0];
     public static final int SCRAMBLE_LENGTH = 20;
     public static final int SCRAMBLE_LENGTH_HEX_LENGTH = 2 * SCRAMBLE_LENGTH + 1;
     public static final byte PVERSION41_CHAR = '*';
-    private static final byte DIG_VEC_UPPER[] = {'0', '1', '2', '3', '4', '5', '6', '7',
+    private static final byte[] DIG_VEC_UPPER = {'0', '1', '2', '3', '4', '5', '6', '7',
             '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
     private static Random random = new Random(System.currentTimeMillis());
 
@@ -91,8 +88,8 @@ public class MysqlPassword {
         random.nextBytes(bytes);
         // NOTE: MySQL challenge string can't contain 0.
         for (int i = 0; i < len; ++i) {
-            if ((bytes[i] >= 'a' && bytes[i] <= 'z')
-                    || (bytes[i] >= 'A' && bytes[i] <= 'Z')) {
+            if ((bytes[i] >= 'a' && bytes[i] <= 'z') || (bytes[i] >= 'A' && bytes[i] <= 'Z')) {
+                // pass
             } else {
                 bytes[i] = (byte) ('a' + (bytes[i] % 26));
             }
@@ -264,12 +261,8 @@ public class MysqlPassword {
         }
 
         byte[] passwd = null;
-        try {
-            passwdString = passwdString.toUpperCase();
-            passwd = passwdString.getBytes("UTF-8");
-        } catch (UnsupportedEncodingException e) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_UNKNOWN_ERROR);
-        }
+        passwdString = passwdString.toUpperCase();
+        passwd = passwdString.getBytes(StandardCharsets.UTF_8);
         if (passwd.length != SCRAMBLE_LENGTH_HEX_LENGTH || passwd[0] != PVERSION41_CHAR) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_PASSWD_LENGTH, 41);
         }

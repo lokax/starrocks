@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer;
 
@@ -15,10 +15,15 @@ import com.starrocks.sql.optimizer.operator.logical.LogicalLimitOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalProjectOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalTopNOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalAssertOneRowOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalCTEAnchorOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalCTEConsumeOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalCTEProduceOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalDistributionOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalFilterOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalHashAggregateOperator;
-import com.starrocks.sql.optimizer.operator.physical.PhysicalHashJoinOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalJDBCScanOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalJoinOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalMetaScanOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalMysqlScanOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalOlapScanOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalRepeatOperator;
@@ -178,13 +183,20 @@ public class OperatorStrings {
         public OperatorStr visitPhysicalOlapScan(OptExpression optExpression, Integer step) {
             PhysicalOlapScanOperator scan = (PhysicalOlapScanOperator) optExpression.getOp();
             StringBuilder sb = new StringBuilder("SCAN (");
-            sb.append("columns").append(scan.getOutputColumns());
+            sb.append("columns").append(scan.getColRefToColumnMetaMap().keySet());
             sb.append(" predicate[").append(scan.getPredicate()).append("]");
             sb.append(")");
             if (scan.getLimit() >= 0) {
                 sb.append(" Limit ").append(scan.getLimit());
             }
             return new OperatorStr(sb.toString(), step, Collections.emptyList());
+        }
+
+        @Override
+        public OperatorStr visitPhysicalMetaScan(OptExpression optExpression, Integer step) {
+            PhysicalMetaScanOperator scan = (PhysicalMetaScanOperator) optExpression.getOp();
+            String sb = "Meta SCAN (" + "columns" + scan.getUsedColumns() + ")";
+            return new OperatorStr(sb, step, Collections.emptyList());
         }
 
         @Override
@@ -204,6 +216,19 @@ public class OperatorStrings {
         public OperatorStr visitPhysicalMysqlScan(OptExpression optExpression, Integer step) {
             PhysicalMysqlScanOperator scan = (PhysicalMysqlScanOperator) optExpression.getOp();
             StringBuilder sb = new StringBuilder("SCAN (");
+            sb.append("columns").append(scan.getUsedColumns());
+            sb.append(" predicate[").append(scan.getPredicate()).append("]");
+            sb.append(")");
+            if (scan.getLimit() >= 0) {
+                sb.append(" Limit ").append(scan.getLimit());
+            }
+            return new OperatorStr(sb.toString(), step, Collections.emptyList());
+        }
+
+        @Override
+        public OperatorStr visitPhysicalJDBCScan(OptExpression optExpression, Integer step) {
+            PhysicalJDBCScanOperator scan = (PhysicalJDBCScanOperator) optExpression.getOp();
+            StringBuilder sb = new StringBuilder("JDBC SCAN (");
             sb.append("columns").append(scan.getUsedColumns());
             sb.append(" predicate[").append(scan.getPredicate()).append("]");
             sb.append(")");
@@ -251,12 +276,24 @@ public class OperatorStrings {
         }
 
         public OperatorStr visitPhysicalHashJoin(OptExpression optExpression, Integer step) {
+            return visitPhysicalJoin(optExpression, step);
+        }
+
+        public OperatorStr visitPhysicalMergeJoin(OptExpression optExpression, Integer step) {
+            return visitPhysicalJoin(optExpression, step);
+        }
+
+        public OperatorStr visitPhysicalNestLoopJoin(OptExpression optExpression, Integer step) {
+            return visitPhysicalJoin(optExpression, step);
+        }
+
+        public OperatorStr visitPhysicalJoin(OptExpression optExpression, Integer step) {
             OperatorStr left = visit(optExpression.getInputs().get(0), step + 1);
             OperatorStr right = visit(optExpression.getInputs().get(1), step + 1);
 
-            PhysicalHashJoinOperator join = (PhysicalHashJoinOperator) optExpression.getOp();
+            PhysicalJoinOperator join = (PhysicalJoinOperator) optExpression.getOp();
             StringBuilder sb = new StringBuilder("").append(join.getJoinType()).append(" (");
-            sb.append("join-predicate [").append(join.getJoinPredicate()).append("] ");
+            sb.append("join-predicate [").append(join.getOnPredicate()).append("] ");
             sb.append("post-join-predicate [").append(join.getPredicate()).append("]");
             sb.append(")");
 
@@ -375,6 +412,45 @@ public class OperatorStrings {
             }
 
             return new OperatorStr(s, step, new ArrayList<>(childString));
+        }
+
+        @Override
+        public OperatorStr visitPhysicalDecode(OptExpression optExpression, Integer step) {
+            OperatorStr child = visit(optExpression.getInputs().get(0), step + 1);
+            String sb = "Decode ";
+            return new OperatorStr(sb, step, Collections.singletonList(child));
+        }
+
+        @Override
+        public OperatorStr visitPhysicalLimit(OptExpression optExpression, Integer step) {
+            return visit(optExpression.getInputs().get(0), step);
+        }
+
+        @Override
+        public OperatorStr visitPhysicalCTEAnchor(OptExpression optExpression, Integer step) {
+            OperatorStr producer = visit(optExpression.getInputs().get(0), step + 1);
+            OperatorStr consumer = visit(optExpression.getInputs().get(1), step + 1);
+            PhysicalCTEAnchorOperator op = (PhysicalCTEAnchorOperator) optExpression.getOp();
+            String sb = "CTEAnchor(cteid=" + op.getCteId() + ")";
+            ArrayList<OperatorStr> children = new ArrayList<>();
+            children.add(producer);
+            children.add(consumer);
+            return new OperatorStr(sb, step, children);
+        }
+
+        @Override
+        public OperatorStr visitPhysicalCTEProduce(OptExpression optExpression, Integer step) {
+            OperatorStr children = visit(optExpression.getInputs().get(0), step + 1);
+            PhysicalCTEProduceOperator op = (PhysicalCTEProduceOperator) optExpression.getOp();
+            String sb = "CTEProducer(cteid=" + op.getCteId() + ")";
+            return new OperatorStr(sb, step, Collections.singletonList(children));
+        }
+
+        @Override
+        public OperatorStr visitPhysicalCTEConsume(OptExpression optExpression, Integer step) {
+            PhysicalCTEConsumeOperator op = (PhysicalCTEConsumeOperator) optExpression.getOp();
+            String sb = "CTEConsumer(cteid=" + op.getCteId() + ")";
+            return new OperatorStr(sb, step, Collections.emptyList());
         }
     }
 }

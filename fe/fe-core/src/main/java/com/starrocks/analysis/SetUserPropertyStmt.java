@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/SetUserPropertyStmt.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -56,7 +52,7 @@ public class SetUserPropertyStmt extends DdlStmt {
     }
 
     @Override
-    public void analyze(Analyzer analyzer) throws AnalysisException, UserException {
+    public void analyze(Analyzer analyzer) throws UserException {
         super.analyze(analyzer);
         if (Strings.isNullOrEmpty(user)) {
             // If param 'user' is not set, use the login user name.
@@ -65,7 +61,7 @@ public class SetUserPropertyStmt extends DdlStmt {
         } else {
             // If param 'user' is set, check if it need to be full-qualified
             if (!user.equals(Auth.ROOT_USER) && !user.equals(Auth.ADMIN_USER)) {
-                user = ClusterNamespace.getFullName(getClusterName(), user);
+                user = ClusterNamespace.getFullName(user);
             }
         }
 
@@ -75,7 +71,7 @@ public class SetUserPropertyStmt extends DdlStmt {
 
         boolean isSelf = user.equals(ConnectContext.get().getQualifiedUser());
         for (SetVar var : propertyList) {
-            ((SetUserPropertyVar) var).analyze(analyzer, isSelf);
+            ((SetUserPropertyVar) var).analyze(isSelf);
         }
     }
 

@@ -1,13 +1,46 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "column/nullable_column.h"
 
+#include <fmt/format.h>
 #include <gtest/gtest.h>
 
+#include "column/binary_column.h"
 #include "column/fixed_length_column.h"
+#include "exec/vectorized/sorting/sorting.h"
 #include "testutil/parallel_test.h"
 
 namespace starrocks::vectorized {
+
+// NOLINTNEXTLINE
+PARALLEL_TEST(NullableColumnTest, test_nullable_column_upgrade_if_overflow) {
+    auto c0 = NullableColumn::create(UInt32Column::create(), NullColumn::create());
+    c0->append_datum((uint32_t)1);
+
+    auto ret = c0->upgrade_if_overflow();
+    ASSERT_TRUE(ret.ok());
+    ASSERT_TRUE(ret.value() == nullptr);
+}
+
+// NOLINTNEXTLINE
+PARALLEL_TEST(NullableColumnTest, test_nullable_column_downgrade) {
+    auto c0 = NullableColumn::create(BinaryColumn::create(), NullColumn::create());
+    c0->append_datum(Slice("1"));
+
+    ASSERT_FALSE(c0->has_large_column());
+    auto ret = c0->downgrade();
+    ASSERT_TRUE(ret.ok());
+    ASSERT_TRUE(ret.value() == nullptr);
+
+    c0 = NullableColumn::create(LargeBinaryColumn::create(), NullColumn::create());
+    c0->append_datum(Slice("1"));
+
+    ASSERT_TRUE(c0->has_large_column());
+    ret = c0->downgrade();
+    ASSERT_TRUE(ret.ok());
+    ASSERT_TRUE(ret.value() == nullptr);
+    ASSERT_FALSE(c0->has_large_column());
+}
 
 // NOLINTNEXTLINE
 PARALLEL_TEST(NullableColumnTest, test_copy_constructor) {
@@ -195,6 +228,115 @@ PARALLEL_TEST(NullableColumnTest, test_clone_empty) {
     ASSERT_TRUE(down_cast<NullableColumn*>(c2.get())->null_column().unique());
     ASSERT_EQ(0, down_cast<NullableColumn*>(c2.get())->data_column()->size());
     ASSERT_EQ(0, down_cast<NullableColumn*>(c2.get())->null_column()->size());
+}
+
+PARALLEL_TEST(NullableColumnTest, test_update_rows) {
+    auto column = NullableColumn::create(Int32Column::create(), NullColumn::create());
+    column->append_datum((int32_t)1);
+    column->append_datum((int32_t)2);
+    column->append_datum({});
+    column->append_datum((int32_t)4);
+    column->append_datum({});
+
+    auto replace_col1 = NullableColumn::create(Int32Column::create(), NullColumn::create());
+    replace_col1->append_datum({});
+    replace_col1->append_datum((int32_t)5);
+
+    std::vector<uint32_t> replace_idxes = {1, 4};
+    ASSERT_TRUE(column->update_rows(*replace_col1.get(), replace_idxes.data()).ok());
+    ASSERT_EQ(5, column->size());
+    ASSERT_TRUE(column->data_column().unique());
+    ASSERT_TRUE(column->null_column().unique());
+    ASSERT_EQ(5, column->data_column()->size());
+    ASSERT_EQ(5, column->null_column()->size());
+
+    ASSERT_EQ(1, column->get(0).get_int32());
+    ASSERT_TRUE(column->get(1).is_null());
+    ASSERT_TRUE(column->get(2).is_null());
+    ASSERT_EQ(4, column->get(3).get_int32());
+    ASSERT_EQ(5, column->get(4).get_int32());
+
+    auto column1 = NullableColumn::create(BinaryColumn::create(), NullColumn::create());
+    column1->append_datum("abc");
+    column1->append_datum("def");
+    column1->append_datum({});
+    column1->append_datum("ghi");
+    column1->append_datum({});
+
+    auto replace_col2 = NullableColumn::create(BinaryColumn::create(), NullColumn::create());
+    replace_col2->append_datum({});
+    replace_col2->append_datum("jk");
+
+    ASSERT_TRUE(column1->update_rows(*replace_col2.get(), replace_idxes.data()).ok());
+    ASSERT_EQ(5, column1->size());
+    ASSERT_TRUE(column1->data_column().unique());
+    ASSERT_TRUE(column1->null_column().unique());
+    ASSERT_EQ(5, column1->data_column()->size());
+    ASSERT_EQ(5, column1->null_column()->size());
+
+    ASSERT_EQ("abc", column1->get(0).get_slice().to_string());
+    ASSERT_TRUE(column1->get(1).is_null());
+    ASSERT_TRUE(column1->get(2).is_null());
+    ASSERT_EQ("ghi", column1->get(3).get_slice().to_string());
+    ASSERT_EQ("jk", column1->get(4).get_slice().to_string());
+}
+
+PARALLEL_TEST(NullableColumnTest, test_xor_checksum) {
+    auto c0 = NullableColumn::create(Int32Column::create(), NullColumn::create());
+
+    c0->append_datum({}); // NULL
+    for (int i = 0; i <= 1000; i++) {
+        c0->append_datum((int32_t)i);
+    }
+
+    int64_t checksum = c0->xor_checksum(0, 1001);
+    int64_t expected_checksum = 1001;
+
+    ASSERT_EQ(checksum, expected_checksum);
+}
+
+PARALLEL_TEST(NullableColumnTest, test_compare_row) {
+    auto c0 = NullableColumn::create(Int32Column::create(), NullColumn::create());
+    c0->append_datum({});
+    c0->append_datum(1);
+    c0->append_datum(2);
+    c0->append_datum({});
+    c0->append_datum({});
+    c0->append_datum(7);
+    c0->append_datum({});
+    c0->append_datum(8);
+    c0->append_datum({});
+    auto correct = [&](Datum rhs_value, int sort_order, int null_first) {
+        CompareVector res;
+        auto rhs_column = NullableColumn::create(Int32Column::create(), NullColumn::create());
+        rhs_column->append_datum(rhs_value);
+
+        for (size_t i = 0; i < c0->size(); i++) {
+            if (c0->is_null(i) || rhs_value.is_null()) {
+                res.push_back(c0->compare_at(i, 0, *rhs_column, null_first));
+            } else {
+                res.push_back(c0->compare_at(i, 0, *rhs_column, null_first) * sort_order);
+            }
+        }
+        return res;
+    };
+    auto execute = [&](Datum rhs_value, int sort_order, int null_first) {
+        CompareVector cmp_result(c0->size(), 0);
+        compare_column(c0, cmp_result, rhs_value, sort_order, null_first);
+        return cmp_result;
+    };
+
+    std::vector<Datum> rhs_values = {{0}, {1}, {3}, {4}, {7}, {10}, {}};
+    for (Datum datum : rhs_values) {
+        std::string datum_str = datum.is_null() ? "NULL" : std::to_string(datum.get_int32());
+        for (int sort_order : std::vector<int>{1, -1}) {
+            for (int null_first : std::vector<int>{1, -1}) {
+                fmt::print("Column::compare_row rhs={} sort_order={} null_first={}\n", datum_str, sort_order,
+                           null_first);
+                EXPECT_EQ(correct(datum, sort_order, null_first), execute(datum, sort_order, null_first));
+            }
+        }
+    }
 }
 
 } // namespace starrocks::vectorized

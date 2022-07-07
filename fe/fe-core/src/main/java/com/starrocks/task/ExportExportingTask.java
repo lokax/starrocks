@@ -23,7 +23,6 @@ package com.starrocks.task;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.common.MarkedCountDownLatch;
 import com.starrocks.common.Status;
 import com.starrocks.common.UserException;
@@ -38,6 +37,7 @@ import com.starrocks.load.ExportFailMsg;
 import com.starrocks.load.ExportJob;
 import com.starrocks.qe.Coordinator;
 import com.starrocks.qe.QeProcessorImpl;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TStatusCode;
 import com.starrocks.thrift.TUniqueId;
 import org.apache.logging.log4j.LogManager;
@@ -55,10 +55,10 @@ public class ExportExportingTask extends MasterTask {
     protected final ExportJob job;
 
     private RuntimeProfile profile = new RuntimeProfile("Export");
-    private List<RuntimeProfile> fragmentProfiles = Lists.newArrayList();
+    private final List<RuntimeProfile> fragmentProfiles = Lists.newArrayList();
 
     // task index -> dummy value
-    private MarkedCountDownLatch<Integer, Integer> subTasksDoneSignal;
+    private final MarkedCountDownLatch<Integer, Integer> subTasksDoneSignal;
 
     public ExportExportingTask(ExportJob job) {
         this.job = job;
@@ -187,7 +187,8 @@ public class ExportExportingTask extends MasterTask {
 
         summaryProfile.addInfoString(ProfileManager.QUERY_TYPE, "Query");
         summaryProfile.addInfoString(ProfileManager.QUERY_STATE, job.getState().toString());
-        summaryProfile.addInfoString("StarRocks Version", Version.STARROCKS_VERSION);
+        summaryProfile.addInfoString("StarRocks Version",
+                String.format("%s-%s", Version.STARROCKS_VERSION, Version.STARROCKS_COMMIT_HASH));
         summaryProfile.addInfoString(ProfileManager.USER, "xxx");
         summaryProfile.addInfoString(ProfileManager.DEFAULT_DB, String.valueOf(job.getDbId()));
         summaryProfile.addInfoString(ProfileManager.SQL_STATEMENT, job.getSql());
@@ -214,7 +215,7 @@ public class ExportExportingTask extends MasterTask {
             // remove timestamp suffix
             // data_f8d0f324-83b3-11eb-9e09-02425ee98b69_0_0_0.csv
             exportedFile = exportedFile.substring(0, exportedFile.lastIndexOf("."));
-            exportedFile = exportPath + "/" + exportedFile;
+            exportedFile = exportPath + exportedFile;
             boolean success = false;
             String failMsg = null;
 
@@ -260,7 +261,7 @@ public class ExportExportingTask extends MasterTask {
             this.coord = coord;
             this.taskIdx = taskIdx;
             this.coordSize = coordSize;
-            this.signature = Catalog.getCurrentCatalog().getNextId();
+            this.signature = GlobalStateMgr.getCurrentState().getNextId();
         }
 
         public int getTaskIdx() {

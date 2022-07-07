@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_OLAP_OLAP_COMMON_H
-#define STARROCKS_BE_SRC_OLAP_OLAP_COMMON_H
+#pragma once
 
 #include <netinet/in.h>
 
@@ -31,6 +30,7 @@
 #include <ostream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <typeinfo>
 #include <unordered_map>
 #include <unordered_set>
@@ -49,29 +49,44 @@ namespace starrocks {
 static const int64_t MAX_ROWSET_ID = 1L << 56;
 
 typedef int32_t SchemaHash;
-typedef int64_t VersionHash;
 typedef __int128 int128_t;
 typedef unsigned __int128 uint128_t;
 
 typedef UniqueId TabletUid;
 
-enum CompactionType { BASE_COMPACTION = 1, CUMULATIVE_COMPACTION = 2, UPDATE_COMPACTION = 3 };
+enum CompactionType { BASE_COMPACTION = 1, CUMULATIVE_COMPACTION = 2, UPDATE_COMPACTION = 3, INVALID_COMPACTION };
+
+inline std::string to_string(CompactionType type) {
+    switch (type) {
+    case BASE_COMPACTION:
+        return "base";
+    case CUMULATIVE_COMPACTION:
+        return "cumulative";
+    case UPDATE_COMPACTION:
+        return "update";
+    case INVALID_COMPACTION:
+        return "invalid";
+    default:
+        return "unknown";
+    }
+}
 
 struct DataDirInfo {
-    DataDirInfo() : path_hash(0), disk_capacity(1), available(0), data_used_capacity(0), is_used(false) {}
+    DataDirInfo() {}
 
     std::string path;
-    size_t path_hash;
-    int64_t disk_capacity; // actual disk capacity
-    int64_t available;
-    int64_t data_used_capacity;
-    bool is_used;
+    size_t path_hash{0};
+    int64_t disk_capacity{1}; // actual disk capacity
+    int64_t available{0};
+    int64_t data_used_capacity{0};
+    bool is_used{false};
     TStorageMedium::type storage_medium; // storage medium: SSD|HDD
 };
 
 struct TabletInfo {
-    TabletInfo(TTabletId in_tablet_id, TSchemaHash in_schema_hash, UniqueId in_uid)
+    TabletInfo(TTabletId in_tablet_id, TSchemaHash in_schema_hash, const UniqueId& in_uid)
             : tablet_id(in_tablet_id), schema_hash(in_schema_hash), tablet_uid(in_uid) {}
+    TabletInfo(const TabletInfo& other) = default;
 
     bool operator<(const TabletInfo& right) const {
         if (tablet_id != right.tablet_id) {
@@ -99,6 +114,14 @@ enum RangeCondition {
     GE = 1, // greater or equal
     LT = 2, // less than
     LE = 3, // less or equal
+};
+
+enum MaterializeType {
+    OLAP_MATERIALIZE_TYPE_UNKNOWN = 0,
+    OLAP_MATERIALIZE_TYPE_PERCENTILE = 1,
+    OLAP_MATERIALIZE_TYPE_HLL = 2,
+    OLAP_MATERIALIZE_TYPE_BITMAP = 3,
+    OLAP_MATERIALIZE_TYPE_COUNT = 4
 };
 
 enum FieldType {
@@ -141,9 +164,11 @@ enum FieldType {
     OLAP_FIELD_TYPE_DECIMAL_V2 = 52,
     OLAP_FIELD_TYPE_PERCENTILE = 53,
 
+    OLAP_FIELD_TYPE_JSON = 54,
+
     // max value of FieldType, newly-added type should not exceed this value.
     // used to create a fixed-size hash map.
-    OLAP_FIELD_TYPE_MAX_VALUE = 54
+    OLAP_FIELD_TYPE_MAX_VALUE = 55
 };
 
 inline const char* field_type_to_string(FieldType type) {
@@ -212,6 +237,8 @@ inline const char* field_type_to_string(FieldType type) {
         return "DECIMAL V2";
     case OLAP_FIELD_TYPE_PERCENTILE:
         return "PERCENTILE";
+    case OLAP_FIELD_TYPE_JSON:
+        return "JSON";
     case OLAP_FIELD_TYPE_MAX_VALUE:
         return "MAX VALUE";
     }
@@ -329,11 +356,17 @@ inline bool is_compaction(ReaderType reader_type) {
 //using Version = std::pair<TupleVersion, TupleVersion>;
 
 struct Version {
-    int64_t first;
-    int64_t second;
+    int64_t first{0};
+    int64_t second{0};
 
     Version(int64_t first_, int64_t second_) : first(first_), second(second_) {}
-    Version() : first(0), second(0) {}
+    Version() {}
+
+    Version& operator=(const Version& version) {
+        first = version.first;
+        second = version.second;
+        return *this;
+    }
 
     friend std::ostream& operator<<(std::ostream& os, const Version& version);
 
@@ -342,6 +375,8 @@ struct Version {
     bool operator==(const Version& rhs) const { return first == rhs.first && second == rhs.second; }
 
     bool contains(const Version& other) const { return first <= other.first && second >= other.second; }
+
+    bool operator<(const Version& rhs) const { return second < rhs.second; }
 };
 
 typedef std::vector<Version> Versions;
@@ -360,21 +395,13 @@ struct HashOfVersion {
     }
 };
 
-// It is used to represent Graph vertex.
-struct Vertex {
-    int64_t value = 0;
-    std::list<int64_t> edges;
-
-    Vertex(int64_t v) : value(v) {}
-};
-
 class Field;
 class WrapperField;
 using KeyRange = std::pair<WrapperField*, WrapperField*>;
 
 // ReaderStatistics used to collect statistics when scan data from storage
 struct OlapReaderStatistics {
-    int64_t capture_rowset_ns = 0;
+    int64_t create_segment_iter_ns = 0;
     int64_t io_ns = 0;
     int64_t compressed_bytes_read = 0;
 
@@ -400,10 +427,13 @@ struct OlapReaderStatistics {
     int64_t vec_cond_ns = 0;
     int64_t vec_cond_evaluate_ns = 0;
     int64_t vec_cond_chunk_copy_ns = 0;
+    int64_t branchless_cond_evaluate_ns = 0;
+    int64_t expr_cond_evaluate_ns = 0;
 
     int64_t segment_init_ns = 0;
     int64_t segment_create_chunk_ns = 0;
 
+    int64_t segment_stats_filtered = 0;
     int64_t rows_key_range_filtered = 0;
     int64_t rows_stats_filtered = 0;
     int64_t rows_bf_filtered = 0;
@@ -419,6 +449,10 @@ struct OlapReaderStatistics {
     int64_t bitmap_index_filter_timer = 0;
 
     int64_t rows_del_vec_filtered = 0;
+
+    int64_t rowsets_read_count = 0;
+    int64_t segments_read_count = 0;
+    int64_t total_columns_data_page_count = 0;
 };
 
 typedef uint32_t ColumnId;
@@ -436,22 +470,7 @@ struct RowsetId {
     int64_t mi = 0;
     int64_t lo = 0;
 
-    void init(const std::string& rowset_id_str) {
-        // for new rowsetid its a 48 hex string
-        // if the len < 48, then it is an old format rowset id
-        if (rowset_id_str.length() < 48) {
-            int64_t high = std::stol(rowset_id_str, nullptr, 10);
-            init(1, high, 0, 0);
-        } else {
-            int64_t high = 0;
-            int64_t middle = 0;
-            int64_t low = 0;
-            from_hex(&high, rowset_id_str.substr(0, 16));
-            from_hex(&middle, rowset_id_str.substr(16, 16));
-            from_hex(&low, rowset_id_str.substr(32, 16));
-            init(high >> 56, high & LOW_56_BITS, middle, low);
-        }
-    }
+    void init(std::string_view rowset_id_str);
 
     // to compatiable with old version
     void init(int64_t rowset_id) { init(1, rowset_id, 0, 0); }
@@ -522,5 +541,3 @@ struct hash<starrocks::TabletSegmentId> {
     }
 };
 } // namespace std
-
-#endif // STARROCKS_BE_SRC_OLAP_OLAP_COMMON_H

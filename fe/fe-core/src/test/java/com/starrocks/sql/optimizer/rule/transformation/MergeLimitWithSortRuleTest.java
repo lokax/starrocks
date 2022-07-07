@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
@@ -23,7 +23,7 @@ public class MergeLimitWithSortRuleTest {
 
     @Test
     public void transform() {
-        OptExpression limit = new OptExpression(new LogicalLimitOperator(10, 2));
+        OptExpression limit = new OptExpression(LogicalLimitOperator.init(10, 2));
         OptExpression sort = new OptExpression(new LogicalTopNOperator(
                 Lists.newArrayList(new Ordering(new ColumnRefOperator(1, Type.INT, "name", true), false, false))));
 

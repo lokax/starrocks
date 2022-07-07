@@ -82,8 +82,6 @@ public final class AggregateInfo extends AggregateInfoBase {
         }
     }
 
-    ;
-
     // created by createMergeAggInfo()
     private AggregateInfo mergeAggInfo_;
 
@@ -244,7 +242,7 @@ public final class AggregateInfo extends AggregateInfoBase {
         }
 
         ArrayList<Expr> expr0Children = Lists.newArrayList();
-        if (distinctAggExprs.get(0).getFnName().getFunction().equalsIgnoreCase("group_concat")) {
+        if (distinctAggExprs.get(0).getFnName().getFunction().equalsIgnoreCase(FunctionSet.GROUP_CONCAT)) {
             // Ignore separator parameter, otherwise the same would have to be present for all
             // other distinct aggregates as well.
             // TODO: Deal with constant exprs more generally, instead of special-casing
@@ -258,7 +256,7 @@ public final class AggregateInfo extends AggregateInfoBase {
         boolean hasMultiDistinct = false;
         for (int i = 1; i < distinctAggExprs.size(); ++i) {
             ArrayList<Expr> exprIChildren = Lists.newArrayList();
-            if (distinctAggExprs.get(i).getFnName().getFunction().equalsIgnoreCase("group_concat")) {
+            if (distinctAggExprs.get(i).getFnName().getFunction().equalsIgnoreCase(FunctionSet.GROUP_CONCAT)) {
                 exprIChildren.add(distinctAggExprs.get(i).getChild(0).ignoreImplicitCast());
             } else {
                 for (Expr expr : distinctAggExprs.get(i).getChildren()) {
@@ -274,17 +272,15 @@ public final class AggregateInfo extends AggregateInfoBase {
             }
         }
 
-        if (analyzer.getContext().getSessionVariable().useVectorizedEngineEnable()) {
-            // For sql: `select count(distinct k1, k2) from baseall group by k3`,
-            // We need to add k1 and k2 to group by columns
-            if (distinctAggExprs.size() == 1 && distinctAggExprs.get(0).getChildren().size() > 1) {
-                return false;
-            }
-            // If there are group by columns, we don't need to add count distinct column to group by column
-            // TODO(KKS): we could improve if group by column is same with count distinct column
-            if (!groupingExprs.isEmpty()) {
-                return true;
-            }
+        // For sql: `select count(distinct k1, k2) from baseall group by k3`,
+        // We need to add k1 and k2 to group by columns
+        if (distinctAggExprs.size() == 1 && distinctAggExprs.get(0).getChildren().size() > 1) {
+            return false;
+        }
+        // If there are group by columns, we don't need to add count distinct column to group by column
+        // TODO(KKS): we could improve if group by column is same with count distinct column
+        if (!groupingExprs.isEmpty()) {
+            return true;
         }
 
         return hasMultiDistinct;
@@ -325,7 +321,7 @@ public final class AggregateInfo extends AggregateInfoBase {
         // ignore top-level implicit casts in the comparison, we might have inserted
         // those during analysis
         ArrayList<Expr> expr0Children = Lists.newArrayList();
-        if (distinctAggExprs.get(0).getFnName().getFunction().equalsIgnoreCase("group_concat")) {
+        if (distinctAggExprs.get(0).getFnName().getFunction().equalsIgnoreCase(FunctionSet.GROUP_CONCAT)) {
             // Ignore separator parameter, otherwise the same would have to be present for all
             // other distinct aggregates as well.
             // TODO: Deal with constant exprs more generally, instead of special-casing
@@ -362,56 +358,12 @@ public final class AggregateInfo extends AggregateInfoBase {
         return result;
     }
 
-    public AggregateInfo getMergeAggInfo() {
-        return mergeAggInfo_;
-    }
-
     public boolean isMerge() {
         return aggPhase_.isMerge();
     }
 
-    public boolean isDistinctAgg() {
-        return secondPhaseDistinctAggInfo_ != null;
-    }
-
-    public ExprSubstitutionMap getIntermediateSmap() {
-        return intermediateTupleSmap_;
-    }
-
-    public ExprSubstitutionMap getOutputSmap() {
-        return outputTupleSmap_;
-    }
-
-    public ExprSubstitutionMap getOutputToIntermediateSmap() {
-        return outputToIntermediateTupleSmap_;
-    }
-
-    public boolean hasAggregateExprs() {
-        return !aggregateExprs_.isEmpty() ||
-                (secondPhaseDistinctAggInfo_ != null &&
-                        !secondPhaseDistinctAggInfo_.getAggregateExprs().isEmpty());
-    }
-
     public void setIsMultiDistinct(boolean value) {
         this.isMultiDistinct_ = value;
-    }
-
-    public boolean isMultiDistinct() {
-        return isMultiDistinct_;
-    }
-
-    public AggregateInfo getSecondPhaseDistinctAggInfo() {
-        return secondPhaseDistinctAggInfo_;
-    }
-
-    /**
-     * Return the tuple id produced in the final aggregation step.
-     */
-    public TupleId getResultTupleId() {
-        if (isDistinctAgg()) {
-            return secondPhaseDistinctAggInfo_.getOutputTupleId();
-        }
-        return getOutputTupleId();
     }
 
     /**
@@ -591,7 +543,7 @@ public final class AggregateInfo extends AggregateInfoBase {
                     Preconditions.checkNotNull(ifExpr);
                     ifExpr.analyzeNoThrow(analyzer);
                     aggExpr = new FunctionCallExpr(FunctionSet.COUNT, Lists.newArrayList(ifExpr));
-                } else if (inputExpr.getFnName().getFunction().equals("group_concat")) {
+                } else if (inputExpr.getFnName().getFunction().equalsIgnoreCase(FunctionSet.GROUP_CONCAT)) {
                     // Syntax: GROUP_CONCAT([DISTINCT] expression [, separator])
                     ArrayList<Expr> exprList = Lists.newArrayList();
                     // Add "expression" parameter. Need to get it from the inputDesc's slots so the
@@ -661,7 +613,7 @@ public final class AggregateInfo extends AggregateInfoBase {
             numDistinctParams = distinctAggExprs.get(0).getChildren().size();
             // If we are counting distinct params of group_concat, we cannot include the custom
             // separator since it is not a distinct param.
-            if (distinctAggExprs.get(0).getFnName().getFunction().equalsIgnoreCase("group_concat")
+            if (distinctAggExprs.get(0).getFnName().getFunction().equalsIgnoreCase(FunctionSet.GROUP_CONCAT)
                     && numDistinctParams == 2) {
                 --numDistinctParams;
             }
@@ -723,11 +675,6 @@ public final class AggregateInfo extends AggregateInfoBase {
             outputToIntermediateTupleSmap_.put(
                     new SlotRef(outputTupleDesc_.getSlots().get(i)),
                     new SlotRef(intermediateTupleDesc_.getSlots().get(i)));
-            if (i < groupingExprs_.size()) {
-                analyzer.createAuxEquivPredicate(
-                        new SlotRef(outputTupleDesc_.getSlots().get(i)),
-                        new SlotRef(intermediateTupleDesc_.getSlots().get(i)));
-            }
         }
         if (!requiresIntermediateTuple()) {
             intermediateTupleSmap_ = outputTupleSmap_;
@@ -736,123 +683,6 @@ public final class AggregateInfo extends AggregateInfoBase {
         if (LOG.isTraceEnabled()) {
             LOG.trace("output smap=" + outputTupleSmap_.debugString());
             LOG.trace("intermediate smap=" + intermediateTupleSmap_.debugString());
-        }
-    }
-
-    /**
-     * Changing type of slot ref which is the same as the type of slot desc.
-     * Putting this logic in here is helpless.
-     * If StarRocks could analyze mv column in the future, please move this logic before reanalyze.
-     * <p>
-     * - The parameters of the sum function may involve the columns of a materialized view.
-     * - The type of this column may happen to be inconsistent with the column type of the base table.
-     * - In order to ensure the correctness of the result,
-     * the parameter type needs to be changed to the type of the materialized view column
-     * to ensure the correctness of the result.
-     * - Currently only the sum function will involve this problem.
-     */
-    public void updateTypeOfAggregateExprs() {
-        for (FunctionCallExpr functionCallExpr : aggregateExprs_) {
-            if (!functionCallExpr.getFnName().getFunction().equalsIgnoreCase("sum")) {
-                continue;
-            }
-            List<SlotRef> slots = new ArrayList<>();
-            functionCallExpr.collect(SlotRef.class, slots);
-            if (slots.size() != 1) {
-                continue;
-            }
-            SlotRef slotRef = slots.get(0);
-            if (slotRef.getDesc() == null) {
-                continue;
-            }
-            // Sum function only support numeric type
-            if (!slotRef.getType().isNumericType()) {
-                continue;
-            }
-            if (!slotRef.getType().equals(slotRef.getDesc().getType())) {
-                slotRef.setType(slotRef.getDesc().getType());
-            }
-        }
-    }
-
-    /**
-     * Mark slots required for this aggregation as materialized:
-     * - all grouping output slots as well as grouping exprs
-     * - for non-distinct aggregation: the aggregate exprs of materialized aggregate slots;
-     * this assumes that the output slots corresponding to aggregate exprs have already
-     * been marked by the consumer of this select block
-     * - for distinct aggregation, we mark all aggregate output slots in order to keep
-     * things simple
-     * Also computes materializedAggregateExprs.
-     * This call must be idempotent because it may be called more than once for Union stmt.
-     */
-    @Override
-    public void materializeRequiredSlots(Analyzer analyzer, ExprSubstitutionMap smap) {
-        for (int i = 0; i < groupingExprs_.size(); ++i) {
-            outputTupleDesc_.getSlots().get(i).setIsMaterialized(true);
-            intermediateTupleDesc_.getSlots().get(i).setIsMaterialized(true);
-        }
-
-        // collect input exprs: grouping exprs plus aggregate exprs that need to be
-        // materialized
-        materializedAggSlots.clear();
-        List<Expr> exprs = Lists.newArrayList();
-        exprs.addAll(groupingExprs_);
-
-        boolean hasCountStar = false;
-        int aggregateExprsSize = aggregateExprs_.size();
-        int groupExprsSize = groupingExprs_.size();
-        boolean isDistinctAgg = isDistinctAgg();
-        for (int i = 0; i < aggregateExprsSize; ++i) {
-            FunctionCallExpr functionCallExpr = aggregateExprs_.get(i);
-            SlotDescriptor slotDesc =
-                    outputTupleDesc_.getSlots().get(groupExprsSize + i);
-            SlotDescriptor intermediateSlotDesc =
-                    intermediateTupleDesc_.getSlots().get(groupExprsSize + i);
-            if (isDistinctAgg || isMultiDistinct_) {
-                slotDesc.setIsMaterialized(true);
-                intermediateSlotDesc.setIsMaterialized(true);
-            }
-
-            if (functionCallExpr.isCountStar()) {
-                hasCountStar = true;
-            }
-
-            if (!slotDesc.isMaterialized()) {
-                continue;
-            }
-
-            intermediateSlotDesc.setIsMaterialized(true);
-            exprs.add(functionCallExpr);
-            materializedAggSlots.add(i);
-        }
-
-        // For SQL: select join_data from ( select
-        //        1 as join_data,
-        //        count(1) from table) a;
-        // The group by expr and aggregate expr both are empty.
-        // We should at least pass one aggregate expr to BE
-        if (materializedAggSlots.isEmpty() && groupExprsSize == 0) {
-            Preconditions.checkState(aggregateExprsSize > 0);
-            outputTupleDesc_.getSlots().get(0).setIsMaterialized(true);
-            intermediateTupleDesc_.getSlots().get(0).setIsMaterialized(true);
-            materializedAggSlots.add(0);
-            exprs.add(aggregateExprs_.get(0));
-        }
-
-        List<Expr> resolvedExprs = Expr.substituteList(exprs, smap, analyzer, false);
-
-        // In order to meet the requirements materialize slots In the top-down phase 
-        // over query statements, if aggregate functions contain count(*), now 
-        // materialize all slots this SelectStmt maps.
-        // chenhao added.
-        if (hasCountStar && smap != null && smap.size() > 0) {
-            resolvedExprs.addAll(smap.getRhs());
-        }
-        analyzer.materializeSlots(resolvedExprs);
-
-        if (isDistinctAgg()) {
-            secondPhaseDistinctAggInfo_.materializeRequiredSlots(analyzer, null);
         }
     }
 

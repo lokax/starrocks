@@ -25,18 +25,26 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.analysis.PartitionKeyDesc;
 import com.starrocks.analysis.SingleRangePartitionDesc;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.FeConstants;
 import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.util.RangeUtils;
+import com.starrocks.server.GlobalStateMgr;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.DataInput;
+import java.io.DataInputStream;
 import java.io.DataOutput;
+import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -46,11 +54,24 @@ import java.util.Set;
 public class RangePartitionInfo extends PartitionInfo {
     private static final Logger LOG = LogManager.getLogger(RangePartitionInfo.class);
 
+    @SerializedName(value = "partitionColumns")
     private List<Column> partitionColumns = Lists.newArrayList();
     // formal partition id -> partition range
     private Map<Long, Range<PartitionKey>> idToRange = Maps.newHashMap();
     // temp partition id -> partition range
     private Map<Long, Range<PartitionKey>> idToTempRange = Maps.newHashMap();
+
+    // partitionId -> serialized Range<PartitionKey>
+    // because Range<PartitionKey> and PartitionKey can not be serialized by gson
+    // ATTN: call preSerialize before serialization and postDeserialized after deserialization
+    @SerializedName(value = "serializedIdToRange")
+    private Map<Long, byte[]> serializedIdToRange;
+
+    // partitionId -> serialized Range<PartitionKey>
+    // because Range<PartitionKey> and PartitionKey can not be serialized by gson
+    // ATTN: call preSerialize before serialization and postDeserialized after deserialization
+    @SerializedName(value = "serializedIdToTempRange")
+    private Map<Long, byte[]> serializedIdToTempRange;
 
     public RangePartitionInfo() {
         // for persist
@@ -63,6 +84,7 @@ public class RangePartitionInfo extends PartitionInfo {
         this.isMultiColumnPartition = partitionColumns.size() > 1;
     }
 
+    @Override
     public List<Column> getPartitionColumns() {
         return partitionColumns;
     }
@@ -316,6 +338,53 @@ public class RangePartitionInfo extends PartitionInfo {
         return partitionInfo;
     }
 
+    byte[] serializeRange(Range<PartitionKey> range) throws IOException {
+        ByteArrayOutputStream stream = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(stream);
+        RangeUtils.writeRange(dos, range);
+        return stream.toByteArray();
+    }
+
+    Range<PartitionKey> deserializeRange(byte[] serializedRange) throws IOException {
+        InputStream inputStream = new ByteArrayInputStream(serializedRange);
+        DataInput dataInput = new DataInputStream(inputStream);
+        Range<PartitionKey> range = RangeUtils.readRange(dataInput);
+        return range;
+    }
+
+    @Override
+    public void gsonPreProcess() throws IOException {
+        serializedIdToRange = Maps.newHashMap();
+        for (Map.Entry<Long, Range<PartitionKey>> entry : idToRange.entrySet()) {
+            byte[] serializedRange = serializeRange(entry.getValue());
+            serializedIdToRange.put(entry.getKey(), serializedRange);
+        }
+
+        serializedIdToTempRange = Maps.newHashMap();
+        for (Map.Entry<Long, Range<PartitionKey>> entry : idToTempRange.entrySet()) {
+            byte[] serializedRange = serializeRange(entry.getValue());
+            serializedIdToTempRange.put(entry.getKey(), serializedRange);
+        }
+    }
+
+    @Override
+    public void gsonPostProcess() throws IOException {
+        idToRange = Maps.newHashMap();
+        if (serializedIdToRange != null && !serializedIdToRange.isEmpty()) {
+            for (Map.Entry<Long, byte[]> entry : serializedIdToRange.entrySet()) {
+                idToRange.put(entry.getKey(), deserializeRange(entry.getValue()));
+            }
+            serializedIdToRange = null;
+        }
+        idToTempRange = Maps.newHashMap();
+        if (serializedIdToTempRange != null && !serializedIdToTempRange.isEmpty()) {
+            for (Map.Entry<Long, byte[]> entry : serializedIdToTempRange.entrySet()) {
+                idToTempRange.put(entry.getKey(), deserializeRange(entry.getValue()));
+            }
+            serializedIdToTempRange = null;
+        }
+    }
+
     @Override
     public void write(DataOutput out) throws IOException {
         super.write(out);
@@ -357,7 +426,7 @@ public class RangePartitionInfo extends PartitionInfo {
             idToRange.put(partitionId, range);
         }
 
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_77) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_77) {
             counter = in.readInt();
             for (int i = 0; i < counter; i++) {
                 long partitionId = in.readLong();
@@ -387,6 +456,16 @@ public class RangePartitionInfo extends PartitionInfo {
         Collections.sort(entries, RangeUtils.RANGE_MAP_ENTRY_COMPARATOR);
 
         idx = 0;
+        PartitionInfo tblPartitionInfo = table.getPartitionInfo();
+
+        String replicationNumStr = table.getTableProperty().getProperties().get("replication_num");
+        short replicationNum;
+        if (replicationNumStr == null) {
+            replicationNum = FeConstants.default_replication_num;
+        } else {
+            replicationNum = Short.parseShort(replicationNumStr);
+        }
+
         for (Map.Entry<Long, Range<PartitionKey>> entry : entries) {
             Partition partition = table.getPartition(entry.getKey());
             String partitionName = partition.getName();
@@ -401,7 +480,10 @@ public class RangePartitionInfo extends PartitionInfo {
                 partitionId.add(entry.getKey());
                 break;
             }
-
+            short curPartitionReplicationNum = tblPartitionInfo.getReplicationNum(entry.getKey());
+            if (curPartitionReplicationNum != replicationNum) {
+                sb.append("(").append("\"replication_num\" = \"").append(curPartitionReplicationNum).append("\")");
+            }
             if (idx != entries.size() - 1) {
                 sb.append(",\n");
             }

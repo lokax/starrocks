@@ -45,15 +45,12 @@ public enum AggregateType {
         compatibilityMap = new EnumMap<>(AggregateType.class);
         List<PrimitiveType> primitiveTypeList = Lists.newArrayList();
 
-        primitiveTypeList.add(PrimitiveType.TINYINT);
-        primitiveTypeList.add(PrimitiveType.SMALLINT);
         primitiveTypeList.add(PrimitiveType.INT);
         primitiveTypeList.add(PrimitiveType.BIGINT);
         primitiveTypeList.add(PrimitiveType.LARGEINT);
         primitiveTypeList.add(PrimitiveType.FLOAT);
         primitiveTypeList.add(PrimitiveType.DOUBLE);
         primitiveTypeList.add(PrimitiveType.DECIMALV2);
-        primitiveTypeList.add(PrimitiveType.DECIMAL32);
         primitiveTypeList.add(PrimitiveType.DECIMAL64);
         primitiveTypeList.add(PrimitiveType.DECIMAL128);
         compatibilityMap.put(SUM, EnumSet.copyOf(primitiveTypeList));
@@ -95,13 +92,17 @@ public enum AggregateType {
         compatibilityMap.put(MAX, EnumSet.copyOf(primitiveTypeList));
 
         primitiveTypeList.clear();
+
+        EnumSet<PrimitiveType> replaceObject = EnumSet.allOf(PrimitiveType.class);
+        replaceObject.remove(PrimitiveType.INVALID_TYPE);
+        compatibilityMap.put(REPLACE, EnumSet.copyOf(replaceObject));
+
         // all types except bitmap, hll, percentile and complex types.
         EnumSet<PrimitiveType> excObject = EnumSet.allOf(PrimitiveType.class);
         excObject.remove(PrimitiveType.BITMAP);
         excObject.remove(PrimitiveType.HLL);
         excObject.remove(PrimitiveType.PERCENTILE);
         excObject.remove(PrimitiveType.INVALID_TYPE);
-        compatibilityMap.put(REPLACE, EnumSet.copyOf(excObject));
 
         compatibilityMap.put(REPLACE_IF_NOT_NULL, EnumSet.copyOf(excObject));
 
@@ -126,7 +127,7 @@ public enum AggregateType {
         this.sqlName = sqlName;
     }
 
-    public static boolean checkCompatibility(AggregateType aggType, PrimitiveType priType) {
+    public static boolean checkPrimitiveTypeCompatibility(AggregateType aggType, PrimitiveType priType) {
         return compatibilityMap.get(aggType).contains(priType);
     }
 
@@ -139,8 +140,16 @@ public enum AggregateType {
         return toSql();
     }
 
-    public boolean checkCompatibility(PrimitiveType priType) {
-        return checkCompatibility(this, priType);
+    public boolean checkCompatibility(Type type) {
+        return checkPrimitiveTypeCompatibility(this, type.getPrimitiveType()) ||
+                (this.isReplaceFamily() && type.isArrayType());
+    }
+
+    public static Type extendedPrecision(Type type) {
+        if (type.isDecimalV3()) {
+            return ScalarType.createDecimalV3Type(PrimitiveType.DECIMAL128, 38, ((ScalarType) type).getScalarScale());
+        }
+        return type;
     }
 
     public boolean isReplaceFamily() {

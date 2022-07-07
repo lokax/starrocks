@@ -20,8 +20,7 @@
  * limitations under the License.
  */
 
-#ifndef ORC_FILE_HH
-#define ORC_FILE_HH
+#pragma once
 
 #include <string>
 
@@ -40,6 +39,12 @@ namespace orc {
    */
 class InputStream {
 public:
+    enum class PrepareCacheScope {
+        READ_FULL_FILE,
+        READ_FULL_STRIPE,
+        READ_ROW_GROUP_INDEX,
+    };
+
     virtual ~InputStream();
 
     /**
@@ -54,6 +59,12 @@ public:
     virtual uint64_t getNaturalReadSize() const = 0;
 
     /**
+     * Get the natural size for reads afrer seek.
+     * @return the number of bytes that should be read at once
+     */
+    virtual uint64_t getNaturalReadSizeAfterSeek() const;
+
+    /**
      * Read length bytes from the file starting at offset into
      * the buffer starting at buf.
      * @param buf the starting position of a buffer.
@@ -66,6 +77,8 @@ public:
      * Get the name of the stream for error messages.
      */
     virtual const std::string& getName() const = 0;
+
+    virtual void prepareCache(PrepareCacheScope scope, uint64_t offset, uint64_t length);
 };
 
 /**
@@ -142,5 +155,3 @@ ORC_UNIQUE_PTR<OutputStream> writeLocalFile(const std::string& path);
    */
 ORC_UNIQUE_PTR<Writer> createWriter(const Type& type, OutputStream* stream, const WriterOptions& options);
 } // namespace orc
-
-#endif

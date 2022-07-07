@@ -1,7 +1,9 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.operator.scalar;
 
+import com.google.common.collect.Lists;
 import com.starrocks.catalog.Type;
+import com.starrocks.sql.optimizer.base.ColumnRefSet;
 
 import java.util.List;
 import java.util.Objects;
@@ -15,13 +17,11 @@ import static com.starrocks.sql.optimizer.operator.OperatorType.ARRAY;
  * eg. array[1,2,3]
  */
 public class ArrayOperator extends ScalarOperator {
-    private final Type type;
     private final boolean nullable;
-    private final List<ScalarOperator> arguments;
+    protected List<ScalarOperator> arguments;
 
     public ArrayOperator(Type type, boolean nullable, List<ScalarOperator> arguments) {
         super(ARRAY, type);
-        this.type = type;
         this.nullable = nullable;
         this.arguments = arguments;
     }
@@ -49,6 +49,23 @@ public class ArrayOperator extends ScalarOperator {
     @Override
     public String toString() {
         return arguments.stream().map(ScalarOperator::toString).collect(Collectors.joining(","));
+    }
+
+    @Override
+    public ColumnRefSet getUsedColumns() {
+        ColumnRefSet usedColumns = new ColumnRefSet();
+        arguments.forEach(arg -> usedColumns.union(arg.getUsedColumns()));
+        return usedColumns;
+    }
+
+    @Override
+    public ScalarOperator clone() {
+        ArrayOperator operator = (ArrayOperator) super.clone();
+        // Deep copy here
+        List<ScalarOperator> newArguments = Lists.newArrayList();
+        this.arguments.forEach(p -> newArguments.add(p.clone()));
+        operator.arguments = newArguments;
+        return operator;
     }
 
     @Override

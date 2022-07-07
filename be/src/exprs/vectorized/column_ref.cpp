@@ -1,14 +1,18 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/column_ref.h"
 
-namespace starrocks {
-namespace vectorized {
+#include "column/chunk.h"
+#include "exprs/expr.h"
+
+namespace starrocks::vectorized {
 
 ColumnRef::ColumnRef(const TExprNode& node)
         : Expr(node, true), _column_id(node.slot_ref.slot_id), _tuple_id(node.slot_ref.tuple_id) {}
 
 ColumnRef::ColumnRef(const SlotDescriptor* desc) : Expr(desc->type(), true), _column_id(desc->id()) {}
+
+ColumnRef::ColumnRef(const TypeDescriptor& type, SlotId slot) : Expr(type, true), _column_id(slot) {}
 
 int ColumnRef::get_slot_ids(std::vector<SlotId>* slot_ids) const {
     slot_ids->push_back(_column_id);
@@ -16,8 +20,8 @@ int ColumnRef::get_slot_ids(std::vector<SlotId>* slot_ids) const {
 }
 
 bool ColumnRef::is_bound(const std::vector<TupleId>& tuple_ids) const {
-    for (int i = 0; i < tuple_ids.size(); i++) {
-        if (_tuple_id == tuple_ids[i]) {
+    for (int tuple_id : tuple_ids) {
+        if (_tuple_id == tuple_id) {
             return true;
         }
     }
@@ -35,5 +39,10 @@ ColumnPtr ColumnRef::evaluate(ExprContext* context, Chunk* ptr) {
     return get_column(this, ptr);
 }
 
-} // namespace vectorized
-} // namespace starrocks
+vectorized::ColumnPtr& ColumnRef::get_column(Expr* expr, vectorized::Chunk* chunk) {
+    ColumnRef* ref = (ColumnRef*)expr;
+    ColumnPtr& column = (chunk)->get_column_by_slot_id(ref->slot_id());
+    return column;
+}
+
+} // namespace starrocks::vectorized

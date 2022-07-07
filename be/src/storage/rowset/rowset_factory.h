@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_OLAP_ROWSET_FACTORY_H
-#define STARROCKS_BE_SRC_OLAP_ROWSET_FACTORY_H
+#pragma once
 
 #include "gen_cpp/olap_file.pb.h"
 #include "storage/data_dir.h"
@@ -33,17 +32,15 @@ class RowsetWriterContext;
 
 class RowsetFactory {
 public:
-    // return OLAP_SUCCESS and set inited rowset in `*rowset`.
-    // return others if failed to create or init rowset.
-    static OLAPStatus create_rowset(MemTracker* mem_tracker, const TabletSchema* schema, const std::string& rowset_path,
-                                    RowsetMetaSharedPtr rowset_meta, RowsetSharedPtr* rowset);
+    // return OK on success and set inited rowset in `*rowset`.
+    // return error if failed to create or init rowset.
+    static Status create_rowset(const TabletSchema* schema, const std::string& rowset_path,
+                                const RowsetMetaSharedPtr& rowset_meta, RowsetSharedPtr* rowset);
 
     // create and init rowset writer.
-    // return OLAP_SUCCESS and set `*output` to inited rowset writer.
-    // return others if failed
-    static OLAPStatus create_rowset_writer(const RowsetWriterContext& context, std::unique_ptr<RowsetWriter>* output);
+    // return OK on success and set `*output` to inited rowset writer.
+    // return error if failed
+    static Status create_rowset_writer(const RowsetWriterContext& context, std::unique_ptr<RowsetWriter>* output);
 };
 
 } // namespace starrocks
-
-#endif // STARROCKS_BE_SRC_OLAP_ROWSET_FACTORY_H

@@ -31,6 +31,8 @@ include "Planner.thrift"
 include "DataSinks.thrift"
 include "Data.thrift"
 include "RuntimeProfile.thrift"
+include "WorkGroup.thrift"
+include "RuntimeFilter.thrift"
 
 // constants for TQueryOptions.num_nodes
 const i32 NUM_NODES_ALL = 0
@@ -78,6 +80,12 @@ struct TLoadErrorHubInfo {
     1: required TErrorHubType type = TErrorHubType.NULL_TYPE;
     2: optional TMysqlErrorHubInfo mysql_info;
     3: optional TBrokerErrorHubInfo broker_info;
+}
+
+enum TPipelineProfileLevel {
+  CORE_METRICS,
+  ALL_METRICS,
+  DETAIL
 }
 
 // Query options with their respective defaults
@@ -149,11 +157,18 @@ struct TQueryOptions {
   // Timeout in ms to send runtime filter across nodes.
   53: optional i32 runtime_filter_send_timeout_ms = 400;
   // For pipeline query engine
-  54: optional i32 query_threads;
+  54: optional i32 pipeline_dop;
   // For pipeline query engine
-  55: optional i32 pipeline_scan_mode;
-  // For query context expired period
-  56: optional i32 pipeline_query_expire_seconds
+  55: optional TPipelineProfileLevel pipeline_profile_level;
+  // For load degree of parallel
+  56: optional i32 load_dop;
+  57: optional i64 runtime_filter_scan_wait_time_ms;
+
+  58: optional i64 query_mem_limit;
+
+  59: optional bool enable_tablet_internal_parallel;
+
+  60: optional i32 query_delivery_timeout;
 }
 
 
@@ -161,32 +176,6 @@ struct TQueryOptions {
 struct TScanRangeParams {
   1: required PlanNodes.TScanRange scan_range
   2: optional i32 volume_id = -1
-}
-
-struct TRuntimeFilterProberParams {
-  1: optional Types.TUniqueId fragment_instance_id
-  2: optional Types.TNetworkAddress fragment_instance_address
-}
-
-struct TRuntimeFilterParams {
-  // Runtime filter Id to the fragment instances where that runtime filter will be applied on
-  2: optional map<i32, list<TRuntimeFilterProberParams>> id_to_prober_params
-  // Runtime filter Id to (number of partitioned runtime filters)
-  // To merge a global runtime filter, merge node has to merge
-  // all partitioned runtime filters for the sake of correctness.
-  3: optional map<i32, i32> runtime_filter_builder_number
-  // if aggregated runtime filter size exceeds it, merge node can stop merging.
-  4: optional i64 runtime_filter_max_size;
-}
-
-// Specification of one output destination of a plan fragment
-struct TPlanFragmentDestination {
-  // the globally unique fragment instance id
-  1: required Types.TUniqueId fragment_instance_id
-
-  // ... which is being executed on this server
-  2: required Types.TNetworkAddress server
-  3: optional Types.TNetworkAddress brpc_server
 }
 
 // Parameters for a single execution instance of a particular TPlanFragment
@@ -210,7 +199,7 @@ struct TPlanFragmentExecParams {
   // The partitioning of the output is specified by
   // TPlanFragment.output_sink.output_partition.
   // The number of output partitions is destinations.size().
-  5: list<TPlanFragmentDestination> destinations
+  5: list<DataSinks.TPlanFragmentDestination> destinations
 
   // Debug options: perform some action in a particular phase of a particular node
   6: optional Types.TPlanNodeId debug_node_id
@@ -224,8 +213,12 @@ struct TPlanFragmentExecParams {
   12: optional bool use_vectorized // whether to use vectorized query engine
 
   // Global runtime filters
-  50: optional TRuntimeFilterParams runtime_filter_params
+  50: optional RuntimeFilter.TRuntimeFilterParams runtime_filter_params
   51: optional i32 instances_number
+  // To enable pass through chunks between sink/exchange if they are in the same process.
+  52: optional bool enable_exchange_pass_through
+
+  53: optional map<Types.TPlanNodeId, map<i32, list<TScanRangeParams>>> node_to_per_driver_seq_scan_ranges
 }
 
 // Global query parameters assigned by the coordinator.
@@ -299,6 +292,15 @@ struct TExecPlanFragmentParams {
   14: optional TLoadErrorHubInfo load_error_hub_info
 
   50: optional bool is_pipeline
+  51: optional i32 pipeline_dop
+  52: optional map<Types.TPlanNodeId, i32> per_scan_node_dop
+
+  53: optional WorkGroup.TWorkGroup workgroup
+  54: optional bool enable_resource_group
+  55: optional i32 func_version
+  
+  // Sharing data between drivers of same scan operator
+  56: optional bool enable_shared_scan
 }
 
 struct TExecPlanFragmentResult {
@@ -444,3 +446,4 @@ struct TExportStatusResult {
     2: required Types.TExportState state
     3: optional list<string> files
 }
+

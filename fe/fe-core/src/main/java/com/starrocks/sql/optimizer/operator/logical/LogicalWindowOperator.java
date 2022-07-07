@@ -1,6 +1,8 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.operator.logical;
 
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.starrocks.analysis.AnalyticWindow;
 import com.starrocks.sql.optimizer.ExpressionContext;
 import com.starrocks.sql.optimizer.OptExpression;
@@ -19,19 +21,23 @@ import java.util.Map;
 import java.util.Objects;
 
 public class LogicalWindowOperator extends LogicalOperator {
-    private final Map<ColumnRefOperator, CallOperator> windowCall;
-    private final List<ScalarOperator> partitionExpressions;
-    private final List<Ordering> orderByElements;
+    private final ImmutableMap<ColumnRefOperator, CallOperator> windowCall;
+    private final ImmutableList<ScalarOperator> partitionExpressions;
+    private final ImmutableList<Ordering> orderByElements;
     private final AnalyticWindow analyticWindow;
+    /**
+     * Each LogicalWindowOperator will belong to a SortGroup,
+     * so we need to record sortProperty to ensure that only one SortNode is enforced
+     */
+    private final ImmutableList<Ordering> enforceSortColumns;
 
-    public LogicalWindowOperator(Map<ColumnRefOperator, CallOperator> windowCall,
-                                 List<ScalarOperator> partitionExpressions,
-                                 List<Ordering> orderByElements, AnalyticWindow analyticWindow) {
-        super(OperatorType.LOGICAL_WINDOW);
-        this.windowCall = windowCall;
-        this.partitionExpressions = partitionExpressions;
-        this.orderByElements = orderByElements;
-        this.analyticWindow = analyticWindow;
+    private LogicalWindowOperator(Builder builder) {
+        super(OperatorType.LOGICAL_WINDOW, builder.getLimit(), builder.getPredicate(), builder.getProjection());
+        this.windowCall = ImmutableMap.copyOf(builder.windowCall);
+        this.partitionExpressions = ImmutableList.copyOf(builder.partitionExpressions);
+        this.orderByElements = ImmutableList.copyOf(builder.orderByElements);
+        this.analyticWindow = builder.analyticWindow;
+        this.enforceSortColumns = ImmutableList.copyOf(builder.enforceSortColumns);
     }
 
     public Map<ColumnRefOperator, CallOperator> getWindowCall() {
@@ -50,12 +56,20 @@ public class LogicalWindowOperator extends LogicalOperator {
         return analyticWindow;
     }
 
+    public List<Ordering> getEnforceSortColumns() {
+        return enforceSortColumns;
+    }
+
     @Override
     public ColumnRefSet getOutputColumns(ExpressionContext expressionContext) {
-        ColumnRefSet columns = new ColumnRefSet();
-        columns.union(new ArrayList<>(windowCall.keySet()));
-        columns.union(expressionContext.getChildLogicalProperty(0).getOutputColumns());
-        return columns;
+        if (projection != null) {
+            return new ColumnRefSet(new ArrayList<>(projection.getColumnRefMap().keySet()));
+        } else {
+            ColumnRefSet columns = new ColumnRefSet();
+            columns.union(new ArrayList<>(windowCall.keySet()));
+            columns.union(expressionContext.getChildLogicalProperty(0).getOutputColumns());
+            return columns;
+        }
     }
 
     @Override
@@ -89,5 +103,56 @@ public class LogicalWindowOperator extends LogicalOperator {
     @Override
     public int hashCode() {
         return Objects.hash(super.hashCode(), windowCall, partitionExpressions, orderByElements, analyticWindow);
+    }
+
+    public static class Builder extends LogicalOperator.Builder<LogicalWindowOperator, LogicalWindowOperator.Builder> {
+        private Map<ColumnRefOperator, CallOperator> windowCall;
+        private List<ScalarOperator> partitionExpressions;
+        private List<Ordering> orderByElements;
+        private AnalyticWindow analyticWindow;
+        private List<Ordering> enforceSortColumns;
+
+        @Override
+        public LogicalWindowOperator build() {
+            return new LogicalWindowOperator(this);
+        }
+
+        @Override
+        public LogicalWindowOperator.Builder withOperator(LogicalWindowOperator windowOperator) {
+            super.withOperator(windowOperator);
+
+            this.windowCall = windowOperator.windowCall;
+            this.partitionExpressions = windowOperator.partitionExpressions;
+            this.orderByElements = windowOperator.orderByElements;
+            this.analyticWindow = windowOperator.analyticWindow;
+            this.enforceSortColumns = windowOperator.enforceSortColumns;
+            return this;
+        }
+
+        public Builder setWindowCall(Map<ColumnRefOperator, CallOperator> windowCall) {
+            this.windowCall = windowCall;
+            return this;
+        }
+
+        public Builder setPartitionExpressions(
+                List<ScalarOperator> partitionExpressions) {
+            this.partitionExpressions = partitionExpressions;
+            return this;
+        }
+
+        public Builder setOrderByElements(List<Ordering> orderByElements) {
+            this.orderByElements = orderByElements;
+            return this;
+        }
+
+        public Builder setAnalyticWindow(AnalyticWindow analyticWindow) {
+            this.analyticWindow = analyticWindow;
+            return this;
+        }
+
+        public Builder setEnforceSortColumns(List<Ordering> enforceSortColumns) {
+            this.enforceSortColumns = enforceSortColumns;
+            return this;
+        }
     }
 }

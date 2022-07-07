@@ -37,9 +37,10 @@ import java.nio.channels.SocketChannel;
 public class MysqlChannel {
     // max length which one MySQL physical can hold, if one logical packet is bigger than this,
     // one packet will split to many packets
-    protected static final int MAX_PHYSICAL_PACKET_LENGTH = 0xffffff - 1;
+    protected static final int MAX_PHYSICAL_PACKET_LENGTH = 0xffffff;
     // MySQL packet header length
     protected static final int PACKET_HEADER_LEN = 4;
+    protected static final int DEFAULT_BUFFER_SIZE = 16 * 1024;
     // logger for this class
     protected static final Logger LOG = LogManager.getLogger(MysqlChannel.class);
     // next sequence id to receive or send
@@ -49,7 +50,7 @@ public class MysqlChannel {
     // used to receive/send header, avoiding new this many time.
     protected ByteBuffer headerByteBuffer = ByteBuffer.allocate(PACKET_HEADER_LEN);
     // default packet byte buffer for most packet
-    protected ByteBuffer defaultBuffer = ByteBuffer.allocate(16 * 1024);
+    protected ByteBuffer defaultBuffer = ByteBuffer.allocate(DEFAULT_BUFFER_SIZE);
     protected ByteBuffer sendBuffer;
     // for log and show
     protected String remoteHostPortString;
@@ -58,7 +59,6 @@ public class MysqlChannel {
 
     protected MysqlChannel() {
         this.sequenceId = 0;
-        this.sendBuffer = ByteBuffer.allocate(2 * 1024 * 1024);
         this.isSend = false;
         this.remoteHostPortString = "";
         this.remoteIp = "";
@@ -67,7 +67,6 @@ public class MysqlChannel {
     public MysqlChannel(SocketChannel channel) {
         this.sequenceId = 0;
         this.channel = channel;
-        this.sendBuffer = ByteBuffer.allocate(2 * 1024 * 1024);
         this.isSend = false;
         this.remoteHostPortString = "";
         this.remoteIp = "";
@@ -206,16 +205,31 @@ public class MysqlChannel {
             // Nothing to send
             return;
         }
+
         sendBuffer.flip();
-        realNetSend(sendBuffer);
-        sendBuffer.clear();
+        try {
+            realNetSend(sendBuffer);
+        } finally {
+            sendBuffer.clear();
+        }
+
         isSend = true;
     }
 
-    private void writeHeader(int length) throws IOException {
-        if (null == sendBuffer) {
-            return;
+    public void initBuffer(int bufferSize) {
+        if (this.sendBuffer == null) {
+            // The buffer size shouldn't too large or shouldn't too small
+            bufferSize = Math.min(bufferSize, 2 * 1024 * 1024);
+            bufferSize = Math.max(bufferSize, 256 * 1024);
+            this.sendBuffer = ByteBuffer.allocate(bufferSize);
         }
+    }
+
+    public boolean isSendBufferNull() {
+        return this.sendBuffer == null;
+    }
+
+    private void writeHeader(int length) throws IOException {
         long leftLength = sendBuffer.capacity() - sendBuffer.position();
         if (leftLength < 4) {
             flush();
@@ -230,17 +244,13 @@ public class MysqlChannel {
     }
 
     private void writeBuffer(ByteBuffer buffer) throws IOException {
-        if (null == sendBuffer) {
-            return;
-        }
-        long leftLength = sendBuffer.capacity() - sendBuffer.position();
         // If too long for buffer, send buffered data.
-        if (leftLength < buffer.remaining()) {
+        if (sendBuffer.remaining() < buffer.remaining()) {
             // Flush data in buffer.
             flush();
         }
         // Send this buffer if large enough
-        if (buffer.remaining() > sendBuffer.capacity()) {
+        if (buffer.remaining() > sendBuffer.remaining()) {
             realNetSend(buffer);
             return;
         }
@@ -249,6 +259,7 @@ public class MysqlChannel {
     }
 
     public void sendOnePacket(ByteBuffer packet) throws IOException {
+        initBuffer(DEFAULT_BUFFER_SIZE);
         int bufLen;
         int oldLimit = packet.limit();
         while (oldLimit - packet.position() >= MAX_PHYSICAL_PACKET_LENGTH) {

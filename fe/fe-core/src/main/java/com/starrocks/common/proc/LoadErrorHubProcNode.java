@@ -22,28 +22,24 @@
 package com.starrocks.common.proc;
 
 import com.google.common.collect.ImmutableList;
-import com.starrocks.catalog.Catalog;
-import com.starrocks.load.LoadErrorHub;
+import com.starrocks.server.GlobalStateMgr;
 
+@Deprecated
 public class LoadErrorHubProcNode implements ProcNodeInterface {
     public static final ImmutableList<String> TITLE_NAMES = new ImmutableList.Builder<String>()
             .add("Type").add("Properties")
             .build();
 
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
 
-    public LoadErrorHubProcNode(Catalog catalog) {
-        this.catalog = catalog;
+    public LoadErrorHubProcNode(GlobalStateMgr globalStateMgr) {
+        this.globalStateMgr = globalStateMgr;
     }
 
     @Override
     public ProcResult fetchResult() {
         BaseProcResult result = new BaseProcResult();
         result.setNames(TITLE_NAMES);
-        LoadErrorHub.Param param = catalog.getLoadInstance().getLoadErrorHubInfo();
-        if (param != null) {
-            result.addRow(param.getInfo());
-        }
 
         return result;
     }

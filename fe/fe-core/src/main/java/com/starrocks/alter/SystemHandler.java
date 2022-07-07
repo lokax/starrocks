@@ -22,10 +22,10 @@
 package com.starrocks.alter;
 
 import com.google.common.base.Preconditions;
-import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.starrocks.alter.AlterJob.JobState;
 import com.starrocks.analysis.AddBackendClause;
+import com.starrocks.analysis.AddComputeNodeClause;
 import com.starrocks.analysis.AddFollowerClause;
 import com.starrocks.analysis.AddObserverClause;
 import com.starrocks.analysis.AlterClause;
@@ -34,21 +34,23 @@ import com.starrocks.analysis.CancelAlterSystemStmt;
 import com.starrocks.analysis.CancelStmt;
 import com.starrocks.analysis.DecommissionBackendClause;
 import com.starrocks.analysis.DropBackendClause;
+import com.starrocks.analysis.DropComputeNodeClause;
 import com.starrocks.analysis.DropFollowerClause;
 import com.starrocks.analysis.DropObserverClause;
+import com.starrocks.analysis.ModifyBackendAddressClause;
 import com.starrocks.analysis.ModifyBrokerClause;
-import com.starrocks.catalog.Catalog;
+import com.starrocks.analysis.ModifyFrontendAddressClause;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.TabletInvertedIndex;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
-import com.starrocks.common.ErrorCode;
-import com.starrocks.common.ErrorReport;
 import com.starrocks.common.MetaNotFoundException;
 import com.starrocks.common.Pair;
 import com.starrocks.common.UserException;
 import com.starrocks.ha.FrontendNodeType;
+import com.starrocks.qe.ShowResultSet;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.task.AgentTask;
@@ -94,8 +96,8 @@ public class SystemHandler extends AlterHandler {
 
     // check all decommissioned backends, if there is no tablet on that backend, drop it.
     private void runAlterJobV2() {
-        SystemInfoService systemInfoService = Catalog.getCurrentSystemInfo();
-        TabletInvertedIndex invertedIndex = Catalog.getCurrentInvertedIndex();
+        SystemInfoService systemInfoService = GlobalStateMgr.getCurrentSystemInfo();
+        TabletInvertedIndex invertedIndex = GlobalStateMgr.getCurrentInvertedIndex();
         // check if decommission is finished
         for (Long beId : systemInfoService.getBackendIds(false)) {
             Backend backend = systemInfoService.getBackend(beId);
@@ -127,37 +129,22 @@ public class SystemHandler extends AlterHandler {
 
     @Override
     // add synchronized to avoid process 2 or more stmts at same time
-    public synchronized void process(List<AlterClause> alterClauses, String clusterName, Database dummyDb,
+    public synchronized ShowResultSet process(List<AlterClause> alterClauses, Database dummyDb,
                                      OlapTable dummyTbl) throws UserException {
         Preconditions.checkArgument(alterClauses.size() == 1);
         AlterClause alterClause = alterClauses.get(0);
-
         if (alterClause instanceof AddBackendClause) {
             // add backend
             AddBackendClause addBackendClause = (AddBackendClause) alterClause;
-            final String destClusterName = addBackendClause.getDestCluster();
-
-            if ((!Strings.isNullOrEmpty(destClusterName) || addBackendClause.isFree()) &&
-                    Config.disable_cluster_feature) {
-                ErrorReport.reportAnalysisException(ErrorCode.ERR_INVALID_OPERATION, "ADD BACKEND TO CLUSTER");
-            }
-
-            if (!Strings.isNullOrEmpty(destClusterName)
-                    && Catalog.getCurrentCatalog().getCluster(destClusterName) == null) {
-                throw new DdlException("Cluster: " + destClusterName + " does not exist.");
-            }
-            Catalog.getCurrentSystemInfo().addBackends(addBackendClause.getHostPortPairs(),
-                    addBackendClause.isFree(), addBackendClause.getDestCluster());
+            GlobalStateMgr.getCurrentSystemInfo().addBackends(addBackendClause.getHostPortPairs());
+        } else if (alterClause instanceof ModifyBackendAddressClause) {
+            // update Backend Address
+            ModifyBackendAddressClause modifyBackendAddressClause = (ModifyBackendAddressClause) alterClause;
+            return GlobalStateMgr.getCurrentSystemInfo().modifyBackendHost(modifyBackendAddressClause);
         } else if (alterClause instanceof DropBackendClause) {
             // drop backend
             DropBackendClause dropBackendClause = (DropBackendClause) alterClause;
-            if (!dropBackendClause.isForce()) {
-                throw new DdlException("It is highly NOT RECOMMENDED to use DROP BACKEND stmt."
-                        + "It is not safe to directly drop a backend. "
-                        + "All data on this backend will be discarded permanently. "
-                        + "If you insist, use DROPP BACKEND stmt (double P).");
-            }
-            Catalog.getCurrentSystemInfo().dropBackends(dropBackendClause.getHostPortPairs());
+            GlobalStateMgr.getCurrentSystemInfo().dropBackends(dropBackendClause);
         } else if (alterClause instanceof DecommissionBackendClause) {
             // decommission
             DecommissionBackendClause decommissionBackendClause = (DecommissionBackendClause) alterClause;
@@ -169,31 +156,44 @@ public class SystemHandler extends AlterHandler {
             // all backend in decommission state
             for (Backend backend : decommissionBackends) {
                 backend.setDecommissioned(true);
-                Catalog.getCurrentCatalog().getEditLog().logBackendStateChange(backend);
+                GlobalStateMgr.getCurrentState().getEditLog().logBackendStateChange(backend);
                 LOG.info("set backend {} to decommission", backend.getId());
             }
 
         } else if (alterClause instanceof AddObserverClause) {
             AddObserverClause clause = (AddObserverClause) alterClause;
-            Catalog.getCurrentCatalog().addFrontend(FrontendNodeType.OBSERVER, clause.getHost(), clause.getPort());
+            GlobalStateMgr.getCurrentState().addFrontend(FrontendNodeType.OBSERVER, clause.getHost(), clause.getPort());
         } else if (alterClause instanceof DropObserverClause) {
             DropObserverClause clause = (DropObserverClause) alterClause;
-            Catalog.getCurrentCatalog().dropFrontend(FrontendNodeType.OBSERVER, clause.getHost(), clause.getPort());
+            GlobalStateMgr.getCurrentState()
+                    .dropFrontend(FrontendNodeType.OBSERVER, clause.getHost(), clause.getPort());
         } else if (alterClause instanceof AddFollowerClause) {
             AddFollowerClause clause = (AddFollowerClause) alterClause;
-            Catalog.getCurrentCatalog().addFrontend(FrontendNodeType.FOLLOWER, clause.getHost(), clause.getPort());
+            GlobalStateMgr.getCurrentState().addFrontend(FrontendNodeType.FOLLOWER, clause.getHost(), clause.getPort());
+        } else if (alterClause instanceof ModifyFrontendAddressClause) {
+            // update Frontend Address
+            ModifyFrontendAddressClause modifyFrontendAddressClause = (ModifyFrontendAddressClause) alterClause;
+            GlobalStateMgr.getCurrentState().modifyFrontendHost(modifyFrontendAddressClause);
         } else if (alterClause instanceof DropFollowerClause) {
             DropFollowerClause clause = (DropFollowerClause) alterClause;
-            Catalog.getCurrentCatalog().dropFrontend(FrontendNodeType.FOLLOWER, clause.getHost(), clause.getPort());
+            GlobalStateMgr.getCurrentState()
+                    .dropFrontend(FrontendNodeType.FOLLOWER, clause.getHost(), clause.getPort());
         } else if (alterClause instanceof ModifyBrokerClause) {
             ModifyBrokerClause clause = (ModifyBrokerClause) alterClause;
-            Catalog.getCurrentCatalog().getBrokerMgr().execute(clause);
+            GlobalStateMgr.getCurrentState().getBrokerMgr().execute(clause);
         } else if (alterClause instanceof AlterLoadErrorUrlClause) {
             AlterLoadErrorUrlClause clause = (AlterLoadErrorUrlClause) alterClause;
-            Catalog.getCurrentCatalog().getLoadInstance().setLoadErrorHubInfo(clause.getProperties());
+            GlobalStateMgr.getCurrentState().getLoadInstance().setLoadErrorHubInfo(clause.getProperties());
+        } else if (alterClause instanceof AddComputeNodeClause) {
+            AddComputeNodeClause addComputeNodeClause = (AddComputeNodeClause) alterClause;
+            GlobalStateMgr.getCurrentSystemInfo().addComputeNodes(addComputeNodeClause.getHostPortPairs());
+        } else if (alterClause instanceof DropComputeNodeClause) {
+            DropComputeNodeClause dropComputeNodeClause = (DropComputeNodeClause) alterClause;
+            GlobalStateMgr.getCurrentSystemInfo().dropComputeNodes(dropComputeNodeClause.getHostPortPairs());
         } else {
             Preconditions.checkState(false, alterClause.getClass());
         }
+        return null;
     }
 
     private List<Backend> checkDecommission(DecommissionBackendClause decommissionBackendClause)
@@ -209,7 +209,7 @@ public class SystemHandler extends AlterHandler {
      */
     public static List<Backend> checkDecommission(List<Pair<String, Integer>> hostPortPairs)
             throws DdlException {
-        SystemInfoService infoService = Catalog.getCurrentSystemInfo();
+        SystemInfoService infoService = GlobalStateMgr.getCurrentSystemInfo();
         List<Backend> decommissionBackends = Lists.newArrayList();
         // check if exist
         for (Pair<String, Integer> pair : hostPortPairs) {
@@ -235,7 +235,7 @@ public class SystemHandler extends AlterHandler {
         CancelAlterSystemStmt cancelAlterSystemStmt = (CancelAlterSystemStmt) stmt;
         cancelAlterSystemStmt.getHostPortPairs();
 
-        SystemInfoService infoService = Catalog.getCurrentSystemInfo();
+        SystemInfoService infoService = GlobalStateMgr.getCurrentSystemInfo();
         // check if backends is under decommission
         List<Backend> backends = Lists.newArrayList();
         List<Pair<String, Integer>> hostPortPairs = cancelAlterSystemStmt.getHostPortPairs();
@@ -257,7 +257,7 @@ public class SystemHandler extends AlterHandler {
 
         for (Backend backend : backends) {
             if (backend.setDecommissioned(false)) {
-                Catalog.getCurrentCatalog().getEditLog().logBackendStateChange(backend);
+                GlobalStateMgr.getCurrentState().getEditLog().logBackendStateChange(backend);
             } else {
                 LOG.info("backend is not decommissioned[{}]", backend.getHost());
             }
@@ -265,14 +265,14 @@ public class SystemHandler extends AlterHandler {
     }
 
     @Override
-    public void replayInitJob(AlterJob alterJob, Catalog catalog) {
+    public void replayInitJob(AlterJob alterJob, GlobalStateMgr globalStateMgr) {
         DecommissionBackendJob decommissionBackendJob = (DecommissionBackendJob) alterJob;
         LOG.debug("replay init decommision backend job: {}", decommissionBackendJob.getBackendIdsString());
         addAlterJob(alterJob);
     }
 
     @Override
-    public void replayFinish(AlterJob alterJob, Catalog catalog) {
+    public void replayFinish(AlterJob alterJob, GlobalStateMgr globalStateMgr) {
         LOG.debug("replay finish decommision backend job: {}",
                 ((DecommissionBackendJob) alterJob).getBackendIdsString());
         removeAlterJob(alterJob.getTableId());
@@ -281,7 +281,7 @@ public class SystemHandler extends AlterHandler {
     }
 
     @Override
-    public void replayCancel(AlterJob alterJob, Catalog catalog) {
+    public void replayCancel(AlterJob alterJob, GlobalStateMgr globalStateMgr) {
         throw new NotImplementedException();
     }
 }

@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
@@ -6,7 +6,7 @@
 
 namespace starrocks {
 
-static inline Status to_status(const rocksdb::Status from) {
+static inline Status to_status(const rocksdb::Status& from) {
     switch (from.code()) {
     case rocksdb::Status::kOk:
         return Status::OK();

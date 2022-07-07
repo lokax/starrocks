@@ -1,17 +1,22 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.planner;
 
+import com.google.common.collect.Lists;
 import com.starrocks.analysis.Expr;
+import com.starrocks.qe.SessionVariable;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TRuntimeFilterBuildJoinMode;
 import com.starrocks.thrift.TRuntimeFilterDescription;
+import com.starrocks.thrift.TRuntimeFilterDestination;
 import com.starrocks.thrift.TUniqueId;
 
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 // this class is to describe a runtime filter.
 // this class is almost identical to TRuntimeFilterDescription in PlanNodes.thrift
@@ -19,31 +24,51 @@ import java.util.Map;
 // `toExplainString()` for explaining sql
 public class RuntimeFilterDescription {
     private int filterId;
+    private int buildPlanNodeId;
     private Expr buildExpr;
     private int exprOrder; // order of expr in eq conjuncts.
     private final Map<Integer, Expr> nodeIdToProbeExpr;
     private boolean hasRemoteTargets;
     private final List<TNetworkAddress> mergeNodes;
-    private HashJoinNode.DistributionMode joinMode;
+    private JoinNode.DistributionMode joinMode;
     private TUniqueId senderFragmentInstanceId;
+
+    private Set<TUniqueId> broadcastGRFSenders;
+
+    private List<TRuntimeFilterDestination> broadcastGRFDestinations;
     private int equalCount;
     private int crossExchangeNodeTimes;
+    private boolean equalForNull;
 
-    private static final int ProbeMinSize = 100 * 1024;
-    private static final float ProbeMinSelectivity = 0.5f;
     private long buildCardinality;
+    private SessionVariable sessionVariable;
 
-    public RuntimeFilterDescription() {
+    private boolean onlyLocal;
+
+    private List<Integer> bucketSeqToInstance = Lists.newArrayList();
+
+    public RuntimeFilterDescription(SessionVariable sv) {
         nodeIdToProbeExpr = new HashMap<>();
         mergeNodes = new ArrayList<>();
         filterId = 0;
         exprOrder = 0;
         hasRemoteTargets = false;
-        joinMode = HashJoinNode.DistributionMode.NONE;
+        joinMode = JoinNode.DistributionMode.NONE;
         senderFragmentInstanceId = null;
         equalCount = 0;
         crossExchangeNodeTimes = 0;
         buildCardinality = 0;
+        equalForNull = false;
+        sessionVariable = sv;
+        onlyLocal = false;
+    }
+
+    public boolean getEqualForNull() {
+        return equalForNull;
+    }
+
+    public void setEqualForNull(boolean v) {
+        equalForNull = v;
     }
 
     public void setFilterId(int id) {
@@ -70,14 +95,11 @@ public class RuntimeFilterDescription {
         }
 
         long card = node.getCardinality();
-        if (card < ProbeMinSize) {
+        if (card < sessionVariable.getGlobalRuntimeFilterProbeMinSize()) {
             return false;
         }
         float sel = (1.0f - buildCardinality * 1.0f / card);
-        if (sel < ProbeMinSelectivity) {
-            return false;
-        }
-        return true;
+        return !(sel < sessionVariable.getGlobalRuntimeFilterProbeMinSelectivity());
     }
 
     public void enterExchangeNode() {
@@ -104,6 +126,10 @@ public class RuntimeFilterDescription {
         equalCount = value;
     }
 
+    public int getEqualCount() {
+        return equalCount;
+    }
+
     public boolean isHasRemoteTargets() {
         return hasRemoteTargets;
     }
@@ -112,39 +138,61 @@ public class RuntimeFilterDescription {
         exprOrder = order;
     }
 
-    public void setJoinMode(HashJoinNode.DistributionMode mode) {
+    public void setJoinMode(JoinNode.DistributionMode mode) {
         joinMode = mode;
     }
 
-    public HashJoinNode.DistributionMode getJoinMode() {
-        return joinMode;
+    public boolean isColocateOrBucketShuffle() {
+        return joinMode.equals(JoinNode.DistributionMode.COLOCATE) ||
+                joinMode.equals(JoinNode.DistributionMode.LOCAL_HASH_BUCKET);
+    }
+
+    public int getBuildPlanNodeId() {
+        return buildPlanNodeId;
+    }
+
+    public void setBuildPlanNodeId(int buildPlanNodeId) {
+        this.buildPlanNodeId = buildPlanNodeId;
+    }
+
+    public void setOnlyLocal(boolean onlyLocal) {
+        this.onlyLocal = onlyLocal;
     }
 
     public boolean isLocalApplicable() {
         return joinMode.equals(HashJoinNode.DistributionMode.BROADCAST) ||
                 joinMode.equals(HashJoinNode.DistributionMode.COLOCATE) ||
-                joinMode.equals(HashJoinNode.DistributionMode.BUCKET_SHUFFLE);
+                joinMode.equals(HashJoinNode.DistributionMode.LOCAL_HASH_BUCKET) ||
+                joinMode.equals(HashJoinNode.DistributionMode.SHUFFLE_HASH_BUCKET) ||
+                joinMode.equals(HashJoinNode.DistributionMode.REPLICATED);
     }
 
     public boolean isBroadcastJoin() {
-        return joinMode.equals(HashJoinNode.DistributionMode.BROADCAST);
+        return joinMode.equals(JoinNode.DistributionMode.BROADCAST);
+    }
+
+    public void setBucketSeqToInstance(List<Integer> bucketSeqToInstance) {
+        this.bucketSeqToInstance = bucketSeqToInstance;
+    }
+
+    public List<Integer> getBucketSeqToInstance() {
+        return this.bucketSeqToInstance;
     }
 
     public boolean canPushAcrossExchangeNode() {
-        // if runtime filter is shuffle-aware implementation, then only rf generated by partitioned/bucket shuffle hash join
-        // can be pushed down across exchange node.
-        // or broadcast join(we just need to send one copy).
-        if (joinMode.equals(HashJoinNode.DistributionMode.BROADCAST)) {
-            return true;
+        if (onlyLocal) {
+            return false;
         }
-        // if there are more thant 1 equal conjuncts, we don't know shuffle algorithm any more.
-        // because data are shuffled base on multiple columns
-        // and we can not probe with only one column.
-        if (joinMode.equals(HashJoinNode.DistributionMode.PARTITIONED) ||
-                joinMode.equals(HashJoinNode.DistributionMode.BUCKET_SHUFFLE)) {
-            return equalCount == 1;
+        switch (joinMode) {
+            case BROADCAST:
+            case PARTITIONED:
+            case LOCAL_HASH_BUCKET:
+            case SHUFFLE_HASH_BUCKET:
+            case COLOCATE:
+                return true;
+            default:
+                return false;
         }
-        return false;
     }
 
     public void addMergeNode(TNetworkAddress addr) {
@@ -156,6 +204,14 @@ public class RuntimeFilterDescription {
 
     public void setSenderFragmentInstanceId(TUniqueId value) {
         senderFragmentInstanceId = value;
+    }
+
+    public void setBroadcastGRFSenders(Set<TUniqueId> broadcastGRFSenders) {
+        this.broadcastGRFSenders = broadcastGRFSenders;
+    }
+
+    public void setBroadcastGRFDestinations(List<TRuntimeFilterDestination> broadcastGRFDestinations) {
+        this.broadcastGRFDestinations = broadcastGRFDestinations;
     }
 
     public String toExplainString(int probeNodeId) {
@@ -181,22 +237,35 @@ public class RuntimeFilterDescription {
             t.putToPlan_node_id_to_target_expr(entry.getKey(), entry.getValue().treeToThrift());
         }
         t.setHas_remote_targets(hasRemoteTargets);
+        t.setBuild_plan_node_id(buildPlanNodeId);
         if (!mergeNodes.isEmpty()) {
             t.setRuntime_filter_merge_nodes(mergeNodes);
         }
         if (senderFragmentInstanceId != null) {
             t.setSender_finst_id(senderFragmentInstanceId);
         }
-
-        assert (joinMode != HashJoinNode.DistributionMode.NONE);
-        if (joinMode.equals(HashJoinNode.DistributionMode.BROADCAST)) {
+        if (broadcastGRFSenders != null && !broadcastGRFSenders.isEmpty()) {
+            t.setBroadcast_grf_senders(broadcastGRFSenders.stream().collect(Collectors.toList()));
+        }
+        if (broadcastGRFDestinations != null && !broadcastGRFDestinations.isEmpty()) {
+            t.setBroadcast_grf_destinations(broadcastGRFDestinations);
+        }
+        if (isColocateOrBucketShuffle() && bucketSeqToInstance != null && !bucketSeqToInstance.isEmpty()) {
+            t.setBucketseq_to_instance(bucketSeqToInstance);
+        }
+        assert (joinMode != JoinNode.DistributionMode.NONE);
+        if (joinMode.equals(JoinNode.DistributionMode.BROADCAST)) {
             t.setBuild_join_mode(TRuntimeFilterBuildJoinMode.BORADCAST);
-        } else if (joinMode.equals(HashJoinNode.DistributionMode.BUCKET_SHUFFLE)) {
-            t.setBuild_join_mode(TRuntimeFilterBuildJoinMode.BUCKET_SHUFFLE);
-        } else if (joinMode.equals(HashJoinNode.DistributionMode.PARTITIONED)) {
+        } else if (joinMode.equals(JoinNode.DistributionMode.LOCAL_HASH_BUCKET)) {
+            t.setBuild_join_mode(TRuntimeFilterBuildJoinMode.LOCAL_HASH_BUCKET);
+        } else if (joinMode.equals(JoinNode.DistributionMode.PARTITIONED)) {
             t.setBuild_join_mode(TRuntimeFilterBuildJoinMode.PARTITIONED);
-        } else if (joinMode.equals(HashJoinNode.DistributionMode.COLOCATE)) {
+        } else if (joinMode.equals(JoinNode.DistributionMode.COLOCATE)) {
             t.setBuild_join_mode(TRuntimeFilterBuildJoinMode.COLOCATE);
+        } else if (joinMode.equals(JoinNode.DistributionMode.SHUFFLE_HASH_BUCKET)) {
+            t.setBuild_join_mode(TRuntimeFilterBuildJoinMode.SHUFFLE_HASH_BUCKET);
+        } else if (joinMode.equals(JoinNode.DistributionMode.REPLICATED)) {
+            t.setBuild_join_mode(TRuntimeFilterBuildJoinMode.REPLICATED);
         }
 
         return t;

@@ -26,9 +26,10 @@ package starrocks;
 option java_package = "com.starrocks.proto";
 
 import "olap_common.proto";
+import "tablet_schema.proto";
 import "types.proto";
 
-message ZoneMap {
+message ZoneMapOfRowset {
     required bytes min = 1;
     required bytes max = 2;
     optional bool null_flag = 3;
@@ -56,22 +57,43 @@ enum SegmentsOverlapPB {
     NONOVERLAPPING = 2;
 }
 
+// indicate segment footer position and size of partial rowset
+message FooterPointerPB {
+    optional uint64 position = 1;
+    optional uint64 size = 2;
+}
+
+// some txn semantic information bind to a written rowset
+// i.e.
+//   1. partial update txn only provide and update a subset of columns,
+//      so it should add info about updated columns, whether to insert new
+//      rows if old row doesn't exists, and default values etc
+//   2. conditional update txn may add some meta to describe condition
+//   3. more general read-write txn may add complex expressions
+message RowsetTxnMetaPB {
+    repeated uint32 partial_update_column_ids = 1;
+    repeated uint32 partial_update_column_unique_ids = 2;
+
+    // one for each segment
+    repeated FooterPointerPB partial_rowset_footers = 3;
+}
+
 message RowsetMetaPB {
-    required int64 rowset_id = 1;
+    required int64 deprecated_rowset_id = 1;
     optional int64 partition_id = 2;
     optional int64 tablet_id = 3;
     // only for pending rowset
     optional int64 txn_id = 4;
     // tablet id and schema hash could find tablet
     optional int32 tablet_schema_hash = 5;
-    optional RowsetTypePB rowset_type = 6;
+    optional RowsetTypePB rowset_type = 6 [default = BETA_ROWSET]; // deprecated
     optional RowsetStatePB rowset_state = 7;
     // only for visible rowset.
     optional int64 start_version = 8;
     // only for visible rowset.
     optional int64 end_version = 9;
     // only for visible rowset.
-    optional int64 version_hash = 10;
+    optional int64 version_hash = 10 [deprecated = true];
     // total number of rows.
     optional int64 num_rows = 11;
     // calculated by index + data
@@ -81,7 +103,7 @@ message RowsetMetaPB {
     // calculated sum(segmentgroup.index_size)
     optional int64 index_disk_size = 14;
     // rowset level column min/max/null statistics, not not used currently
-    repeated ZoneMap zone_maps = 15;
+    repeated ZoneMapOfRowset zone_maps = 15 [deprecated = true];
     optional DeletePredicatePB delete_predicate = 16;
     // calculated from segment group
     optional bool empty = 17;
@@ -94,7 +116,7 @@ message RowsetMetaPB {
     // total number of segments
     optional int64 num_segments = 22;
     // rowset id definition, it will replace required rowset id
-    optional string rowset_id_v2 = 23;
+    optional string rowset_id = 23;
     // to indicate whether the data between the segments overlap
     optional SegmentsOverlapPB segments_overlap_pb = 51 [default = OVERLAP_UNKNOWN];
     // every segment in a rowset has an unique uint32 id
@@ -107,18 +129,13 @@ message RowsetMetaPB {
     optional uint32 num_delete_files = 53;
     // total row size in approximately
     optional int64 total_row_size = 54;
+    // some txn semantic information bind to this rowset
+    optional RowsetTxnMetaPB txn_meta = 55;
 }
 
 enum DataFileType {
     OLAP_DATA_FILE = 0; //Deprecated. Only columnar-wise format is supported.
     COLUMN_ORIENTED_FILE = 1;
-}
-
-enum KeysType {
-    DUP_KEYS = 0;
-    UNIQUE_KEYS = 1;
-    AGG_KEYS = 2;
-    PRIMARY_KEYS = 10;
 }
 
 message DeletePredicatePB {
@@ -152,37 +169,6 @@ message AlterTabletPB {
     optional AlterTabletType alter_type = 4;
 }
 
-message ColumnPB {
-    required int32 unique_id = 1; // ColumnMessage.unique_id
-    optional string name = 2; // ColumnMessage.name
-    required string type = 3; // ColumnMessage.type
-    optional bool is_key = 4; // ColumnMessage.is_key
-    optional string aggregation = 5; // ColumnMessage.aggregation
-    optional bool is_nullable = 6; // ColumnMessage.is_allow_null
-    optional bytes default_value = 7; // ColumnMessage.default_value ?
-    optional int32 precision = 8; // ColumnMessage.precision
-    optional int32 frac = 9; // ColumnMessage.frac
-    optional int32 length = 10; // ColumnMessage.length
-    optional int32 index_length = 11; // ColumnMessage.index_length
-    optional bool is_bf_column = 12; // ColumnMessage.is_bf_column
-    optional int32 referenced_column_id = 13; //
-    optional string referenced_column = 14; // ColumnMessage.referenced_column?
-    optional bool has_bitmap_index = 15 [default=false]; // ColumnMessage.has_bitmap_index
-    optional bool visible = 16 [default=true]; // used for hided column
-    repeated ColumnPB children_columns = 17;
-}
-
-message TabletSchemaPB {
-    optional KeysType keys_type = 1;    // OLAPHeaderMessage.keys_type
-    repeated ColumnPB column = 2;   // OLAPHeaderMessage.column
-    optional int32 num_short_key_columns = 3;   // OLAPHeaderMessage.num_short_key_fields
-    optional int32 num_rows_per_row_block = 4;  // OLAPHeaderMessage.num_rows_per_data_block
-    optional CompressKind compress_kind = 5; // OLAPHeaderMessage.compress_kind
-    optional double bf_fpp = 6; // OLAPHeaderMessage.bf_fpp
-    optional uint32 next_column_unique_id = 7; // OLAPHeaderMessage.next_column_unique_id
-    optional bool is_in_memory = 8 [default=false];
-}
-
 enum TabletStatePB {
     PB_NOTREADY  = 0; // under alter table, rollup, clone
     PB_RUNNING = 1;
@@ -194,11 +180,6 @@ enum TabletStatePB {
 enum TabletTypePB {
     TABLET_TYPE_DISK = 0;
     TABLET_TYPE_MEMORY = 1;
-}
-
-message EditVersionPB {
-    optional int64 major = 1;
-    optional int64 minor = 2;
 }
 
 message CompactionInfoPB {
@@ -263,15 +244,16 @@ message TabletMetaPB {
     // a uniqued id to identified tablet with same tablet_id and schema hash
     optional PUniqueId tablet_uid = 14;
     optional int64 end_rowset_id = 15;
-    optional RowsetTypePB preferred_rowset_type = 16;
+    optional RowsetTypePB preferred_rowset_type = 16 [default = BETA_ROWSET]; // deprecated
     optional TabletTypePB tablet_type = 17;
     optional TabletUpdatesPB updates = 50; // used for new updatable tablet
+    optional bool enable_persistent_index = 51 [default = false]; // used for persistent index in primary index
 }
 
 message OLAPIndexHeaderMessage {
     required int32 start_version = 1;
     required int32 end_version = 2;
-    required int64 cumulative_version_hash = 3;
+    required int64 cumulative_version_hash = 3 [deprecated = true];
 
     required uint32 segment = 4;
     required uint32 num_rows_per_block = 5;

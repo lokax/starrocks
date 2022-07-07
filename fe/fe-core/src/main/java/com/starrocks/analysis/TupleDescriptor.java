@@ -29,21 +29,12 @@ import com.starrocks.catalog.ColumnStats;
 import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.Table;
 import com.starrocks.thrift.TTupleDescriptor;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.TreeSet;
 
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 @Deprecated
 public class TupleDescriptor {
-    private static final Logger LOG = LogManager.getLogger(TupleDescriptor.class);
     private final TupleId id;
     private final String debugName; // debug only
     private final ArrayList<SlotDescriptor> slots;
@@ -176,10 +167,6 @@ public class TupleDescriptor {
         return (aliases_ != null) ? aliases_[0] : null;
     }
 
-    public TableName getAliasAsName() {
-        return (aliases_ != null) ? new TableName(null, aliases_[0]) : null;
-    }
-
     public TTupleDescriptor toThrift() {
         TTupleDescriptor ttupleDesc = new TTupleDescriptor(id.asInt(), byteSize, numNullBytes);
         ttupleDesc.setNumNullSlots(numNullableSlots);
@@ -263,56 +250,6 @@ public class TupleDescriptor {
         // LOG.debug("tuple is {}", byteSize);
     }
 
-    /**
-     * Returns true if tuples of type 'this' can be assigned to tuples of type 'desc'
-     * (checks that both have the same number of slots and that slots are of the same type)
-     */
-    public boolean isCompatible(TupleDescriptor desc) {
-        if (slots.size() != desc.slots.size()) {
-            return false;
-        }
-        for (int i = 0; i < slots.size(); ++i) {
-            if (slots.get(i).getType() != desc.slots.get(i).getType()) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
-     * Materialize all slots.
-     */
-    public void materializeSlots() {
-        for (SlotDescriptor slot : slots) {
-            slot.setIsMaterialized(true);
-        }
-    }
-
-    public void getTableIdToColumnNames(Map<Long, Set<String>> tableIdToColumnNames) {
-        for (SlotDescriptor slotDescriptor : slots) {
-            if (!slotDescriptor.isMaterialized()) {
-                continue;
-            }
-            if (slotDescriptor.getColumn() != null) {
-                TupleDescriptor parent = slotDescriptor.getParent();
-                Preconditions.checkState(parent != null);
-                Table table = parent.getTable();
-                Preconditions.checkState(table != null);
-                Long tableId = table.getId();
-                Set<String> columnNames = tableIdToColumnNames.get(tableId);
-                if (columnNames == null) {
-                    columnNames = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
-                    tableIdToColumnNames.put(tableId, columnNames);
-                }
-                columnNames.add(slotDescriptor.getColumn().getName());
-            } else {
-                for (Expr expr : slotDescriptor.getSourceExprs()) {
-                    expr.getTableIdToColumnNames(tableIdToColumnNames);
-                }
-            }
-        }
-    }
-
     @Override
     public String toString() {
         String tblStr = (table == null ? "null" : table.getName());
@@ -326,8 +263,6 @@ public class TupleDescriptor {
     }
 
     public String debugString() {
-        // TODO(zc):
-        // String tblStr = (getTable() == null ? "null" : getTable().getFullName());
         String tblStr = (getTable() == null ? "null" : getTable().getName());
         List<String> slotStrings = Lists.newArrayList();
         for (SlotDescriptor slot : slots) {

@@ -27,6 +27,7 @@ namespace starrocks {
 
 static const std::string HTTP_DB_KEY = "db";
 static const std::string HTTP_TABLE_KEY = "table";
+static const std::string HTTP_TXN_OP_KEY = "txn_op";
 static const std::string HTTP_LABEL_KEY = "label";
 static const std::string HTTP_FORMAT_KEY = "format";
 static const std::string HTTP_COLUMNS = "columns";
@@ -35,15 +36,21 @@ static const std::string HTTP_COLUMN_SEPARATOR = "column_separator";
 static const std::string HTTP_ROW_DELIMITER = "row_delimiter";
 static const std::string HTTP_MAX_FILTER_RATIO = "max_filter_ratio";
 static const std::string HTTP_TIMEOUT = "timeout";
+static const std::string HTTP_IDLE_TRANSACTION_TIMEOUT = "idle_transaction_timeout";
 static const std::string HTTP_PARTITIONS = "partitions";
 static const std::string HTTP_TEMP_PARTITIONS = "temporary_partitions";
 static const std::string HTTP_NEGATIVE = "negative";
 static const std::string HTTP_STRICT_MODE = "strict_mode";
 static const std::string HTTP_TIMEZONE = "timezone";
 static const std::string HTTP_LOAD_MEM_LIMIT = "load_mem_limit";
+static const std::string HTTP_EXEC_MEM_LIMIT = "exec_mem_limit";
 static const std::string HTTP_JSONPATHS = "jsonpaths";
 static const std::string HTTP_JSONROOT = "json_root";
+static const std::string HTTP_IGNORE_JSON_SIZE = "ignore_json_size";
 static const std::string HTTP_STRIP_OUTER_ARRAY = "strip_outer_array";
+static const std::string HTTP_PARTIAL_UPDATE = "partial_update";
+static const std::string HTTP_TRANSMISSION_COMPRESSION_TYPE = "transmission_compression_type";
+static const std::string HTTP_LOAD_DOP = "load_dop";
 
 static const std::string HTTP_100_CONTINUE = "100-continue";
 

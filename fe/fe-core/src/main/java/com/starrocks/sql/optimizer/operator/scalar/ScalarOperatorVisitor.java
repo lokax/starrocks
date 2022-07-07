@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.operator.scalar;
 
 /**
@@ -23,6 +23,10 @@ public abstract class ScalarOperatorVisitor<R, C> {
     }
 
     public R visitArrayElement(ArrayElementOperator array, C context) {
+        return visit(array, context);
+    }
+
+    public R visitArraySlice(ArraySliceOperator array, C context) {
         return visit(array, context);
     }
 
@@ -67,6 +71,14 @@ public abstract class ScalarOperatorVisitor<R, C> {
     }
 
     public R visitCaseWhenOperator(CaseWhenOperator operator, C context) {
+        return visit(operator, context);
+    }
+
+    public R visitDictMappingOperator(DictMappingOperator operator, C context) {
+        return visit(operator, context);
+    }
+
+    public R visitCloneOperator(CloneOperator operator, C context) {
         return visit(operator, context);
     }
 }

@@ -1,13 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <memory>
 #include <random>
 
 #include "column/array_column.h"
 #include "exprs/vectorized/function_helper.h"
 #include "exprs/vectorized/mock_vectorized_expr.h"
 #include "exprs/vectorized/string_functions.h"
+#include "runtime/large_int_value.h"
+#include "testutil/assert.h"
 #include "testutil/parallel_test.h"
 
 namespace starrocks {
@@ -192,16 +195,16 @@ PARALLEL_TEST(VecStringFunctionsTest, substrConstUtf8Test) {
     std::string s;
     s.append("\x7f");
     s.append("\xdf\xbf");
-    s.append("\xef\xbf\xbf");
-    s.append("\xf7\xbf\xbf\xbf");
+    s.append("\xe0\xbf\xbf");
+    s.append("\xf3\xbf\xbf\xbf");
     s.append("\x7f");
     s.append("\xdf\xbf");
-    s.append("\xef\xbf\xbf");
-    s.append("\xf7\xbf\xbf\xbf");
+    s.append("\xe0\xbf\xbf");
+    s.append("\xf3\xbf\xbf\xbf");
     s.append("\x7f");
     s.append("\xdf\xbf");
-    s.append("\xef\xbf\xbf");
-    s.append("\xf7\xbf\xbf\xbf");
+    s.append("\xe0\xbf\xbf");
+    s.append("\xf3\xbf\xbf\xbf");
 
     str->append(s);
     str->append("");
@@ -209,27 +212,27 @@ PARALLEL_TEST(VecStringFunctionsTest, substrConstUtf8Test) {
     std::vector<std::tuple<int, int, std::string>> cases = {
             {1, 1, "\x7f"},
             {1, 2, "\x7f\xdf\xbf"},
-            {1, 3, "\x7f\xdf\xbf\xef\xbf\xbf"},
-            {1, 4, "\x7f\xdf\xbf\xef\xbf\xbf\xf7\xbf\xbf\xbf"},
+            {1, 3, "\x7f\xdf\xbf\xe0\xbf\xbf"},
+            {1, 4, "\x7f\xdf\xbf\xe0\xbf\xbf\xf3\xbf\xbf\xbf"},
             {1, 100, s},
             {2, 1, "\xdf\xbf"},
-            {2, 2, "\xdf\xbf\xef\xbf\xbf"},
-            {2, 3, "\xdf\xbf\xef\xbf\xbf\xf7\xbf\xbf\xbf"},
-            {2, 4, "\xdf\xbf\xef\xbf\xbf\xf7\xbf\xbf\xbf\x7f"},
+            {2, 2, "\xdf\xbf\xe0\xbf\xbf"},
+            {2, 3, "\xdf\xbf\xe0\xbf\xbf\xf3\xbf\xbf\xbf"},
+            {2, 4, "\xdf\xbf\xe0\xbf\xbf\xf3\xbf\xbf\xbf\x7f"},
             {2, 100, s.substr(1)},
-            {3, 1, "\xef\xbf\xbf"},
-            {3, 2, "\xef\xbf\xbf\xf7\xbf\xbf\xbf"},
-            {3, 3, "\xef\xbf\xbf\xf7\xbf\xbf\xbf\x7f"},
-            {3, 4, "\xef\xbf\xbf\xf7\xbf\xbf\xbf\x7f\xdf\xbf"},
+            {3, 1, "\xe0\xbf\xbf"},
+            {3, 2, "\xe0\xbf\xbf\xf3\xbf\xbf\xbf"},
+            {3, 3, "\xe0\xbf\xbf\xf3\xbf\xbf\xbf\x7f"},
+            {3, 4, "\xe0\xbf\xbf\xf3\xbf\xbf\xbf\x7f\xdf\xbf"},
             {3, 100, s.substr(3)},
-            {4, 2, "\xf7\xbf\xbf\xbf\x7f"},
-            {4, 3, "\xf7\xbf\xbf\xbf\x7f\xdf\xbf"},
-            {4, 4, "\xf7\xbf\xbf\xbf\x7f\xdf\xbf\xef\xbf\xbf"},
+            {4, 2, "\xf3\xbf\xbf\xbf\x7f"},
+            {4, 3, "\xf3\xbf\xbf\xbf\x7f\xdf\xbf"},
+            {4, 4, "\xf3\xbf\xbf\xbf\x7f\xdf\xbf\xe0\xbf\xbf"},
             {4, 100, s.substr(6)},
             {5, 1, "\x7f"},
             {5, 2, "\x7f\xdf\xbf"},
-            {5, 3, "\x7f\xdf\xbf\xef\xbf\xbf"},
-            {5, 4, "\x7f\xdf\xbf\xef\xbf\xbf\xf7\xbf\xbf\xbf"},
+            {5, 3, "\x7f\xdf\xbf\xe0\xbf\xbf"},
+            {5, 4, "\x7f\xdf\xbf\xe0\xbf\xbf\xf3\xbf\xbf\xbf"},
             {5, 100, s.substr(10)},
             {-12, 2, s.substr(0, 3)},
             {-11, 3, s.substr(1, 9)},
@@ -336,7 +339,7 @@ PARALLEL_TEST(VecStringFunctionsTest, substringNullTest) {
     pos->append(5);
     len->append(2);
 
-    ColumnBuilder<TYPE_VARCHAR> b;
+    ColumnBuilder<TYPE_VARCHAR> b(config::vector_chunk_size);
 
     for (int j = 0; j < 20; ++j) {
         b.append("test" + std::to_string(j), j % 2 == 0);
@@ -615,81 +618,105 @@ PARALLEL_TEST(VecStringFunctionsTest, splitPart) {
     auto delim = BinaryColumn::create();
     auto field = Int32Column::create();
 
+    // 0
     str->append("hello word");
     delim->append(" ");
     field->append(1);
 
+    // 1
     str->append("hello word");
     delim->append(" ");
     field->append(2);
 
+    // 2
     str->append("hello word");
     delim->append(" ");
     field->append(3);
 
+    // 3
     str->append("hello word");
     delim->append("hello");
     field->append(1);
 
+    // 4
     str->append("hello word");
     delim->append("hello");
     field->append(2);
 
+    // 5
     str->append("abcdabda");
     delim->append("a");
     field->append(1);
 
+    // 6
     str->append("abcdabda");
     delim->append("a");
     field->append(2);
 
+    // 7
     str->append("abcdabda");
     delim->append("a");
     field->append(3);
 
+    // 8
     str->append("abcdabda");
     delim->append("a");
     field->append(4);
 
+    // 9
     str->append("2019年9月8日");
     delim->append("月");
     field->append(1);
 
+    // 10
     str->append("abcdabda");
     delim->append("");
     field->append(1);
 
+    // 11
     str->append("abc###123###234");
     delim->append("##");
     field->append(2);
 
+    // 12
     str->append("abc###123###234");
     delim->append("##");
     field->append(3);
 
+    // 13
     str->append("abcde");
     delim->append("");
     field->append(2);
 
+    // 14
     str->append("abcde");
     delim->append("");
     field->append(10);
 
+    // 15
     str->append("abcde");
     delim->append("abcdef");
     field->append(10);
 
+    // 16
     str->append("abcde");
     delim->append("abcdef");
     field->append(2);
 
+    // 17
     str->append("");
     delim->append("abcdef");
     field->append(2);
 
+    // 18
     str->append("");
     delim->append("");
     field->append(2);
+
+    // 19
+    str->append("abcd");
+    delim->append("");
+    field->append(5);
 
     columns.emplace_back(str);
     columns.emplace_back(delim);
@@ -708,15 +735,16 @@ PARALLEL_TEST(VecStringFunctionsTest, splitPart) {
     ASSERT_EQ("bd", v->get(7).get<Slice>().to_string());
     ASSERT_EQ("", v->get(8).get<Slice>().to_string());
     ASSERT_EQ("2019年9", v->get(9).get<Slice>().to_string());
-    ASSERT_EQ("", v->get(10).get<Slice>().to_string());
+    ASSERT_EQ("a", v->get(10).get<Slice>().to_string());
     ASSERT_EQ("#123", v->get(11).get<Slice>().to_string());
     ASSERT_EQ("#234", v->get(12).get<Slice>().to_string());
-    ASSERT_EQ("", v->get(13).get<Slice>().to_string());
-    ASSERT_EQ("", v->get(14).get<Slice>().to_string());
+    ASSERT_EQ("b", v->get(13).get<Slice>().to_string());
+    ASSERT_TRUE(v->get(14).is_null());
     ASSERT_TRUE(v->get(15).is_null());
     ASSERT_TRUE(v->get(16).is_null());
     ASSERT_TRUE(v->get(17).is_null());
-    ASSERT_EQ("", v->get(18).get<Slice>().to_string());
+    ASSERT_TRUE(v->get(18).is_null());
+    ASSERT_TRUE(v->get(19).is_null());
 }
 
 PARALLEL_TEST(VecStringFunctionsTest, leftTest) {
@@ -1741,6 +1769,24 @@ PARALLEL_TEST(VecStringFunctionsTest, regexpReplaceConstPattern) {
     ASSERT_TRUE(
             StringFunctions::regexp_close(context, FunctionContext::FunctionContext::FunctionStateScope::FRAGMENT_LOCAL)
                     .ok());
+
+    // Test Binary input data
+    {
+        FunctionContext::FunctionStateScope scope =
+                FunctionContext::FunctionContext::FunctionStateScope::FRAGMENT_LOCAL;
+        std::unique_ptr<FunctionContext> ctx0(FunctionContext::create_test_context());
+        int binary_size = 10;
+        std::unique_ptr<char[]> binary_datas = std::make_unique<char[]>(binary_size);
+        memset(binary_datas.get(), 0xff, binary_size);
+
+        auto par0 = BinaryColumn::create();
+        auto par1 = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(binary_datas.get(), binary_size), 1);
+
+        ctx0->impl()->set_constant_columns({par0, par1});
+
+        ASSERT_ERROR(StringFunctions::regexp_prepare(ctx0.get(), scope));
+        ASSERT_OK(StringFunctions::regexp_close(ctx0.get(), scope));
+    }
 }
 
 PARALLEL_TEST(VecStringFunctionsTest, regexpReplace) {

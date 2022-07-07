@@ -26,32 +26,28 @@ import com.starrocks.analysis.DropDbStmt;
 import com.starrocks.analysis.ShowCreateDbStmt;
 import com.starrocks.analysis.StatementBase;
 import com.starrocks.common.util.UUIDUtil;
+import com.starrocks.meta.BlackListSql;
+import com.starrocks.meta.SqlBlackList;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.qe.QueryState.MysqlStateType;
 import com.starrocks.qe.StmtExecutor;
+import com.starrocks.sql.parser.SqlParser;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
-import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import java.io.File;
 import java.util.List;
-import java.util.UUID;
+import java.util.Map;
 
 public class QueryPlannerTest {
-    // use a unique dir so that it won't be conflict with other unit test which
-    // may also start a Mocked Frontend
-    private static String runningDir = "fe/mocked/QueryPlannerTest/" + UUID.randomUUID().toString() + "/";
-
     private static ConnectContext connectContext;
     private static StarRocksAssert starRocksAssert;
     private static String DB_NAME = "test";
 
     @BeforeClass
     public static void beforeClass() throws Exception {
-        UtFrameUtils.createMinStarRocksCluster(runningDir);
+        UtFrameUtils.createMinStarRocksCluster();
 
         // create connect context
         connectContext = UtFrameUtils.createDefaultCtx();
@@ -78,12 +74,6 @@ public class QueryPlannerTest {
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\"\n" +
                 ");");
-    }
-
-    @AfterClass
-    public static void tearDown() {
-        File file = new File(runningDir);
-        file.delete();
     }
 
     @Test
@@ -142,27 +132,56 @@ public class QueryPlannerTest {
         stmtExecutor0.execute();
 
         String addBlackListSql = "add sqlblacklist \"select k1 from .+\"";
-        List<StatementBase> stmts = UtFrameUtils.parseAndAnalyzeStmts(addBlackListSql, connectContext);
-
-        String sql = "select k1 from test.baseall";
-        StmtExecutor stmtExecutor1 = new StmtExecutor(connectContext, sql);
+        StmtExecutor stmtExecutor1 = new StmtExecutor(connectContext, addBlackListSql);
         stmtExecutor1.execute();
 
-        String showBlackListSql = "show sqlblacklist";
-        StmtExecutor stmtExecutor2 = new StmtExecutor(connectContext, showBlackListSql);
-        stmtExecutor2.execute();
+        Assert.assertEquals(SqlBlackList.getInstance().sqlBlackListMap.entrySet().size(), 1);
+        long id = -1;
+        for (Map.Entry<String, BlackListSql> entry : SqlBlackList.getInstance().sqlBlackListMap.entrySet()) {
+            id = entry.getValue().id;
+            Assert.assertEquals("select k1 from .+", entry.getKey());
+        }
 
-        String deleteBlackListSql = "delete sqlblacklist 0";
+        String sql = "select k1 from test.baseall";
+        StatementBase statement = SqlParser.parse(sql, connectContext.getSessionVariable().getSqlMode()).get(0);
+        StmtExecutor stmtExecutor2 = new StmtExecutor(connectContext, statement);
+        stmtExecutor2.execute();
+        Assert.assertEquals("Access denied; This sql is in blacklist, please contact your admin",
+                connectContext.getState().getErrorMessage());
+
+        String deleteBlackListSql = "delete sqlblacklist " + String.valueOf(id);
         StmtExecutor stmtExecutor3 = new StmtExecutor(connectContext, deleteBlackListSql);
         stmtExecutor3.execute();
+        Assert.assertEquals(0, SqlBlackList.getInstance().sqlBlackListMap.entrySet().size());
     }
 
     @Test
-    public void testCreateView() throws Exception {
-        String sql = "create view view_test (dt) as select k10 from baseall where " +
-                "k10 = ( SELECT max(b.k3) FROM baseall as b );";
-        StmtExecutor stmtExecutor0 = new StmtExecutor(connectContext, sql);
+    public void testSqlBlackListUseWhere() throws Exception {
+        String setEnableSqlBlacklist = "admin set frontend config (\"enable_sql_blacklist\" = \"true\")";
+        StmtExecutor stmtExecutor0 = new StmtExecutor(connectContext, setEnableSqlBlacklist);
         stmtExecutor0.execute();
-        Assert.assertNotSame(connectContext.getState().getStateType(), MysqlStateType.ERR);
+
+        String addBlackListSql = "add sqlblacklist \"((?!where).)*\"";
+        StmtExecutor stmtExecutor1 = new StmtExecutor(connectContext, addBlackListSql);
+        stmtExecutor1.execute();
+
+        Assert.assertEquals(SqlBlackList.getInstance().sqlBlackListMap.entrySet().size(), 1);
+        long id = -1;
+        for (Map.Entry<String, BlackListSql> entry : SqlBlackList.getInstance().sqlBlackListMap.entrySet()) {
+            id = entry.getValue().id;
+            Assert.assertEquals("((?!where).)*", entry.getKey());
+        }
+
+        String sql = "select k1 from test.baseall where k1 > 0";
+        StatementBase statementBase = SqlParser.parse(sql, connectContext.getSessionVariable().getSqlMode()).get(0);
+        StmtExecutor stmtExecutor2 = new StmtExecutor(connectContext, statementBase);
+        stmtExecutor2.execute();
+        Assert.assertEquals("Access denied; This sql is in blacklist, please contact your admin",
+                connectContext.getState().getErrorMessage());
+
+        String deleteBlackListSql = "delete sqlblacklist " + String.valueOf(id);
+        StmtExecutor stmtExecutor3 = new StmtExecutor(connectContext, deleteBlackListSql);
+        stmtExecutor3.execute();
+        Assert.assertEquals(0, SqlBlackList.getInstance().sqlBlackListMap.entrySet().size());
     }
 }

@@ -21,6 +21,7 @@
 
 package com.starrocks.qe;
 
+
 import java.io.Serializable;
 
 public class QueryDetail implements Serializable {
@@ -30,8 +31,6 @@ public class QueryDetail implements Serializable {
         FAILED,
         CANCELLED
     }
-
-    ;
 
     // When query received, FE will construct a QueryDetail
     // object. This object will set queryId, startTime, sql
@@ -59,13 +58,14 @@ public class QueryDetail implements Serializable {
     private String errorMessage;
     private String explain;
     private String profile;
+    private String workGroupName;
 
     public QueryDetail() {
     }
 
     public QueryDetail(String queryId, boolean isQuery, int connId, String remoteIP,
                        long startTime, long endTime, long latency, QueryMemState state,
-                       String database, String sql, String user) {
+                       String database, String sql, String user, String workGroupName) {
         this.queryId = queryId;
         this.isQuery = isQuery;
         this.connId = connId;
@@ -78,7 +78,11 @@ public class QueryDetail implements Serializable {
             this.database = "";
         } else {
             String[] stringPieces = database.split(":", -1);
-            this.database = stringPieces[1]; // eliminate cluster name
+            if (stringPieces.length == 1) {
+                this.database = stringPieces[0];
+            } else {
+                this.database = stringPieces[1]; // eliminate cluster name
+            }
         }
         this.sql = sql;
         this.user = user;
@@ -214,5 +218,13 @@ public class QueryDetail implements Serializable {
 
     public void setProfile(String profile) {
         this.profile = profile;
+    }
+
+    public String getWorkGroupName() {
+        return workGroupName;
+    }
+
+    public void setWorkGroupName(String workGroupName) {
+        this.workGroupName = workGroupName;
     }
 }

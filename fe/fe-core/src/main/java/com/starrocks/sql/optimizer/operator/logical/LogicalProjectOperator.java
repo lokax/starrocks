@@ -1,11 +1,11 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.operator.logical;
 
-import com.google.common.collect.Maps;
 import com.starrocks.sql.optimizer.ExpressionContext;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptExpressionVisitor;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
+import com.starrocks.sql.optimizer.operator.Operator;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.OperatorVisitor;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
@@ -15,28 +15,21 @@ import java.util.Map;
 import java.util.Objects;
 
 public final class LogicalProjectOperator extends LogicalOperator {
-    private Map<ColumnRefOperator, ScalarOperator> columnRefMap;
-    // Used for common operator compute result reuse, we need to compute
-    // common sub operators firstly in BE
-    private final Map<ColumnRefOperator, ScalarOperator> commonSubOperatorMap =
-            Maps.newHashMap();
+    private final Map<ColumnRefOperator, ScalarOperator> columnRefMap;
 
     public LogicalProjectOperator(Map<ColumnRefOperator, ScalarOperator> columnRefMap) {
         super(OperatorType.LOGICAL_PROJECT);
         this.columnRefMap = columnRefMap;
     }
 
+    public LogicalProjectOperator(Map<ColumnRefOperator, ScalarOperator> columnRefMap, long limit) {
+        super(OperatorType.LOGICAL_PROJECT);
+        this.columnRefMap = columnRefMap;
+        this.limit = limit;
+    }
+
     public Map<ColumnRefOperator, ScalarOperator> getColumnRefMap() {
         return columnRefMap;
-    }
-
-    public Map<ColumnRefOperator, ScalarOperator> getCommonSubOperatorMap() {
-        return commonSubOperatorMap;
-    }
-
-    // Could only use when rewrite
-    public void setColumnRefMap(Map<ColumnRefOperator, ScalarOperator> columnRefMap) {
-        this.columnRefMap = columnRefMap;
     }
 
     @Override
@@ -79,5 +72,26 @@ public final class LogicalProjectOperator extends LogicalOperator {
     @Override
     public <R, C> R accept(OptExpressionVisitor<R, C> visitor, OptExpression optExpression, C context) {
         return visitor.visitLogicalProject(optExpression, context);
+    }
+
+    public static class Builder extends Operator.Builder<LogicalProjectOperator, LogicalProjectOperator.Builder> {
+        private Map<ColumnRefOperator, ScalarOperator> columnRefMap;
+
+        @Override
+        public Builder withOperator(LogicalProjectOperator operator) {
+            super.withOperator(operator);
+            this.columnRefMap = operator.getColumnRefMap();
+            return this;
+        }
+
+        public Builder setColumnRefMap(Map<ColumnRefOperator, ScalarOperator> columnRefMap) {
+            this.columnRefMap = columnRefMap;
+            return this;
+        }
+
+        @Override
+        public LogicalProjectOperator build() {
+            return new LogicalProjectOperator(columnRefMap, this.limit);
+        }
     }
 }

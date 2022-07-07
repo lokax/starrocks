@@ -1,42 +1,20 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/in_predicate.h"
 
 #include "common/object_pool.h"
 #include "exprs/vectorized/in_const_predicate.hpp"
-#include "exprs/vectorized/in_iterator_predicate.hpp"
+#include "runtime/primitive_type.h"
+#include "runtime/primitive_type_infra.h"
 
-namespace starrocks {
-namespace vectorized {
+namespace starrocks::vectorized {
 
-#define CASE_TYPE(TYPE, CLASS)        \
-    case TYPE: {                      \
-        return new CLASS<TYPE>(node); \
+struct InConstPredicateBuilder {
+    template <PrimitiveType ptype>
+    Expr* operator()(const TExprNode& node) {
+        return new VectorizedInConstPredicate<ptype>(node);
     }
-
-#define SWITCH_ALL_TYPE(CLASS)                                                             \
-    switch (child_type) {                                                                  \
-        CASE_TYPE(TYPE_NULL, CLASS);                                                       \
-        CASE_TYPE(TYPE_BOOLEAN, CLASS);                                                    \
-        CASE_TYPE(TYPE_TINYINT, CLASS);                                                    \
-        CASE_TYPE(TYPE_SMALLINT, CLASS);                                                   \
-        CASE_TYPE(TYPE_INT, CLASS);                                                        \
-        CASE_TYPE(TYPE_BIGINT, CLASS);                                                     \
-        CASE_TYPE(TYPE_FLOAT, CLASS);                                                      \
-        CASE_TYPE(TYPE_DOUBLE, CLASS);                                                     \
-        CASE_TYPE(TYPE_DATE, CLASS);                                                       \
-        CASE_TYPE(TYPE_DATETIME, CLASS);                                                   \
-        CASE_TYPE(TYPE_DECIMALV2, CLASS);                                                  \
-        CASE_TYPE(TYPE_LARGEINT, CLASS);                                                   \
-        CASE_TYPE(TYPE_CHAR, CLASS);                                                       \
-        CASE_TYPE(TYPE_VARCHAR, CLASS);                                                    \
-        CASE_TYPE(TYPE_DECIMAL32, CLASS);                                                  \
-        CASE_TYPE(TYPE_DECIMAL64, CLASS);                                                  \
-        CASE_TYPE(TYPE_DECIMAL128, CLASS);                                                 \
-    default:                                                                               \
-        LOG(WARNING) << "vectorized engine in predicate not support type: " << child_type; \
-        return nullptr;                                                                    \
-    }
+};
 
 Expr* VectorizedInPredicateFactory::from_thrift(const TExprNode& node) {
     // children type
@@ -48,14 +26,11 @@ Expr* VectorizedInPredicateFactory::from_thrift(const TExprNode& node) {
 
     switch (node.opcode) {
     case TExprOpcode::FILTER_IN:
-    case TExprOpcode::FILTER_NOT_IN: {
-        SWITCH_ALL_TYPE(VectorizedInConstPredicate);
-    }
+    case TExprOpcode::FILTER_NOT_IN:
+        return type_dispatch_basic(child_type, InConstPredicateBuilder(), node);
     case TExprOpcode::FILTER_NEW_IN:
-    case TExprOpcode::FILTER_NEW_NOT_IN: {
-        SWITCH_ALL_TYPE(VectorizedInIteratorPredicate);
-    }
-
+    case TExprOpcode::FILTER_NEW_NOT_IN:
+        // NOTE: These two opcode are deprecated
     default:
         LOG(WARNING) << "vectorized engine in predicate not support: " << node.opcode;
         return nullptr;
@@ -64,8 +39,4 @@ Expr* VectorizedInPredicateFactory::from_thrift(const TExprNode& node) {
     return nullptr;
 }
 
-#undef SWITCH_ALL_TYPE
-#undef CASE_TYPE
-
-} // namespace vectorized
-} // namespace starrocks
+} // namespace starrocks::vectorized

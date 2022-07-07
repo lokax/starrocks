@@ -19,22 +19,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_RUNTIME_DATA_STREAM_RECVR_H
-#define STARROCKS_BE_SRC_RUNTIME_DATA_STREAM_RECVR_H
+#pragma once
 
 #include "column/vectorized_fwd.h"
 #include "common/object_pool.h"
 #include "common/status.h"
 #include "gen_cpp/Types_types.h" // for TUniqueId
 #include "runtime/descriptors.h"
+#include "runtime/local_pass_through_buffer.h"
 #include "runtime/query_statistics.h"
-#include "util/tuple_row_compare.h"
+#include "util/runtime_profile.h"
 
-namespace google {
-namespace protobuf {
+namespace google::protobuf {
 class Closure;
-}
-} // namespace google
+} // namespace google::protobuf
 
 namespace starrocks {
 
@@ -43,12 +41,10 @@ class SortedChunksMerger;
 }
 
 class DataStreamMgr;
-class SortedRunMerger;
 class MemTracker;
-class RowBatch;
 class RuntimeProfile;
-class PRowBatch;
 class PTransmitChunkParams;
+class SortExecExprs;
 
 // Single receiver of an m:n data stream.
 // DataStreamRecvr maintains one or more queues of row batches received by a
@@ -76,17 +72,13 @@ class PTransmitChunkParams;
 // recvr instance from the tracking structure of its DataStreamMgr in all cases.
 class DataStreamRecvr {
 public:
+    const static int32_t INVALID_DOP_FOR_NON_PIPELINE_LEVEL_SHUFFLE = 0;
+
+public:
     ~DataStreamRecvr();
 
-    // Returns next row batch in data stream; blocks if there aren't any.
-    // Retains ownership of the returned batch. The caller must acquire data from the
-    // returned batch before the next call to get_batch(). A NULL returned batch indicated
-    // eos. Must only be called if _is_merging is false.
-    // TODO: This is currently only exposed to the non-merging version of the exchange.
-    // Refactor so both merging and non-merging exchange use get_next(RowBatch*, bool* eos).
-    Status get_batch(RowBatch** next_batch);
-
     Status get_chunk(std::unique_ptr<vectorized::Chunk>* chunk);
+    Status get_chunk_for_pipeline(std::unique_ptr<vectorized::Chunk>* chunk, const int32_t driver_sequence);
 
     // Deregister from DataStreamMgr instance, which shares ownership of this instance.
     void close();
@@ -94,44 +86,41 @@ public:
     // Create a SortedRunMerger instance to merge rows from multiple sender according to the
     // specified row comparator. Fetches the first batches from the individual sender
     // queues. The exprs used in less_than must have already been prepared and opened.
-    Status create_merger(const TupleRowComparator& less_than);
-    Status create_merger(const SortExecExprs* exprs, const std::vector<bool>* is_asc,
+    Status create_merger(RuntimeState* state, const SortExecExprs* exprs, const std::vector<bool>* is_asc,
                          const std::vector<bool>* is_null_first);
+    Status create_merger_for_pipeline(RuntimeState* state, const SortExecExprs* exprs, const std::vector<bool>* is_asc,
+                                      const std::vector<bool>* is_null_first);
 
     // Fill output_batch with the next batch of rows obtained by merging the per-sender
     // input streams. Must only be called if _is_merging is true.
-    Status get_next(RowBatch* output_batch, bool* eos);
     Status get_next(vectorized::ChunkPtr* chunk, bool* eos);
-
-    // Transfer all resources from the current batches being processed from each sender
-    // queue to the specified batch.
-    void transfer_all_resources(RowBatch* transfer_batch);
+    Status get_next_for_pipeline(vectorized::ChunkPtr* chunk, std::atomic<bool>* eos, bool* should_exit);
 
     const TUniqueId& fragment_instance_id() const { return _fragment_instance_id; }
     PlanNodeId dest_node_id() const { return _dest_node_id; }
     const RowDescriptor& row_desc() const { return _row_desc; }
-    MemTracker* mem_tracker() const { return _mem_tracker.get(); }
 
     void add_sub_plan_statistics(const PQueryStatistics& statistics, int sender_id) {
         _sub_plan_query_statistics_recvr->insert(statistics, sender_id);
     }
 
-    bool has_output() const;
+    void short_circuit_for_pipeline(const int32_t driver_sequence);
+
+    bool has_output_for_pipeline(const int32_t driver_sequence) const;
 
     bool is_finished() const;
+
+    bool is_data_ready();
 
 private:
     friend class DataStreamMgr;
     class SenderQueue;
 
-    DataStreamRecvr(DataStreamMgr* stream_mgr, MemTracker* parent_tracker, const RowDescriptor& row_desc,
+    DataStreamRecvr(DataStreamMgr* stream_mgr, RuntimeState* runtime_state, const RowDescriptor& row_desc,
                     const TUniqueId& fragment_instance_id, PlanNodeId dest_node_id, int num_senders, bool is_merging,
                     int total_buffer_limit, std::shared_ptr<RuntimeProfile> profile,
-                    std::shared_ptr<QueryStatisticsRecvr> sub_plan_query_statistics_recvr);
-
-    // If receive queue is full, done is enqueue pending, and return with *done is nullptr
-    void add_batch(const PRowBatch& batch, int sender_id, int be_number, int64_t packet_seq,
-                   ::google::protobuf::Closure** done);
+                    std::shared_ptr<QueryStatisticsRecvr> sub_plan_query_statistics_recvr, bool is_pipeline,
+                    int32_t degree_of_parallelism, bool keep_order, PassThroughChunkBuffer* pass_through_chunk_buffer);
 
     // If receive queue is full, done is enqueue pending, and return with *done is nullptr
     Status add_chunks(const PTransmitChunkParams& request, ::google::protobuf::Closure** done);
@@ -143,9 +132,9 @@ private:
     // Empties the sender queues and notifies all waiting consumers of cancellation.
     void cancel_stream();
 
-    // Return true if the addition of a new batch of size 'batch_size' would exceed the
+    // Return true if the addition of a new batch of size 'chunk_size' would exceed the
     // total buffer limit.
-    bool exceeds_limit(int batch_size) { return _num_buffered_bytes + batch_size > _total_buffer_limit; }
+    bool exceeds_limit(int chunk_size) { return _num_buffered_bytes + chunk_size > _total_buffer_limit; }
 
     // DataStreamMgr instance used to create this recvr. (Not owned)
     DataStreamMgr* _mgr;
@@ -169,17 +158,12 @@ private:
     // total number of bytes held across all sender queues.
     std::atomic<int> _num_buffered_bytes{0};
 
-    // Memtracker for batches in the sender queue(s).
-    std::unique_ptr<MemTracker> _mem_tracker;
-
     // One or more queues of row batches received from senders. If _is_merging is true,
     // there is one SenderQueue for each sender. Otherwise, row batches from all senders
     // are placed in the same SenderQueue. The SenderQueue instances are owned by the
     // receiver and placed in _sender_queue_pool.
     std::vector<SenderQueue*> _sender_queues;
 
-    // SortedRunMerger used to merge rows from different senders.
-    std::unique_ptr<SortedRunMerger> _merger;
     // vectorized::SortedChunksMerger merges chunks from different senders.
     std::unique_ptr<vectorized::SortedChunksMerger> _chunks_merger;
 
@@ -189,37 +173,39 @@ private:
     // Runtime profile storing the counters below.
     std::shared_ptr<RuntimeProfile> _profile;
 
+    // instance profile and mem_tracker
+    std::shared_ptr<RuntimeProfile> _instance_profile;
+    std::shared_ptr<MemTracker> _query_mem_tracker;
+    std::shared_ptr<MemTracker> _instance_mem_tracker;
+
     // Number of bytes received
     RuntimeProfile::Counter* _bytes_received_counter;
+    RuntimeProfile::Counter* _bytes_pass_through_counter;
 
     // Time series of number of bytes received, samples _bytes_received_counter
     // RuntimeProfile::TimeSeriesCounter* _bytes_received_time_series_counter;
-    RuntimeProfile::Counter* _deserialize_chunk_meta_timer;
-    RuntimeProfile::Counter* _deserialize_row_batch_timer;
-    RuntimeProfile::Counter* _decompress_row_batch_timer;
+    RuntimeProfile::Counter* _deserialize_chunk_timer;
+    RuntimeProfile::Counter* _decompress_chunk_timer;
     RuntimeProfile::Counter* _request_received_counter;
 
-    // Time spent waiting until the first batch arrives across all queues.
-    // TODO: Turn this into a wall-clock timer.
-    RuntimeProfile::Counter* _first_batch_wait_total_timer;
+    RuntimeProfile::Counter* _process_total_timer = nullptr;
 
     // Total spent for senders putting data in the queue
+    // TODO(hcf) remove these two metrics after non-pipeline offlined
     RuntimeProfile::Counter* _sender_total_timer = nullptr;
     RuntimeProfile::Counter* _sender_wait_lock_timer = nullptr;
 
-    // Total time (summed across all threads) spent waiting for the
-    // recv buffer to be drained so that new batches can be
-    // added. Remote plan fragments are blocked for the same amount of
-    // time.
-    RuntimeProfile::Counter* _buffer_full_total_timer;
-
     // Sub plan query statistics receiver.
     std::shared_ptr<QueryStatisticsRecvr> _sub_plan_query_statistics_recvr;
+    bool _is_pipeline;
+    // Invalid if _is_pipeline is false
+    int32_t _degree_of_parallelism;
 
-    // Total time spent waiting for data to arrive in the recv buffer
-    RuntimeProfile::Counter* _data_arrival_timer;
+    // Invalid if _is_pipeline is false
+    // Pipeline will send packets out-of-order
+    // if _keep_order is set to true, then receiver will keep the order according sequence
+    bool _keep_order;
+    PassThroughContext _pass_through_context;
 };
 
 } // end namespace starrocks
-
-#endif // end STARROCKS_BE_SRC_RUNTIME_DATA_STREAM_RECVR_H

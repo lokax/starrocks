@@ -1,6 +1,8 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "column/array_column.h"
+
+#include <cstdint>
 
 #include "column/column_helper.h"
 #include "column/fixed_length_column.h"
@@ -10,6 +12,13 @@
 #include "util/mysql_row_buffer.h"
 
 namespace starrocks::vectorized {
+
+void ArrayColumn::check_or_die() const {
+    CHECK_EQ(_offsets->get_data().back(), _elements->size());
+    DCHECK(_elements->is_nullable());
+    _offsets->check_or_die();
+    _elements->check_or_die();
+}
 
 ArrayColumn::ArrayColumn(ColumnPtr elements, UInt32Column::Ptr offsets)
         : _elements(std::move(elements)), _offsets(std::move(offsets)) {
@@ -22,6 +31,10 @@ size_t ArrayColumn::size() const {
     return _offsets->size() - 1;
 }
 
+size_t ArrayColumn::capacity() const {
+    return _offsets->capacity() - 1;
+}
+
 const uint8_t* ArrayColumn::raw_data() const {
     return _elements->raw_data();
 }
@@ -32,7 +45,8 @@ uint8_t* ArrayColumn::mutable_raw_data() {
 
 size_t ArrayColumn::byte_size(size_t from, size_t size) const {
     DCHECK_LE(from + size, this->size()) << "Range error";
-    return _elements->byte_size(_offsets->get_data()[from], _offsets->get_data()[from + size]) +
+    return _elements->byte_size(_offsets->get_data()[from],
+                                _offsets->get_data()[from + size] - _offsets->get_data()[from]) +
            _offsets->Column::byte_size(from, size);
 }
 
@@ -117,6 +131,61 @@ void ArrayColumn::append_default(size_t count) {
     _offsets->append_value_multiple_times(&offset, count);
 }
 
+void ArrayColumn::fill_default(const Filter& filter) {
+    std::vector<uint32_t> indexes;
+    for (size_t i = 0; i < filter.size(); i++) {
+        if (filter[i] == 1 && get_element_size(i) > 0) {
+            indexes.push_back(i);
+        }
+    }
+    auto default_column = clone_empty();
+    default_column->append_default(indexes.size());
+    update_rows(*default_column, indexes.data());
+}
+
+Status ArrayColumn::update_rows(const Column& src, const uint32_t* indexes) {
+    const auto& array_column = down_cast<const ArrayColumn&>(src);
+
+    const UInt32Column& src_offsets = array_column.offsets();
+    size_t replace_num = src.size();
+    bool need_resize = false;
+    for (size_t i = 0; i < replace_num; ++i) {
+        if (_offsets->get_data()[indexes[i] + 1] - _offsets->get_data()[indexes[i]] !=
+            src_offsets.get_data()[i + 1] - src_offsets.get_data()[i]) {
+            need_resize = true;
+            break;
+        }
+    }
+
+    if (!need_resize) {
+        Buffer<uint32_t> element_idxes;
+        for (size_t i = 0; i < replace_num; ++i) {
+            size_t element_count = src_offsets.get_data()[i + 1] - src_offsets.get_data()[i];
+            size_t element_offset = _offsets->get_data()[indexes[i]];
+            for (size_t j = 0; j < element_count; j++) {
+                element_idxes.emplace_back(element_offset + j);
+            }
+        }
+        RETURN_IF_ERROR(_elements->update_rows(array_column.elements(), element_idxes.data()));
+    } else {
+        MutableColumnPtr new_array_column = clone_empty();
+        size_t idx_begin = 0;
+        for (size_t i = 0; i < replace_num; ++i) {
+            size_t count = indexes[i] - idx_begin;
+            new_array_column->append(*this, idx_begin, count);
+            new_array_column->append(src, i, 1);
+            idx_begin = indexes[i] + 1;
+        }
+        int32_t remain_count = _offsets->size() - idx_begin - 1;
+        if (remain_count > 0) {
+            new_array_column->append(*this, idx_begin, remain_count);
+        }
+        swap_column(*new_array_column.get());
+    }
+
+    return Status::OK();
+}
+
 uint32_t ArrayColumn::serialize(size_t idx, uint8_t* pos) {
     uint32_t offset = _offsets->get_data()[idx];
     uint32_t array_size = _offsets->get_data()[idx + 1] - offset;
@@ -175,27 +244,11 @@ void ArrayColumn::serialize_batch(uint8_t* dst, Buffer<uint32_t>& slice_sizes, s
     }
 }
 
-void ArrayColumn::deserialize_and_append_batch(std::vector<Slice>& srcs, size_t batch_size) {
-    reserve(batch_size);
-    for (size_t i = 0; i < batch_size; ++i) {
+void ArrayColumn::deserialize_and_append_batch(Buffer<Slice>& srcs, size_t chunk_size) {
+    reserve(chunk_size);
+    for (size_t i = 0; i < chunk_size; ++i) {
         srcs[i].data = (char*)deserialize_and_append((uint8_t*)srcs[i].data);
     }
-}
-
-size_t ArrayColumn::serialize_size() const {
-    return _offsets->serialize_size() + _elements->serialize_size();
-}
-
-uint8_t* ArrayColumn::serialize_column(uint8_t* dst) {
-    dst = _offsets->serialize_column(dst);
-    dst = _elements->serialize_column(dst);
-    return dst;
-}
-
-const uint8_t* ArrayColumn::deserialize_column(const uint8_t* src) {
-    src = _offsets->deserialize_column(src);
-    src = _elements->deserialize_column(src);
-    return src;
 }
 
 MutableColumnPtr ArrayColumn::clone_empty() const {
@@ -305,14 +358,57 @@ int ArrayColumn::compare_at(size_t left, size_t right, const Column& right_colum
     return lhs_size < rhs_size ? -1 : (lhs_size == rhs_size ? 0 : 1);
 }
 
-void ArrayColumn::fvn_hash(uint32_t* seed, uint16_t from, uint16_t to) const {
-    // TODO: only used in shuffle.
-    DCHECK(false) << "If you use array element as join column, it should be implemented";
+void ArrayColumn::fnv_hash_at(uint32_t* hash, int32_t idx) const {
+    DCHECK_LT(idx + 1, _offsets->size()) << "idx + 1 should be less than offsets size";
+    size_t offset = _offsets->get_data()[idx];
+    size_t array_size = _offsets->get_data()[idx + 1] - offset;
+
+    *hash = HashUtil::fnv_hash(&array_size, sizeof(array_size), *hash);
+    for (size_t i = 0; i < array_size; ++i) {
+        uint32_t ele_offset = offset + i;
+        _elements->fnv_hash_at(hash, ele_offset);
+    }
 }
 
-void ArrayColumn::crc32_hash(uint32_t* seed, uint16_t from, uint16_t to) const {
-    // TODO: only used in shuffle.
-    DCHECK(false) << "If you use array element as join column, it should be implemented";
+void ArrayColumn::crc32_hash_at(uint32_t* hash, int32_t idx) const {
+    DCHECK_LT(idx + 1, _offsets->size()) << "idx + 1 should be less than offsets size";
+    size_t offset = _offsets->get_data()[idx];
+    size_t array_size = _offsets->get_data()[idx + 1] - offset;
+
+    *hash = HashUtil::zlib_crc_hash(&array_size, sizeof(array_size), *hash);
+    for (size_t i = 0; i < array_size; ++i) {
+        uint32_t ele_offset = offset + i;
+        _elements->crc32_hash_at(hash, ele_offset);
+    }
+}
+
+// TODO: fnv_hash and crc32_hash in array column may has performance problem
+// We need to make it possible in the future to provide vistor interface to iterator data
+// as much as possible
+
+void ArrayColumn::fnv_hash(uint32_t* hash, uint32_t from, uint32_t to) const {
+    for (uint32_t i = from; i < to; ++i) {
+        fnv_hash_at(hash + i, i);
+    }
+}
+
+void ArrayColumn::crc32_hash(uint32_t* hash, uint32_t from, uint32_t to) const {
+    for (uint32_t i = from; i < to; ++i) {
+        crc32_hash_at(hash + i, i);
+    }
+}
+
+int64_t ArrayColumn::xor_checksum(uint32_t from, uint32_t to) const {
+    // The XOR of ArrayColumn
+    // XOR the offsets column and elements column
+    int64_t xor_checksum = 0;
+    for (size_t idx = from; idx < to; ++idx) {
+        int64_t array_size = _offsets->get_data()[idx + 1] - _offsets->get_data()[idx];
+        xor_checksum ^= array_size;
+    }
+    uint32_t element_from = _offsets->get_data()[from];
+    uint32_t element_to = _offsets->get_data()[to];
+    return (xor_checksum ^ _elements->xor_checksum(element_from, element_to));
 }
 
 void ArrayColumn::put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx) const {
@@ -342,6 +438,11 @@ Datum ArrayColumn::get(size_t idx) const {
         res[i] = _elements->get(offset + i);
     }
     return Datum(res);
+}
+
+size_t ArrayColumn::get_element_size(size_t idx) const {
+    DCHECK_LT(idx + 1, _offsets->size());
+    return _offsets->get_data()[idx + 1] - _offsets->get_data()[idx];
 }
 
 bool ArrayColumn::set_null(size_t idx) {
@@ -408,6 +509,18 @@ std::string ArrayColumn::debug_string() const {
         ss << debug_item(i);
     }
     return ss.str();
+}
+
+StatusOr<ColumnPtr> ArrayColumn::upgrade_if_overflow() {
+    if (_offsets->size() > Column::MAX_CAPACITY_LIMIT) {
+        return Status::InternalError("Size of ArrayColumn exceed the limit");
+    }
+
+    return upgrade_helper_func(&_elements);
+}
+
+StatusOr<ColumnPtr> ArrayColumn::downgrade() {
+    return downgrade_helper_func(&_elements);
 }
 
 } // namespace starrocks::vectorized

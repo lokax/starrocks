@@ -19,8 +19,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_COMMON_UTIL_CIDR_H
-#define STARROCKS_BE_SRC_COMMON_UTIL_CIDR_H
+#pragma once
 
 #include <string>
 
@@ -33,15 +32,13 @@ public:
     void reset();
     bool reset(const std::string& cidr_str);
     bool contains(const std::string& ip);
+    static bool ip_to_int(const std::string& ip_str, uint32_t* value);
 
 private:
-    bool ip_to_int(const std::string& ip_str, uint32_t* value);
     bool contains(uint32_t ip_int);
 
-    uint32_t _address;
-    uint32_t _netmask;
+    uint32_t _address{0};
+    uint32_t _netmask{0xffffffff};
 };
 
 } // end namespace starrocks
-
-#endif // STARROCKS_BE_SRC_COMMON_UTIL_CIDR_H

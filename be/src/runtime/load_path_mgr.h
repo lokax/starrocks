@@ -19,11 +19,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_RUNTIME_LOAD_PATH_MGR_H
-#define STARROCKS_BE_SRC_RUNTIME_LOAD_PATH_MGR_H
+#pragma once
 
 #include <pthread.h>
 
+#include <future>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -41,7 +41,7 @@ class LoadPathMgr {
 public:
     LoadPathMgr(ExecEnv* env);
 
-    ~LoadPathMgr() {}
+    ~LoadPathMgr();
 
     Status init();
 
@@ -49,8 +49,7 @@ public:
 
     void get_load_data_path(std::vector<std::string>* data_paths);
 
-    Status get_load_error_file_name(const std::string& db, const std::string& label,
-                                    const TUniqueId& fragment_instance_id, std::string* error_path);
+    Status get_load_error_file_name(const TUniqueId& fragment_instance_id, std::string* error_path);
     std::string get_load_error_absolute_path(const std::string& file_path);
     const std::string& get_load_error_file_dir() const { return _error_log_dir; }
 
@@ -60,19 +59,18 @@ private:
     void clean_error_log();
     void clean();
     void process_path(time_t now, const std::string& path, int64_t reserve_hours);
-
+    std::future<bool>& stop_future() { return _stop_future; }
     static void* cleaner(void* param);
 
     ExecEnv* _exec_env;
     std::mutex _lock;
     std::vector<std::string> _path_vec;
+    std::promise<bool> _stop;
+    std::future<bool> _stop_future;
     int _idx;
     pthread_t _cleaner_id = 0;
     std::string _error_log_dir;
     uint32_t _next_shard;
-    uint32_t _error_path_next_shard;
 };
 
 } // namespace starrocks
-
-#endif

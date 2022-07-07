@@ -1,7 +1,6 @@
 // Copyright 2008 Google Inc.  All rights reserved.
 
-#include <string.h>
-
+#include <cstring>
 #include <string>
 using std::string;
 
@@ -9,8 +8,7 @@ using std::string;
 #include "gutil/strings/numbers.h"
 #include "gutil/strings/stringpiece.h"
 
-#ifndef STRINGS_SUBSTITUTE_H_
-#define STRINGS_SUBSTITUTE_H_
+#pragma once
 
 namespace strings {
 
@@ -74,7 +72,7 @@ public:
     // overload const string& as well, since this allows us to avoid a temporary
     // object.
     inline SubstituteArg(const char* value) // NOLINT(runtime/explicit)
-            : text_(value), size_(value == NULL ? 0 : strlen(text_)) {}
+            : text_(value), size_(value == nullptr ? 0 : strlen(text_)) {}
     inline SubstituteArg(const string& value) // NOLINT(runtime/explicit)
             : text_(value.data()), size_(value.size()) {}
     inline SubstituteArg(const StringPiece& value) // NOLINT(runtime/explicit)
@@ -134,10 +132,10 @@ public:
     static const SubstituteArg NoArg;
 
 private:
-    inline SubstituteArg() : text_(NULL), size_(-1) {}
+    inline SubstituteArg() {}
 
-    const char* text_;
-    int size_;
+    const char* text_{nullptr};
+    int size_{-1};
     char scratch_[kFastToBufferSize];
 };
 
@@ -181,5 +179,3 @@ inline string Substitute(StringPiece format, const internal::SubstituteArg& arg0
 }
 
 } // namespace strings
-
-#endif // STRINGS_SUBSTITUTE_H_

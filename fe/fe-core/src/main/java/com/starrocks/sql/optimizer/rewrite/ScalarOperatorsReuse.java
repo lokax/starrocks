@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rewrite;
 
@@ -8,6 +8,7 @@ import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CaseWhenOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CastOperator;
+import com.starrocks.sql.optimizer.operator.scalar.CloneOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CompoundPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ExistsPredicateOperator;
@@ -187,6 +188,12 @@ public class ScalarOperatorsReuse {
                     predicate.getChildren().stream().map(argument -> argument.accept(this, null))
                             .toArray(ScalarOperator[]::new));
             return tryRewrite(operator);
+        }
+
+        @Override
+        public ScalarOperator visitCloneOperator(CloneOperator operator, Void context) {
+            ScalarOperator clone = new CloneOperator(operator.getChild(0).accept(this, null));
+            return tryRewrite(clone);
         }
     }
 

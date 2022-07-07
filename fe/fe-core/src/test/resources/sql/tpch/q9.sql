@@ -34,15 +34,15 @@ order by
 [result]
 TOP-N (order by [[53: N_NAME ASC NULLS FIRST, 57: year DESC NULLS LAST]])
     TOP-N (order by [[53: N_NAME ASC NULLS FIRST, 57: year DESC NULLS LAST]])
-        AGGREGATE ([GLOBAL] aggregate [{59: sum(58: expr)=sum(59: sum(58: expr))}] group by [[53: N_NAME, 57: year]] having [null]
+        AGGREGATE ([GLOBAL] aggregate [{59: sum=sum(59: sum)}] group by [[53: N_NAME, 57: year]] having [null]
             EXCHANGE SHUFFLE[53, 57]
-                AGGREGATE ([LOCAL] aggregate [{59: sum(58: expr)=sum(58: expr)}] group by [[53: N_NAME, 57: year]] having [null]
+                AGGREGATE ([LOCAL] aggregate [{59: sum=sum(58: expr)}] group by [[53: N_NAME, 57: year]] having [null]
                     INNER JOIN (join-predicate [37: PS_SUPPKEY = 21: L_SUPPKEY AND 36: PS_PARTKEY = 20: L_PARTKEY] post-join-predicate [null])
                         SCAN (columns[36: PS_PARTKEY, 37: PS_SUPPKEY, 39: PS_SUPPLYCOST] predicate[null])
                         EXCHANGE BROADCAST
                             INNER JOIN (join-predicate [52: N_NATIONKEY = 14: S_NATIONKEY] post-join-predicate [null])
                                 SCAN (columns[52: N_NATIONKEY, 53: N_NAME] predicate[null])
-                                EXCHANGE BROADCAST
+                                EXCHANGE SHUFFLE[14]
                                     INNER JOIN (join-predicate [11: S_SUPPKEY = 21: L_SUPPKEY] post-join-predicate [null])
                                         SCAN (columns[11: S_SUPPKEY, 14: S_NATIONKEY] predicate[null])
                                         EXCHANGE SHUFFLE[21]

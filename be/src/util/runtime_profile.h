@@ -19,16 +19,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_COMMON_UTIL_RUNTIME_PROFILE_H
-#define STARROCKS_BE_SRC_COMMON_UTIL_RUNTIME_PROFILE_H
+#pragma once
 
 #include <sys/resource.h>
 #include <sys/time.h> // NOLINT
 
 #include <atomic>
-#include <boost/thread/thread.hpp>
 #include <functional>
 #include <iostream>
+#include <thread>
+#include <unordered_set>
 #include <utility>
 
 #include "common/compiler_util.h"
@@ -258,6 +258,8 @@ public:
 
     RuntimeProfile* parent() const { return _parent; }
 
+    void reset_parent() { _parent = nullptr; }
+
     // Adds a child profile.  This is thread safe.
     // 'indent' indicates whether the child will be printed w/ extra indentation
     // relative to the parent.
@@ -273,6 +275,12 @@ public:
     //
     // [thread-safe]
     RuntimeProfile* create_child(const std::string& name, bool indent = true, bool prepend = false);
+
+    // Remove childs
+    void remove_childs();
+
+    // Reverse childs
+    void reverse_childs();
 
     // Sorts all children according to a custom comparator. Does not
     // invalidate pointers to profiles.
@@ -301,7 +309,7 @@ public:
     // parent_counter_name.
     // If the counter already exists, the existing counter object is returned.
     Counter* add_counter(const std::string& name, TUnit::type type, const std::string& parent_counter_name);
-    Counter* add_counter(const std::string& name, TUnit::type type) { return add_counter(name, type, ""); }
+    Counter* add_counter(const std::string& name, TUnit::type type) { return add_counter(name, type, ROOT_COUNTER); }
 
     // Add a derived counter with 'name'/'type'. The counter is owned by the
     // RuntimeProfile object.
@@ -324,6 +332,15 @@ public:
     // in any of the child profiles to 'counters'.
     void get_counters(const std::string& name, std::vector<Counter*>* counters);
 
+    // Copy all but the bucket counters from src profile
+    void copy_all_counters_from(RuntimeProfile* src_profile);
+
+    // Remove the counter object with 'name', and it will remove all the child counters recursively
+    void remove_counter(const std::string& name);
+
+    // Clean all the counters except saved_counter_names
+    void remove_counters(const std::set<std::string>& saved_counter_names);
+
     // Helper to append to the "ExecOption" info string.
     void append_exec_option(const std::string& option) { add_info_string("ExecOption", option); }
 
@@ -341,6 +358,9 @@ public:
     // the key does not exist.
     const std::string* get_info_string(const std::string& key);
 
+    // Copy all the string infos from src profile
+    void copy_all_info_strings_from(RuntimeProfile* src_profile);
+
     // Returns the counter for the total elapsed time.
     Counter* total_time_counter() { return &_counter_total_time; }
 
@@ -356,6 +376,15 @@ public:
     // Divides all counters by n
     void divide(int n);
 
+    size_t num_children() const { return _child_map.size(); }
+
+    // Get child of given name
+    RuntimeProfile* get_child(const std::string& name);
+
+    // Get child of given index
+    RuntimeProfile* get_child(const size_t index);
+
+    // Gets all direct children's profiles
     void get_children(std::vector<RuntimeProfile*>* children);
 
     // Gets all profiles in tree, including this one.
@@ -433,11 +462,16 @@ public:
     // This function updates _local_time_percent for each profile.
     void compute_time_in_profile();
 
+public:
+    // The root counter name for all top level counters.
+    const static std::string ROOT_COUNTER;
+
 private:
     // vector of (profile, indentation flag)
-    typedef std::vector<std::pair<RuntimeProfile*, bool> > ChildVector;
+    typedef std::vector<std::pair<RuntimeProfile*, bool>> ChildVector;
 
     void add_child_unlock(RuntimeProfile* child, bool indent, ChildVector::iterator pos);
+    Counter* add_counter_unlock(const std::string& name, TUnit::type type, const std::string& parent_counter_name);
 
     RuntimeProfile* _parent;
 
@@ -458,21 +492,21 @@ private:
     /// All counters in this profile must be of unit AveragedCounter.
     bool _is_averaged_profile;
 
-    // Map from counter names to counters.  The profile owns the memory for the
-    // counters.
-    typedef std::map<std::string, Counter*> CounterMap;
+    // Map from counter names to counters and parent counter names.
+    // The profile owns the memory for the counters.
+    typedef std::map<std::string, std::pair<Counter*, std::string>> CounterMap;
     CounterMap _counter_map;
 
     // Map from parent counter name to a set of child counter name.
     // All top level counters are the child of "" (root).
-    typedef std::map<std::string, std::set<std::string> > ChildCounterMap;
+    typedef std::map<std::string, std::set<std::string>> ChildCounterMap;
     ChildCounterMap _child_counter_map;
 
     // A set of bucket counters registered in this runtime profile.
     std::set<std::vector<Counter*>*> _bucketing_counters;
 
     // protects _counter_map, _counter_child_map and _bucketing_counters
-    mutable std::mutex _counter_map_lock;
+    mutable std::mutex _counter_lock;
 
     // Child profiles.  Does not own memory.
     // We record children in both a map (to facilitate updates) and a vector
@@ -538,10 +572,10 @@ private:
         std::mutex lock;
 
         // If true, tear down the update thread.
-        volatile bool _done;
+        volatile bool _done{false};
 
         // Thread performing asynchronous updates.
-        std::unique_ptr<boost::thread> update_thread;
+        std::unique_ptr<std::thread> update_thread;
 
         // A map of the dst (rate) counter to the src counter and elapsed time.
         typedef std::map<Counter*, RateCounterInfo> RateCounterMap;
@@ -586,6 +620,35 @@ private:
     static void print_child_counters(const std::string& prefix, const std::string& counter_name,
                                      const CounterMap& counter_map, const ChildCounterMap& child_counter_map,
                                      std::ostream* s);
+
+public:
+    // Merge all the isomorphic sub profiles and the caller must known for sure
+    // that all the children are isomorphic, otherwise, the behavior is undefined
+    // The merged result will be stored in the first profile
+    static void merge_isomorphic_profiles(std::vector<RuntimeProfile*>& profiles);
+
+private:
+    static const std::unordered_set<std::string> NON_MERGE_COUNTER_NAMES;
+    // Merge all the isomorphic counters
+    // The exact semantics of merge depends on TUnit::type
+    // TODO(hcf) is the classification right?
+    // TODO(hcf) merge bucket counters
+    // sum:
+    //     UNIT / UNIT_PER_SECOND
+    //     BYTES / BYTES_PER_SECOND
+    //     DOUBLE_VALUE / NONE
+    // average:
+    //     CPU_TICKS / TIME_NS / TIME_MS / TIME_S
+    typedef std::tuple<int64_t, int64_t, int64_t> MergedInfo;
+    static MergedInfo merge_isomorphic_counters(TUnit::type type,
+                                                std::vector<std::tuple<Counter*, Counter*, Counter*>>& counters);
+
+    static bool is_average_type(TUnit::type type) {
+        return TUnit::type::CPU_TICKS == type || TUnit::type::TIME_NS == type || TUnit::type::TIME_MS == type ||
+               TUnit::type::TIME_S == type;
+    }
+
+    std::string get_children_name_string();
 };
 
 // Utility class to update the counter at object construction and destruction.
@@ -594,7 +657,7 @@ private:
 class ScopedCounter {
 public:
     ScopedCounter(RuntimeProfile::Counter* counter, int64_t val) : _val(val), _counter(counter) {
-        if (counter == NULL) {
+        if (counter == nullptr) {
             return;
         }
 
@@ -603,7 +666,7 @@ public:
 
     // Increment the counter when object is destroyed
     ~ScopedCounter() {
-        if (_counter != NULL) {
+        if (_counter != nullptr) {
             _counter->update(_val);
         }
     }
@@ -625,7 +688,7 @@ class ScopedTimer {
 public:
     explicit ScopedTimer(RuntimeProfile::Counter* counter, const bool* is_cancelled = nullptr)
             : _counter(counter), _is_cancelled(is_cancelled) {
-        if (counter == NULL) {
+        if (counter == nullptr) {
             return;
         }
         DCHECK(counter->type() == TUnit::TIME_NS);
@@ -643,7 +706,7 @@ public:
     bool is_cancelled() { return _is_cancelled != nullptr && *_is_cancelled; }
 
     void UpdateCounter() {
-        if (_counter != NULL && !is_cancelled()) {
+        if (_counter != nullptr && !is_cancelled()) {
             _counter->update(_sw.elapsed_time());
         }
     }
@@ -680,5 +743,3 @@ private:
 };
 
 } // namespace starrocks
-
-#endif

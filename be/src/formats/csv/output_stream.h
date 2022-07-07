@@ -1,10 +1,12 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
-#include "runtime/date_value.h"
+#include <ryu/ryu.h>
+
 #include "runtime/decimalv2_value.h"
-#include "runtime/timestamp_value.h"
+#include "types/date_value.hpp"
+#include "types/timestamp_value.h"
 
 namespace starrocks::vectorized::csv {
 
@@ -17,7 +19,7 @@ public:
               _pos(_buff),
               _end(_buff + std::max(kMinBuffSize, capacity)) {}
 
-    ~OutputStream() { delete[] _buff; }
+    virtual ~OutputStream() { delete[] _buff; }
 
     OutputStream(const OutputStream&) = delete;
     void operator=(const OutputStream&) = delete;
@@ -36,13 +38,13 @@ public:
     }
 
     Status write(float f) {
-        RETURN_IF_ERROR(_reserve(std::numeric_limits<float>::digits10 + 2));
+        RETURN_IF_ERROR(_reserve(MAX_FLOAT_STR_LENGTH));
         _pos += f2s_buffered_n(f, _pos);
         return Status::OK();
     }
 
     Status write(double d) {
-        RETURN_IF_ERROR(_reserve(std::numeric_limits<double>::digits10 + 2));
+        RETURN_IF_ERROR(_reserve(MAX_DOUBLE_STR_LENGTH));
         _pos += d2s_buffered_n(d, _pos);
         return Status::OK();
     }
@@ -91,13 +93,15 @@ public:
 
     virtual Status finalize() { return _flush(); }
 
+    virtual std::size_t size() { return 0; }
+
 protected:
     virtual Status _sync(const char* data, size_t size) = 0;
 
 private:
-    inline size_t _free_space() const { return _end - _pos; }
+    size_t _free_space() const { return _end - _pos; }
 
-    inline Status _reserve(size_t n) {
+    Status _reserve(size_t n) {
         if (_free_space() < n) {
             RETURN_IF_ERROR(_flush());
             if (UNLIKELY(_free_space() < n)) {
@@ -107,7 +111,7 @@ private:
         return Status::OK();
     }
 
-    inline Status _flush() {
+    Status _flush() {
         Status st = _sync(_buff, _pos - _buff);
         _pos = _buff; // Don't care about the status.
         return st;

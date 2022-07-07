@@ -1,13 +1,18 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include <arrow/builder.h>
 #include <arrow/memory_pool.h>
 #include <arrow/testing/gtest_util.h>
 #include <arrow/testing/util.h>
 #include <gtest/gtest.h>
+#include <testutil/parallel_test.h>
 #include <util/guard.h>
 
+#include "arrow/array/builder_base.h"
+#include "arrow/type_fwd.h"
+#include "arrow/type_traits.h"
 #include "exec/vectorized/arrow_to_starrocks_converter.h"
+#include "runtime/datetime_value.h"
 
 #define ASSERT_STATUS_OK(stmt)    \
     do {                          \
@@ -39,7 +44,7 @@ static inline std::shared_ptr<arrow::Array> create_constant_array(int64_t num_el
             builder->UnsafeAppend(CType(value));
         }
     };
-    ASSERT_OK_AND_ASSIGN(auto array, arrow::ArrayFromBuilderVisitor(type, num_elements, builder_fn));
+    EXPECT_OK_AND_ASSIGN(auto array, arrow::ArrayFromBuilderVisitor(type, num_elements, builder_fn));
     counter += num_elements;
     return array;
 }
@@ -97,7 +102,7 @@ void add_arrow_to_nullable_column(Column* column, size_t num_elements, ArrowCppT
     }
 }
 
-TEST_F(ArrowConverterTest, test_copyable_converter_int8) {
+PARALLEL_TEST(ArrowConverterTest, test_copyable_converter_int8) {
     auto col = Int8Column::create();
     col->reserve(4096);
     size_t counter = 0;
@@ -109,7 +114,7 @@ TEST_F(ArrowConverterTest, test_copyable_converter_int8) {
     add_arrow_to_column<ArrowTypeId::INT8, TYPE_TINYINT, arrow::Int8Type>(col.get(), 5, int8_t(-127), counter);
 }
 
-TEST_F(ArrowConverterTest, test_copyable_converter_uint64) {
+PARALLEL_TEST(ArrowConverterTest, test_copyable_converter_uint64) {
     auto col = Int64Column::create();
     col->reserve(4096);
     size_t counter = 0;
@@ -124,7 +129,7 @@ TEST_F(ArrowConverterTest, test_copyable_converter_uint64) {
                                                                              counter);
 }
 
-TEST_F(ArrowConverterTest, test_assignable_converter_float) {
+PARALLEL_TEST(ArrowConverterTest, test_assignable_converter_float) {
     auto col = DoubleColumn::create();
     col->reserve(4096);
     size_t counter = 0;
@@ -138,7 +143,7 @@ TEST_F(ArrowConverterTest, test_assignable_converter_float) {
     add_arrow_to_column<ArrowTypeId::FLOAT, TYPE_DOUBLE, arrow::FloatType>(col.get(), 5, -0.0f, counter);
 }
 
-TEST_F(ArrowConverterTest, test_nullable_copyable_converter_int32) {
+PARALLEL_TEST(ArrowConverterTest, test_nullable_copyable_converter_int32) {
     auto data_column = Int32Column::create();
     auto null_column = NullColumn::create();
     auto col = NullableColumn::create(data_column, null_column);
@@ -154,7 +159,7 @@ TEST_F(ArrowConverterTest, test_nullable_copyable_converter_int32) {
     add_arrow_to_nullable_column<ArrowTypeId::INT32, TYPE_INT, arrow::Int32Type>(col.get(), 9, 0xdeadbeef, counter);
 }
 
-TEST_F(ArrowConverterTest, test_nullable_assignable_converter_uint16) {
+PARALLEL_TEST(ArrowConverterTest, test_nullable_assignable_converter_uint16) {
     auto data_column = Int128Column::create();
     auto null_column = NullColumn::create();
     auto col = NullableColumn::create(data_column, null_column);
@@ -178,21 +183,21 @@ template <typename ArrowType, bool is_nullable = false>
 static inline std::shared_ptr<arrow::Array> create_constant_binary_array(int64_t num_elements, const std::string& value,
                                                                          size_t& counter) {
     using offset_type = typename ArrowType::offset_type;
-    std::shared_ptr<arrow::Buffer> offsets_buf;
     size_t offsets_in_bytes = (num_elements + 1) * sizeof(offset_type);
-    arrow::AllocateBuffer(offsets_in_bytes, &offsets_buf);
+    auto offsets_buf_res = arrow::AllocateBuffer(offsets_in_bytes);
+    std::shared_ptr<arrow::Buffer> offsets_buf = std::move(offsets_buf_res.ValueOrDie());
     auto* offsets = (offset_type*)offsets_buf->mutable_data();
     offsets[0] = 0;
 
     auto value_size = value.size();
     size_t data_in_bytes = value_size * num_elements;
-    std::shared_ptr<arrow::Buffer> data_buf;
-    arrow::AllocateBuffer(data_in_bytes, &data_buf);
+    auto data_buf_res = arrow::AllocateBuffer(data_in_bytes);
+    std::shared_ptr<arrow::Buffer> data_buf = std::move(data_buf_res.ValueOrDie());
     auto* data = data_buf->mutable_data();
 
     auto null_bitmap_in_bytes = (num_elements + 7) / 8;
-    std::shared_ptr<arrow::Buffer> null_bitmap;
-    arrow::AllocateBuffer(null_bitmap_in_bytes, &null_bitmap);
+    auto null_bitmap_res = arrow::AllocateBuffer(null_bitmap_in_bytes);
+    std::shared_ptr<arrow::Buffer> null_bitmap = std::move(null_bitmap_res.ValueOrDie());
     auto nulls = null_bitmap->mutable_data();
     auto data_off = 0;
     for (auto i = 0; i < num_elements; ++i) {
@@ -343,7 +348,7 @@ void test_binary_with_strict_mode(const TestCaseArray<std::string>& test_cases, 
     test_binary<ArrowTypeId::LARGE_STRING, TYPE_CHAR, arrow::LargeStringType, std::string>(test_cases, strict_mode);
 }
 
-TEST_F(ArrowConverterTest, test_binary_strict) {
+PARALLEL_TEST(ArrowConverterTest, test_binary_strict) {
     auto test_cases = TestCaseArray<std::string>{
             {13, std::string(""), false},
             {7, std::string("a"), false},
@@ -354,7 +359,7 @@ TEST_F(ArrowConverterTest, test_binary_strict) {
     test_binary_with_strict_mode(test_cases, true);
 }
 
-TEST_F(ArrowConverterTest, test_binary_nonstrict) {
+PARALLEL_TEST(ArrowConverterTest, test_binary_nonstrict) {
     auto test_cases = TestCaseArray<std::string>{
             {13, std::string(""), false},
             {7, std::string("a"), false},
@@ -365,7 +370,7 @@ TEST_F(ArrowConverterTest, test_binary_nonstrict) {
     test_binary_with_strict_mode(test_cases, false);
 }
 
-TEST_F(ArrowConverterTest, test_nullable_binary_strict) {
+PARALLEL_TEST(ArrowConverterTest, test_nullable_binary_strict) {
     auto test_cases = TestCaseArray<std::string>{
             {13, std::string(""), false},
             {7, std::string("a"), false},
@@ -376,7 +381,7 @@ TEST_F(ArrowConverterTest, test_nullable_binary_strict) {
     test_nullable_binary_with_strict_mode(test_cases, true);
 }
 
-TEST_F(ArrowConverterTest, test_nullable_binary_nonstrict) {
+PARALLEL_TEST(ArrowConverterTest, test_nullable_binary_nonstrict) {
     auto test_cases = TestCaseArray<std::string>{
             {13, std::string(""), false},
             {7, std::string("a"), false},
@@ -407,19 +412,19 @@ void convert_binary_fail(size_t limit, bool strict_mode) {
     test_binary<ArrowTypeId::LARGE_BINARY, PT, arrow::LargeBinaryType, std::string>(test_cases_pass, strict_mode);
 }
 
-TEST_F(ArrowConverterTest, test_char_fail_strict) {
+PARALLEL_TEST(ArrowConverterTest, test_char_fail_strict) {
     convert_binary_fail<TYPE_CHAR>(TypeDescriptor::MAX_CHAR_LENGTH, true);
 }
 
-TEST_F(ArrowConverterTest, test_varchar_fail_strict) {
+PARALLEL_TEST(ArrowConverterTest, test_varchar_fail_strict) {
     convert_binary_fail<TYPE_VARCHAR>(TypeDescriptor::MAX_VARCHAR_LENGTH, true);
 }
 
-TEST_F(ArrowConverterTest, test_char_fail_nonstrict) {
+PARALLEL_TEST(ArrowConverterTest, test_char_fail_nonstrict) {
     convert_binary_fail<TYPE_CHAR>(TypeDescriptor::MAX_CHAR_LENGTH, false);
 }
 
-TEST_F(ArrowConverterTest, test_varchar_fail_nonstrict) {
+PARALLEL_TEST(ArrowConverterTest, test_varchar_fail_nonstrict) {
     convert_binary_fail<TYPE_VARCHAR>(TypeDescriptor::MAX_VARCHAR_LENGTH, false);
 }
 
@@ -428,13 +433,13 @@ static inline std::shared_ptr<arrow::Array> create_constant_fixed_size_binary_ar
                                                                                     const std::string& value,
                                                                                     size_t& counter) {
     auto data_buf_size = bytes_width * num_elements;
-    std::shared_ptr<arrow::Buffer> data_buf;
-    arrow::AllocateBuffer(data_buf_size, &data_buf);
+    auto data_buf_res = arrow::AllocateBuffer(data_buf_size);
+    std::shared_ptr<arrow::Buffer> data_buf = std::move(data_buf_res.ValueOrDie());
     auto* p = data_buf->mutable_data();
 
     auto null_bitmap_in_bytes = (num_elements + 7) / 8;
-    std::shared_ptr<arrow::Buffer> null_bitmap;
-    arrow::AllocateBuffer(null_bitmap_in_bytes, &null_bitmap);
+    auto null_bitmap_res = arrow::AllocateBuffer(null_bitmap_in_bytes);
+    std::shared_ptr<arrow::Buffer> null_bitmap = std::move(null_bitmap_res.ValueOrDie());
     auto* nulls = null_bitmap->mutable_data();
 
     for (auto i = 0; i < num_elements; ++i) {
@@ -523,7 +528,7 @@ void add_fixed_size_binary_array_to_nullable_binary_column(Column* column, size_
 }
 
 template <int bytes_width, PrimitiveType PT>
-void test_fixed_size_binary(const TestCaseArray<std::string>& test_cases) {
+void PARALLEL_TESTixed_size_binary(const TestCaseArray<std::string>& test_cases) {
     using ColumnType = RunTimeColumnType<PT>;
     auto col = ColumnType::create();
     col->reserve(4096);
@@ -553,31 +558,31 @@ void test_nullable_fixed_size_binary(const TestCaseArray<std::string>& test_case
     }
 }
 
-TEST_F(ArrowConverterTest, test_fixed_size_binary_pass) {
+PARALLEL_TEST(ArrowConverterTest, PARALLEL_TESTixed_size_binary_pass) {
     auto test_cases = TestCaseArray<std::string>{
             {3, std::string(""), false},
             {3, std::string("a"), false},
             {3, std::string(255, 'x'), false},
     };
-    test_fixed_size_binary<10, TYPE_CHAR>(test_cases);
-    test_fixed_size_binary<255, TYPE_CHAR>(test_cases);
+    PARALLEL_TESTixed_size_binary<10, TYPE_CHAR>(test_cases);
+    PARALLEL_TESTixed_size_binary<255, TYPE_CHAR>(test_cases);
     test_nullable_fixed_size_binary<10, TYPE_CHAR>(test_cases);
     test_nullable_fixed_size_binary<255, TYPE_CHAR>(test_cases);
-    test_fixed_size_binary<10, TYPE_VARCHAR>(test_cases);
-    test_fixed_size_binary<255, TYPE_VARCHAR>(test_cases);
-    test_fixed_size_binary<TypeDescriptor::MAX_VARCHAR_LENGTH, TYPE_VARCHAR>(test_cases);
+    PARALLEL_TESTixed_size_binary<10, TYPE_VARCHAR>(test_cases);
+    PARALLEL_TESTixed_size_binary<255, TYPE_VARCHAR>(test_cases);
+    PARALLEL_TESTixed_size_binary<TypeDescriptor::MAX_VARCHAR_LENGTH, TYPE_VARCHAR>(test_cases);
     test_nullable_fixed_size_binary<10, TYPE_VARCHAR>(test_cases);
     test_nullable_fixed_size_binary<255, TYPE_VARCHAR>(test_cases);
     test_nullable_fixed_size_binary<TypeDescriptor::MAX_VARCHAR_LENGTH, TYPE_VARCHAR>(test_cases);
 }
 
-TEST_F(ArrowConverterTest, test_fixed_size_binary_fail) {
+PARALLEL_TEST(ArrowConverterTest, PARALLEL_TESTixed_size_binary_fail) {
     auto test_cases = TestCaseArray<std::string>{
             {2, std::string(255, 'x'), true},
     };
-    test_fixed_size_binary<256, TYPE_CHAR>(test_cases);
+    PARALLEL_TESTixed_size_binary<256, TYPE_CHAR>(test_cases);
     test_nullable_fixed_size_binary<256, TYPE_CHAR>(test_cases);
-    test_fixed_size_binary<TypeDescriptor::MAX_VARCHAR_LENGTH + 1, TYPE_VARCHAR>(test_cases);
+    PARALLEL_TESTixed_size_binary<TypeDescriptor::MAX_VARCHAR_LENGTH + 1, TYPE_VARCHAR>(test_cases);
     test_nullable_fixed_size_binary<TypeDescriptor::MAX_VARCHAR_LENGTH + 1, TYPE_VARCHAR>(test_cases);
 }
 
@@ -588,8 +593,10 @@ std::shared_ptr<arrow::Array> create_constant_datetime_array(size_t num_elements
     buffers.resize(2);
     size_t null_bitmap_in_bytes = (num_elements + 7) / 8;
     size_t data_buff_in_bytes = num_elements * sizeof(value);
-    arrow::AllocateBuffer(null_bitmap_in_bytes, &buffers[0]);
-    arrow::AllocateBuffer(data_buff_in_bytes, &buffers[1]);
+    auto buffer0_res = arrow::AllocateBuffer(null_bitmap_in_bytes);
+    buffers[0] = std::move(buffer0_res.ValueOrDie());
+    auto buffer1_res = arrow::AllocateBuffer(data_buff_in_bytes);
+    buffers[1] = std::move(buffer1_res.ValueOrDie());
     auto* nulls = buffers[0]->mutable_data();
     auto* data = (ArrowCppType*)buffers[1]->mutable_data();
 
@@ -769,7 +776,7 @@ void test_nullable_datetime(std::shared_ptr<ArrowType> type, const TestCaseArray
     }
 }
 
-TEST_F(ArrowConverterTest, test_date32_to_date) {
+PARALLEL_TEST(ArrowConverterTest, test_date32_to_date) {
     auto type = std::make_shared<arrow::Date32Type>();
     auto test_cases = TestCaseArray<std::string>{
             {7, "2021-09-30", false},
@@ -781,7 +788,7 @@ TEST_F(ArrowConverterTest, test_date32_to_date) {
     test_nullable_datetime<ArrowTypeId::DATE32, TYPE_DATE, arrow::Date32Type>(type, test_cases);
 }
 
-TEST_F(ArrowConverterTest, test_date32_to_datetime) {
+PARALLEL_TEST(ArrowConverterTest, test_date32_to_datetime) {
     auto type = std::make_shared<arrow::Date32Type>();
     auto test_cases = TestCaseArray<std::string>{
             {7, "2021-09-30", false},
@@ -792,7 +799,7 @@ TEST_F(ArrowConverterTest, test_date32_to_datetime) {
     test_datetime<ArrowTypeId::DATE32, TYPE_DATETIME, arrow::Date32Type>(type, test_cases);
     test_nullable_datetime<ArrowTypeId::DATE32, TYPE_DATETIME, arrow::Date32Type>(type, test_cases);
 }
-TEST_F(ArrowConverterTest, test_date64_to_date) {
+PARALLEL_TEST(ArrowConverterTest, test_date64_to_date) {
     auto type = std::make_shared<arrow::Date64Type>();
     auto test_cases = TestCaseArray<std::string>{
             {7, "1999-12-31 00:00:00", false},
@@ -803,7 +810,7 @@ TEST_F(ArrowConverterTest, test_date64_to_date) {
     test_datetime<ArrowTypeId::DATE64, TYPE_DATE, arrow::Date64Type>(type, test_cases);
     test_nullable_datetime<ArrowTypeId::DATE64, TYPE_DATE, arrow::Date64Type>(type, test_cases);
 }
-TEST_F(ArrowConverterTest, test_date64_to_datetime) {
+PARALLEL_TEST(ArrowConverterTest, test_date64_to_datetime) {
     auto type = std::make_shared<arrow::Date64Type>();
     auto test_cases = TestCaseArray<std::string>{
             {7, "1999-12-31 00:00:00", false},
@@ -814,7 +821,7 @@ TEST_F(ArrowConverterTest, test_date64_to_datetime) {
     test_datetime<ArrowTypeId::DATE64, TYPE_DATETIME, arrow::Date64Type>(type, test_cases);
     test_nullable_datetime<ArrowTypeId::DATE64, TYPE_DATETIME, arrow::Date64Type>(type, test_cases);
 }
-TEST_F(ArrowConverterTest, test_timestamp_to_date) {
+PARALLEL_TEST(ArrowConverterTest, test_timestamp_to_date) {
     auto test_cases = TestCaseArray<std::string>{
             {7, "1999-12-31 00:00:00", false},
             {9, "2007-09-01 06:30:00", false},
@@ -837,7 +844,7 @@ TEST_F(ArrowConverterTest, test_timestamp_to_date) {
         test_nullable_datetime<ArrowTypeId::TIMESTAMP, TYPE_DATE, arrow::TimestampType>(type, test_cases);
     }
 }
-TEST_F(ArrowConverterTest, test_timestamp_to_datetime) {
+PARALLEL_TEST(ArrowConverterTest, test_timestamp_to_datetime) {
     auto test_cases = TestCaseArray<std::string>{
             {7, "1999-12-31 00:00:00", false},
             {9, "2007-09-01 06:30:00", false},
@@ -868,8 +875,10 @@ std::shared_ptr<arrow::Array> create_const_decimal_array(size_t num_elements,
     std::vector<std::shared_ptr<arrow::Buffer>> buffers;
     buffers.resize(2);
     auto byte_width = type->byte_width();
-    arrow::AllocateBuffer((num_elements + 7) / 8, &buffers[0]);
-    arrow::AllocateBuffer(type->byte_width() * num_elements, &buffers[1]);
+    auto buffer0_res = arrow::AllocateBuffer((num_elements + 7) / 8);
+    buffers[0] = std::move(buffer0_res.ValueOrDie());
+    auto buffer1_res = arrow::AllocateBuffer(type->byte_width() * num_elements);
+    buffers[1] = std::move(buffer1_res.ValueOrDie());
     auto* nulls = buffers[0]->mutable_data();
     auto* data = buffers[1]->mutable_data();
     for (auto i = 0; i < num_elements; ++i) {
@@ -1028,7 +1037,7 @@ void test_nullable_decimal(std::shared_ptr<arrow::Decimal128Type> type, const Te
     }
 }
 
-TEST_F(ArrowConverterTest, test_decimalv2) {
+PARALLEL_TEST(ArrowConverterTest, test_decimalv2) {
     {
         auto test_cases = TestCaseArray<std::string>{
                 {2, "1.1234567", false},
@@ -1062,7 +1071,7 @@ TEST_F(ArrowConverterTest, test_decimalv2) {
     }
 }
 
-TEST_F(ArrowConverterTest, test_decimal32) {
+PARALLEL_TEST(ArrowConverterTest, test_decimal32) {
     {
         auto test_cases = TestCaseArray<std::string>{
                 {2, "1.111", false},     {4, "22.111", false},      {6, "333.111", false},      {8, "4444.111", false},
@@ -1091,7 +1100,7 @@ TEST_F(ArrowConverterTest, test_decimal32) {
     }
 }
 
-TEST_F(ArrowConverterTest, test_decimal64) {
+PARALLEL_TEST(ArrowConverterTest, test_decimal64) {
     {
         auto test_cases = TestCaseArray<std::string>{
                 {2, "1.1234567", false},
@@ -1125,7 +1134,7 @@ TEST_F(ArrowConverterTest, test_decimal64) {
     }
 }
 
-TEST_F(ArrowConverterTest, test_decimal128) {
+PARALLEL_TEST(ArrowConverterTest, test_decimal128) {
     {
         auto test_cases = TestCaseArray<std::string>{
                 {2, "1.1234567", false},
@@ -1159,9 +1168,70 @@ TEST_F(ArrowConverterTest, test_decimal128) {
     }
 }
 
-} // namespace starrocks::vectorized
+static std::shared_ptr<arrow::Array> create_map_array(int64_t num_elements, const std::map<std::string, int>& value,
+                                                      size_t& counter) {
+    auto key_builder = std::make_shared<arrow::StringBuilder>();
+    auto item_builder = std::make_shared<arrow::Int32Builder>();
+    arrow::TypeTraits<arrow::MapType>::BuilderType builder(arrow::default_memory_pool(), key_builder, item_builder);
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
+    for (int i = 0; i < num_elements; i++) {
+        builder.Append();
+        for (auto& [key, value] : value) {
+            key_builder->Append(key);
+            item_builder->Append(value);
+        }
+        counter += 1;
+    }
+    return builder.Finish().ValueOrDie();
 }
+
+static std::string map_to_json(const std::map<std::string, int>& m) {
+    std::ostringstream oss;
+    oss << "{";
+    bool first = true;
+    for (auto& [key, value] : m) {
+        if (!first) {
+            oss << ", ";
+        }
+        oss << "\"" << key << "\""
+            << ": " << value;
+        first = false;
+    }
+    oss << "}";
+    return oss.str();
+}
+
+void add_arrow_map_to_json_column(Column* column, size_t num_elements, const std::map<std::string, int>& value,
+                                  size_t& counter) {
+    ASSERT_EQ(column->size(), counter);
+    auto array = create_map_array(num_elements, value, counter);
+    auto conv_func = get_arrow_converter(ArrowTypeId::MAP, TYPE_JSON, false, false);
+    ASSERT_TRUE(conv_func != nullptr);
+
+    Column::Filter filter;
+    filter.resize(array->length(), 1);
+    auto* filter_data = &filter.front();
+    ASSERT_STATUS_OK(conv_func(array.get(), 0, array->length(), column, column->size(), nullptr, filter_data, nullptr));
+    ASSERT_EQ(column->size(), counter);
+    for (auto i = 0; i < num_elements; ++i) {
+        const JsonValue* json = column->get(i).get_json();
+        std::string json_str = json->to_string_uncheck();
+
+        ASSERT_EQ(map_to_json(value), json_str);
+    }
+}
+
+PARALLEL_TEST(ArrowConverterTest, test_map_to_json) {
+    auto json_column = JsonColumn::create();
+    json_column->reserve(4096);
+    size_t counter = 0;
+    std::map<std::string, int> map_value = {
+            {"hehe", 1},
+            {"haha", 2},
+    };
+    for (int i = 1; i < 10; i++) {
+        add_arrow_map_to_json_column(json_column.get(), i, map_value, counter);
+    }
+}
+
+} // namespace starrocks::vectorized

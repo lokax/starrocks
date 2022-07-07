@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.rule.implementation;
 
 import com.google.common.collect.Lists;
@@ -14,17 +14,16 @@ import java.util.List;
 
 public class ExceptImplementationRule extends ImplementationRule {
     public ExceptImplementationRule() {
-        super(RuleType.IMP_EXCEPT,
-                Pattern.create(OperatorType.LOGICAL_EXCEPT)
-                        .addChildren(Pattern.create(OperatorType.PATTERN_MULTI_LEAF)));
+        super(RuleType.IMP_EXCEPT, Pattern.create(OperatorType.LOGICAL_EXCEPT)
+                .addChildren(Pattern.create(OperatorType.PATTERN_MULTI_LEAF)));
     }
 
     @Override
     public List<OptExpression> transform(OptExpression input, OptimizerContext context) {
         LogicalSetOperator setOperator = (LogicalSetOperator) input.getOp();
         PhysicalExceptOperator physicalExcept =
-                new PhysicalExceptOperator(setOperator.getOutputColumnRefOp(), setOperator.getChildOutputColumns());
-        physicalExcept.setLimit(setOperator.getLimit());
+                new PhysicalExceptOperator(setOperator.getOutputColumnRefOp(), setOperator.getChildOutputColumns(),
+                        setOperator.getLimit(), setOperator.getPredicate(), setOperator.getProjection());
         return Lists.newArrayList(OptExpression.create(physicalExcept, input.getInputs()));
     }
 }

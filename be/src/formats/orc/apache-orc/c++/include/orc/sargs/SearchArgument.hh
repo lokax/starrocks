@@ -20,8 +20,7 @@
  * limitations under the License.
  */
 
-#ifndef ORC_SEARCHARGUMENT_HH
-#define ORC_SEARCHARGUMENT_HH
+#pragma once
 
 #include <map>
 #include <unordered_map>
@@ -56,6 +55,7 @@ public:
     virtual bool filterOnPickStringDictionary(const std::unordered_map<uint64_t, StringDictionary*>& sdicts) {
         return false;
     }
+    virtual void setWriterTimezone(const std::string& tz) {}
 };
 
 /**
@@ -207,5 +207,3 @@ public:
 };
 
 } // namespace orc
-
-#endif //ORC_SEARCHARGUMENT_HH

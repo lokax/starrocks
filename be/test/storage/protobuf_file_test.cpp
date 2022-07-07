@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "storage/protobuf_file.h"
 
@@ -7,7 +7,7 @@
 #include <filesystem>
 
 #include "common/status.h"
-#include "env/env.h"
+#include "fs/fs.h"
 #include "gen_cpp/olap_file.pb.h"
 #include "util/defer_op.h"
 
@@ -55,9 +55,8 @@ TEST(ProtobufFileTest, test_corruption) {
     ASSERT_TRUE(st.ok()) << st;
 
     std::unique_ptr<WritableFile> f;
-    WritableFileOptions opts{.sync_on_close = false, .mode = Env::CREATE_OR_OPEN};
-    st = Env::Default()->new_writable_file(opts, "ProtobufFileTest_test_corruption.bin", &f);
-    ASSERT_TRUE(st.ok()) << st;
+    WritableFileOptions opts{.sync_on_close = false, .mode = FileSystem::CREATE_OR_OPEN};
+    f = *FileSystem::Default()->new_writable_file(opts, "ProtobufFileTest_test_corruption.bin");
 
     f->append("xx");
     TabletMetaPB tablet_meta_2;

@@ -28,8 +28,7 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#ifndef _SYSINFO_H_
-#define _SYSINFO_H_
+#pragma once
 
 #include <cstdint>
 
@@ -51,7 +50,7 @@ void SleepForNanoseconds(int64_t nanoseconds);
 void SleepForMilliseconds(int64_t milliseconds);
 
 // processor cycles per second of each processor.  Thread-safe.
-extern double CyclesPerSecond(void);
+extern double CyclesPerSecond();
 
 // Parse the maximum CPU index from 'str'. The list is in the format of the CPU lists
 // under /sys/devices/system/cpu/, e.g. /sys/devices/system/cpu/present. Returns the
@@ -66,4 +65,3 @@ extern double CyclesPerSecond(void);
 extern int ParseMaxCpuIndex(const char* str);
 
 } // namespace base
-#endif /* #ifndef _SYSINFO_H_ */

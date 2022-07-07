@@ -1,7 +1,8 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.starrocks.catalog.DistributionInfo;
 import com.starrocks.catalog.HashDistributionInfo;
@@ -39,30 +40,32 @@ public class DistributionPruneRule extends TransformationRule {
 
     @Override
     public List<OptExpression> transform(OptExpression input, OptimizerContext context) {
-        LogicalOlapScanOperator operator = (LogicalOlapScanOperator) input.getOp();
+        LogicalOlapScanOperator olapScanOperator = (LogicalOlapScanOperator) input.getOp();
 
-        OlapTable olapTable = operator.getOlapTable();
+        OlapTable olapTable = (OlapTable) olapScanOperator.getTable();
 
         List<Long> result = Lists.newArrayList();
-        for (Long partitionId : operator.getSelectedPartitionId()) {
+        for (Long partitionId : olapScanOperator.getSelectedPartitionId()) {
             Partition partition = olapTable.getPartition(partitionId);
-            MaterializedIndex table = partition.getIndex(operator.getSelectedIndexId());
-            Collection<Long> tabletIds = distributionPrune(table, partition.getDistributionInfo(), operator);
+            MaterializedIndex table = partition.getIndex(olapScanOperator.getSelectedIndexId());
+            Collection<Long> tabletIds = distributionPrune(table, partition.getDistributionInfo(), olapScanOperator);
             result.addAll(tabletIds);
         }
 
         // prune hint tablet
-        if (null != operator.getHintsTabletIds() && !operator.getHintsTabletIds().isEmpty()) {
-            result.retainAll(operator.getHintsTabletIds());
+        Preconditions.checkState(olapScanOperator.getHintsTabletIds() != null);
+        if (!olapScanOperator.getHintsTabletIds().isEmpty()) {
+            result.retainAll(olapScanOperator.getHintsTabletIds());
         }
 
-        if (result.equals(operator.getSelectedTabletId())) {
+        if (result.equals(olapScanOperator.getSelectedTabletId())) {
             return Collections.emptyList();
         }
 
-        operator.setSelectedTabletId(result);
-
-        return Lists.newArrayList(input);
+        LogicalOlapScanOperator.Builder builder = new LogicalOlapScanOperator.Builder();
+        return Lists.newArrayList(OptExpression.create(
+                builder.withOperator(olapScanOperator).setSelectedTabletId(result).build(),
+                input.getInputs()));
     }
 
     private Collection<Long> distributionPrune(MaterializedIndex index, DistributionInfo distributionInfo,

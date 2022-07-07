@@ -19,15 +19,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef INF_STARROCKS_QE_SRC_BE_EXEC_SORT_EXEC_EXPRS_H
-#define INF_STARROCKS_QE_SRC_BE_EXEC_SORT_EXEC_EXPRS_H
+#pragma once
 
 #include "exprs/expr.h"
 #include "runtime/runtime_state.h"
 
 namespace starrocks {
-
-class MemTracker;
 
 // Helper class to Prepare() , Open() and Close() the ordering expressions used to perform
 // comparisons in a sort. Used by TopNNode, SortNode.  When two
@@ -35,8 +32,10 @@ class MemTracker;
 // TopN and Sort materialize input rows into a single tuple before sorting.
 // If _materialize_tuple is true, SortExecExprs also stores the slot expressions used to
 // materialize the sort tuples.
+
 class SortExecExprs {
 public:
+    ~SortExecExprs();
     // Initialize the expressions from a TSortInfo using the specified pool.
     Status init(const TSortInfo& sort_info, ObjectPool* pool);
 
@@ -47,8 +46,7 @@ public:
                 ObjectPool* pool);
 
     // prepare all expressions used for sorting and tuple materialization.
-    Status prepare(RuntimeState* state, const RowDescriptor& child_row_desc, const RowDescriptor& output_row_desc,
-                   MemTracker* mem_tracker);
+    Status prepare(RuntimeState* state, const RowDescriptor& child_row_desc, const RowDescriptor& output_row_desc);
 
     // open all expressions used for sorting and tuple materialization.
     Status open(RuntimeState* state);
@@ -82,6 +80,9 @@ private:
     // analogous functions in this class). Used for testing.
     Status init(const std::vector<ExprContext*>& lhs_ordering_expr_ctxs,
                 const std::vector<ExprContext*>& rhs_ordering_expr_ctxs);
+
+    bool _is_closed = false;
+    RuntimeState* _runtime_state = nullptr;
 };
 
 struct OrderByType {
@@ -90,5 +91,3 @@ struct OrderByType {
 };
 
 } // namespace starrocks
-
-#endif

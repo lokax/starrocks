@@ -1,32 +1,19 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.analyzer;
 
 import com.starrocks.utframe.UtFrameUtils;
-import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
-
-import java.io.File;
-import java.util.UUID;
 
 import static com.starrocks.sql.analyzer.AnalyzeTestUtil.analyzeFail;
 import static com.starrocks.sql.analyzer.AnalyzeTestUtil.analyzeSuccess;
 
 public class AnalyzeLateralTest {
-    // use a unique dir so that it won't be conflict with other unit test which
-    // may also start a Mocked Frontend
-    private static String runningDir = "fe/mocked/AnalyzeLateralTest/" + UUID.randomUUID().toString() + "/";
 
     @BeforeClass
     public static void beforeClass() throws Exception {
-        UtFrameUtils.createMinStarRocksCluster(runningDir);
+        UtFrameUtils.createMinStarRocksCluster();
         AnalyzeTestUtil.init();
-    }
-
-    @AfterClass
-    public static void tearDown() {
-        File file = new File(runningDir);
-        file.delete();
     }
 
     @Test
@@ -46,7 +33,13 @@ public class AnalyzeLateralTest {
         analyzeFail("select * from tarray, unknow_table_function(v2)",
                 "Unknown table function 'unknow_table_function(BIGINT)'");
         analyzeFail("select * from tarray,unnest(v2)", "Unknown table function 'unnest(BIGINT)'");
-        analyzeFail("select * from tarray,unnest(foo)", "Column '`foo`' cannot be resolved");
+        analyzeFail("select * from tarray,unnest(foo)", "Column 'foo' cannot be resolved");
         analyzeFail("select * from t0 cross join lateral t1", "Only support lateral join with UDTF");
+        analyzeFail("select  unnest(split('1,2,3',','))", "Table function cannot be used in expression");
+        analyzeFail("select a.* from unnest(split('1,2,3',',')) a",
+                "Table function must be used with lateral join");
+
+        analyzeFail("select * from t0,unnest(bitmap_to_array(bitmap_union(to_bitmap(v1))))",
+                "UNNEST clause cannot contain aggregations");
     }
 }

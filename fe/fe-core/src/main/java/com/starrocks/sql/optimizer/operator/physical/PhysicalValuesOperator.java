@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.operator.physical;
 
 import com.starrocks.sql.optimizer.OptExpression;
@@ -6,20 +6,26 @@ import com.starrocks.sql.optimizer.OptExpressionVisitor;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.OperatorVisitor;
+import com.starrocks.sql.optimizer.operator.Projection;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 
 import java.util.List;
-import java.util.Objects;
 
 public class PhysicalValuesOperator extends PhysicalOperator {
     private final List<ColumnRefOperator> columnRefSet;
     private final List<List<ScalarOperator>> rows;
 
-    public PhysicalValuesOperator(List<ColumnRefOperator> columnRefSet, List<List<ScalarOperator>> rows) {
+    public PhysicalValuesOperator(List<ColumnRefOperator> columnRefSet, List<List<ScalarOperator>> rows,
+                                  long limit,
+                                  ScalarOperator predicate,
+                                  Projection projection) {
         super(OperatorType.PHYSICAL_VALUES);
         this.columnRefSet = columnRefSet;
         this.rows = rows;
+        this.limit = limit;
+        this.predicate = predicate;
+        this.projection = projection;
     }
 
     public List<ColumnRefOperator> getColumnRefSet() {
@@ -42,19 +48,12 @@ public class PhysicalValuesOperator extends PhysicalOperator {
 
     @Override
     public boolean equals(Object o) {
-        if (this == o) {
-            return true;
-        }
-        if (o == null || getClass() != o.getClass()) {
-            return false;
-        }
-        PhysicalValuesOperator empty = (PhysicalValuesOperator) o;
-        return Objects.equals(columnRefSet, empty.columnRefSet);
+        return this == o;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(columnRefSet);
+        return System.identityHashCode(this);
     }
 
     @Override

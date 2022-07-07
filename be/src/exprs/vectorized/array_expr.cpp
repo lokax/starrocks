@@ -1,8 +1,9 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #include "exprs/vectorized/array_expr.h"
 
 #include "column/array_column.h"
+#include "column/chunk.h"
 #include "column/column_helper.h"
 #include "column/fixed_length_column.h"
 #include "common/object_pool.h"
@@ -21,6 +22,10 @@ public:
         const size_t num_elements = _children.size();
 
         size_t num_rows = 1;
+        // when num_elements == 0, we should generate right num_rows.
+        if (num_elements == 0 && chunk) {
+            num_rows = chunk->num_rows();
+        }
 
         std::vector<ColumnPtr> element_columns(num_elements);
         std::vector<Column*> element_raw_ptrs(num_elements);

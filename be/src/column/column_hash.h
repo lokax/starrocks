@@ -1,10 +1,25 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
+
+#include <cstdint>
+
+#ifdef __SSE4_2__
+#include <nmmintrin.h>
+#endif
+
+#ifdef __SSE2__
+#include <emmintrin.h>
+#include <xmmintrin.h>
+#endif
 
 #include "util/hash_util.hpp"
 #include "util/slice.h"
 #include "util/unaligned_access.h"
+
+#if defined(__aarch64__)
+#include "arm_acle.h"
+#endif
 
 namespace starrocks::vectorized {
 
@@ -92,19 +107,34 @@ public:
     }
 };
 
-static uint32_t crc_hash_32(const void* data, int32_t bytes, uint32_t hash) {
+inline uint32_t crc_hash_32(const void* data, int32_t bytes, uint32_t hash) {
+#if defined(__x86_64__) && !defined(__SSE4_2__)
+    return crc32(hash, (const unsigned char*)data, bytes);
+#else
     uint32_t words = bytes / sizeof(uint32_t);
     bytes = bytes % 4 /*sizeof(uint32_t)*/;
 
     auto* p = reinterpret_cast<const uint8_t*>(data);
 
     while (words--) {
+#if defined(__x86_64__)
         hash = _mm_crc32_u32(hash, unaligned_load<uint32_t>(p));
+#elif defined(__aarch64__)
+        hash = __crc32cw(hash, unaligned_load<uint32_t>(p));
+#else
+#error "Not supported architecture"
+#endif
         p += sizeof(uint32_t);
     }
 
     while (bytes--) {
+#if defined(__x86_64__)
         hash = _mm_crc32_u8(hash, *p);
+#elif defined(__aarch64__)
+        hash = __crc32cb(hash, unaligned_load<uint32_t>(p));
+#else
+#error "Not supported architecture"
+#endif
         ++p;
     }
 
@@ -112,9 +142,13 @@ static uint32_t crc_hash_32(const void* data, int32_t bytes, uint32_t hash) {
     // for anyone who only uses the first several bits of the hash.
     hash = (hash << 16u) | (hash >> 16u);
     return hash;
+#endif
 }
 
-static uint64_t crc_hash_64(const void* data, int32_t length, uint64_t hash) {
+inline uint64_t crc_hash_64(const void* data, int32_t length, uint64_t hash) {
+#if defined(__x86_64__) && !defined(__SSE4_2__)
+    return crc32(hash, (const unsigned char*)data, length);
+#else
     if (UNLIKELY(length < 8)) {
         return crc_hash_32(data, length, hash);
     }
@@ -123,21 +157,37 @@ static uint64_t crc_hash_64(const void* data, int32_t length, uint64_t hash) {
     auto* p = reinterpret_cast<const uint8_t*>(data);
     auto* end = reinterpret_cast<const uint8_t*>(data) + length;
     while (words--) {
+#if defined(__x86_64__) && defined(__SSE4_2__)
         hash = _mm_crc32_u64(hash, unaligned_load<uint64_t>(p));
+#elif defined(__aarch64__)
+        hash = __crc32cd(hash, unaligned_load<uint32_t>(p));
+#else
+#error "Not supported architecture"
+#endif
         p += sizeof(uint64_t);
     }
     // Reduce the branch condition
     p = end - 8;
+#if defined(__x86_64__)
     hash = _mm_crc32_u64(hash, unaligned_load<uint64_t>(p));
+#elif defined(__aarch64__)
+    hash = __crc32cd(hash, unaligned_load<uint32_t>(p));
+#else
+#error "Not supported architecture"
+#endif
+    p += sizeof(uint64_t);
     return hash;
+#endif
 }
+
+// TODO: 0x811C9DC5 is not prime number
+static const uint32_t CRC_HASH_SEED1 = 0x811C9DC5;
+static const uint32_t CRC_HASH_SEED2 = 0x811C9DD7;
 
 class SliceHash {
 public:
-    // TODO: 0x811C9DC5 is not prime number
-    static const uint32_t CRC_SEED = 0x811C9DC5;
     std::size_t operator()(const Slice& slice) const {
-        return crc_hash_64(slice.data, static_cast<int32_t>(slice.size), CRC_SEED);
+        return crc_hash_64(slice.data, static_cast<int32_t>(slice.size), CRC_HASH_SEED1);
     }
 };
 
@@ -150,18 +200,16 @@ public:
 template <>
 class SliceHashWithSeed<PhmapSeed1> {
 public:
-    static const uint32_t CRC_SEED = 0x811C9DC5;
     std::size_t operator()(const Slice& slice) const {
-        return crc_hash_64(slice.data, static_cast<int32_t>(slice.size), CRC_SEED);
+        return crc_hash_64(slice.data, static_cast<int32_t>(slice.size), CRC_HASH_SEED1);
     }
 };
 
 template <>
 class SliceHashWithSeed<PhmapSeed2> {
 public:
-    static const uint32_t CRC_SEED = 0x811c9dd7;
     std::size_t operator()(const Slice& slice) const {
-        return crc_hash_64(slice.data, static_cast<int32_t>(slice.size), CRC_SEED);
+        return crc_hash_64(slice.data, static_cast<int32_t>(slice.size), CRC_HASH_SEED2);
     }
 };
 
@@ -217,6 +265,55 @@ template <class T, PhmapSeed seed>
 class StdHashWithSeed {
 public:
     std::size_t operator()(T value) const { return phmap_mix_with_seed<sizeof(size_t), seed>()(std::hash<T>()(value)); }
+};
+
+inline uint64_t crc_hash_uint64(uint64_t value, uint64_t seed) {
+#if defined(__x86_64__) && defined(__SSE4_2__)
+    return _mm_crc32_u64(seed, value);
+#elif defined(__x86_64__)
+    return crc32(seed, (const unsigned char*)&value, sizeof(uint64_t));
+#elif defined(__aarch64__)
+    return __crc32cd(seed, value);
+#else
+#error "Not supported architecture"
+#endif
+}
+
+inline uint64_t crc_hash_uint128(uint64_t value0, uint64_t value1, uint64_t seed) {
+#if defined(__x86_64__) && defined(__SSE4_2__)
+    uint64_t hash = _mm_crc32_u64(seed, value0);
+    hash = _mm_crc32_u64(hash, value1);
+#elif defined(__x86_64__)
+    uint64_t hash = crc32(seed, (const unsigned char*)&value0, sizeof(uint64_t));
+    hash = crc32(hash, (const unsigned char*)&value1, sizeof(uint64_t));
+#elif defined(__aarch64__)
+    uint64_t hash = __crc32cd(seed, value0);
+    hash = __crc32cd(hash, value1);
+#else
+#error "Not supported architecture"
+#endif
+    return hash;
+}
+
+// https://github.com/HowardHinnant/hash_append/issues/7
+template <typename T>
+inline void hash_combine(uint64_t& seed, const T& val) {
+    seed ^= std::hash<T>{}(val) + 0x9e3779b97f4a7c15LLU + (seed << 12) + (seed >> 4);
+}
+
+inline uint64_t hash_128(uint64_t seed, int128_t val) {
+    size_t low = val;
+    size_t high = val >> 64;
+    hash_combine(seed, low);
+    hash_combine(seed, high);
+    return seed;
+}
+
+template <PhmapSeed seed>
+struct Hash128WithSeed {
+    std::size_t operator()(int128_t value) const {
+        return phmap_mix_with_seed<sizeof(size_t), seed>()(hash_128(seed, value));
+    }
 };
 
 } // namespace starrocks::vectorized

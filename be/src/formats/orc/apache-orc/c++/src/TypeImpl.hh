@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/orc/tree/main/c++/src/TypeImpl.hh
-
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
@@ -20,8 +16,7 @@
  * limitations under the License.
  */
 
-#ifndef TYPE_IMPL_HH
-#define TYPE_IMPL_HH
+#pragma once
 
 #include <vector>
 
@@ -171,7 +166,7 @@ private:
      * @param start start position of the input string
      * @param end end position of the input string
      */
-    static std::unique_ptr<Type> parseCategory(std::string category, const std::string& input, size_t start,
+    static std::unique_ptr<Type> parseCategory(const std::string& category, const std::string& input, size_t start,
                                                size_t end);
 };
 
@@ -187,5 +182,3 @@ std::unique_ptr<Type> convertType(const proto::Type& type, const proto::Footer& 
    */
 std::unique_ptr<Type> buildSelectedType(const Type* fileType, const std::vector<bool>& selected);
 } // namespace orc
-
-#endif

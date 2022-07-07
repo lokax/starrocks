@@ -23,9 +23,9 @@ package com.starrocks.common.proc;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Replica;
 import com.starrocks.common.util.TimeUtils;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 
 import java.util.Arrays;
@@ -41,7 +41,8 @@ public class ReplicasProcNode implements ProcNodeInterface {
             .add("LstSuccessVersion").add("LstSuccessVersionHash")
             .add("LstFailedVersion").add("LstFailedVersionHash")
             .add("LstFailedTime").add("SchemaHash").add("DataSize").add("RowCount").add("State")
-            .add("IsBad").add("VersionCount").add("PathHash").add("MetaUrl").add("CompactionStatus")
+            .add("IsBad").add("IsSetBadForce").add("VersionCount").add("PathHash").add("MetaUrl")
+            .add("CompactionStatus")
             .build();
 
     private long tabletId;
@@ -54,38 +55,46 @@ public class ReplicasProcNode implements ProcNodeInterface {
 
     @Override
     public ProcResult fetchResult() {
-        ImmutableMap<Long, Backend> backendMap = Catalog.getCurrentSystemInfo().getIdToBackend();
+        ImmutableMap<Long, Backend> backendMap = GlobalStateMgr.getCurrentSystemInfo().getIdToBackend();
 
         BaseProcResult result = new BaseProcResult();
         result.setNames(TITLE_NAMES);
         for (Replica replica : replicas) {
-            String metaUrl = String.format("http://%s:%d/api/meta/header/%d/%d",
-                    backendMap.get(replica.getBackendId()).getHost(),
-                    backendMap.get(replica.getBackendId()).getHttpPort(),
-                    tabletId,
-                    replica.getSchemaHash());
-
-            String compactionUrl = String.format(
-                    "http://%s:%d/api/compaction/show?tablet_id=%d&schema_hash=%d",
-                    backendMap.get(replica.getBackendId()).getHost(),
-                    backendMap.get(replica.getBackendId()).getHttpPort(),
-                    tabletId,
-                    replica.getSchemaHash());
+            String metaUrl;
+            String compactionUrl;
+            Backend backend = backendMap.get(replica.getBackendId());
+            if (backend != null) {
+                metaUrl = String.format("http://%s:%d/api/meta/header/%d/%d",
+                        backend.getHost(),
+                        backend.getHttpPort(),
+                        tabletId,
+                        replica.getSchemaHash());
+                compactionUrl = String.format(
+                        "http://%s:%d/api/compaction/show?tablet_id=%d&schema_hash=%d",
+                        backend.getHost(),
+                        backend.getHttpPort(),
+                        tabletId,
+                        replica.getSchemaHash());
+            } else {
+                metaUrl = "N/A";
+                compactionUrl = "N/A";
+            }
 
             result.addRow(Arrays.asList(String.valueOf(replica.getId()),
                     String.valueOf(replica.getBackendId()),
                     String.valueOf(replica.getVersion()),
-                    String.valueOf(replica.getVersionHash()),
+                    String.valueOf(0),
                     String.valueOf(replica.getLastSuccessVersion()),
-                    String.valueOf(replica.getLastSuccessVersionHash()),
+                    String.valueOf(0),
                     String.valueOf(replica.getLastFailedVersion()),
-                    String.valueOf(replica.getLastFailedVersionHash()),
+                    String.valueOf(0),
                     TimeUtils.longToTimeString(replica.getLastFailedTimestamp()),
                     String.valueOf(replica.getSchemaHash()),
                     String.valueOf(replica.getDataSize()),
                     String.valueOf(replica.getRowCount()),
                     String.valueOf(replica.getState()),
                     String.valueOf(replica.isBad()),
+                    String.valueOf(replica.isSetBadForce()),
                     String.valueOf(replica.getVersionCount()),
                     String.valueOf(replica.getPathHash()),
                     metaUrl,

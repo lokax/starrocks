@@ -19,17 +19,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_RUNTIME_MEM_POOL_H
-#define STARROCKS_BE_RUNTIME_MEM_POOL_H
+#pragma once
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
+#include <new>
 #include <string>
 #include <vector>
 
+#include "common/compiler_util.h"
 #include "common/config.h"
 #include "common/logging.h"
+#include "common/status.h"
 #include "gutil/dynamic_annotations.h"
 #include "runtime/memory/chunk.h"
 #include "storage/olap_define.h"
@@ -91,16 +93,12 @@ class MemTracker;
 ///    delete p;
 class MemPool {
 public:
-    /// 'tracker' tracks the amount of memory allocated by this pool. Must not be NULL.
-    MemPool(MemTracker* mem_tracker)
+    MemPool()
             : current_chunk_idx_(-1),
               next_chunk_size_(INITIAL_CHUNK_SIZE),
               total_allocated_bytes_(0),
               total_reserved_bytes_(0),
-              peak_allocated_bytes_(0),
-              mem_tracker_(mem_tracker) {
-        DCHECK(mem_tracker != nullptr);
-    }
+              peak_allocated_bytes_(0) {}
 
     /// Frees all chunks of memory and subtracts the total allocated bytes
     /// from the registered limits.
@@ -111,34 +109,13 @@ public:
     /// with enough capacity.
     uint8_t* allocate(int64_t size) { return allocate<false>(size, DEFAULT_ALIGNMENT); }
 
-    /// Same as Allocate() except the mem limit is checked before the allocation and
-    /// this call will fail (returns NULL) if it does.
-    /// The caller must handle the NULL case. This should be used for allocations
-    /// where the size can be very big to bound the amount by which we exceed mem limits.
-    uint8_t* try_allocate(int64_t size) { return allocate<true>(size, DEFAULT_ALIGNMENT); }
-
-    /// Same as TryAllocate() except a non-default alignment can be specified. It
-    /// should be a power-of-two in [1, alignof(std::max_align_t)].
-    uint8_t* try_allocate_aligned(int64_t size, int alignment) {
-        DCHECK_GE(alignment, 1);
-        DCHECK_LE(alignment, config::memory_max_alignment);
-        DCHECK_EQ(BitUtil::RoundUpToPowerOfTwo(alignment), alignment);
-        return allocate<true>(size, alignment);
-    }
-
     // Don't check memory limit
     uint8_t* allocate_aligned(int64_t size, int alignment) {
         DCHECK_GE(alignment, 1);
         DCHECK_LE(alignment, config::memory_max_alignment);
-        DCHECK_EQ(BitUtil::RoundUpToPowerOfTwo(alignment), alignment);
+        // alignment should be a power of 2
+        DCHECK((alignment & (alignment - 1)) == 0);
         return allocate<false>(size, alignment);
-    }
-
-    /// Same as TryAllocate() except returned memory is not aligned at all.
-    uint8_t* try_allocate_unaligned(int64_t size) {
-        // Call templated implementation directly so that it is inlined here and the
-        // alignment logic can be optimised out.
-        return allocate<true>(size, 1);
     }
 
     /// Makes all allocated chunks available for re-use, but doesn't delete any chunks.
@@ -154,7 +131,7 @@ public:
     void acquire_data(MemPool* src, bool keep_current);
 
     // Exchange all chunks with input source, including reserved chunks.
-    // This funciton will keep its own MemTracker, and upate it after exchange.
+    // This function will keep its own MemTracker, and update it after exchange.
     // Why we need this other than std::swap? Because swap will swap MemTracker too, which would
     // lead error. We only has MemTracker's pointer, which can be invalid after swap.
     void exchange_data(MemPool* other);
@@ -164,8 +141,6 @@ public:
     int64_t total_allocated_bytes() const { return total_allocated_bytes_; }
     int64_t total_reserved_bytes() const { return total_reserved_bytes_; }
     int64_t peak_allocated_bytes() const { return peak_allocated_bytes_; }
-
-    MemTracker* mem_tracker() { return mem_tracker_; }
 
     static const int DEFAULT_ALIGNMENT = 16;
 
@@ -180,9 +155,9 @@ private:
     struct ChunkInfo {
         Chunk chunk;
         /// bytes allocated via Allocate() in this chunk
-        int64_t allocated_bytes;
+        int64_t allocated_bytes{0};
         explicit ChunkInfo(const Chunk& chunk);
-        ChunkInfo() : allocated_bytes(0) {}
+        ChunkInfo() {}
     };
 
     /// A static field used as non-NULL pointer for zero length allocations. NULL is
@@ -235,7 +210,7 @@ private:
         // guarantee alignment.
         //static_assert(
         //INITIAL_CHUNK_SIZE >= config::FLAGS_MEMORY_MAX_ALIGNMENT, "Min chunk size too low");
-        if (UNLIKELY(!find_chunk(size, CHECK_LIMIT_FIRST))) return NULL;
+        if (UNLIKELY(!find_chunk(size, CHECK_LIMIT_FIRST))) return nullptr;
 
         ChunkInfo& info = chunks_[current_chunk_idx_];
         uint8_t* result = info.chunk.data + info.allocated_bytes;
@@ -269,15 +244,9 @@ private:
     int64_t peak_allocated_bytes_;
 
     std::vector<ChunkInfo> chunks_;
-
-    /// The current and peak memory footprint of this pool. This is different from
-    /// total allocated_bytes_ since it includes bytes in chunks that are not used.
-    MemTracker* mem_tracker_;
 };
 
 // Stamp out templated implementations here so they're included in IR module
 template uint8_t* MemPool::allocate<false>(int64_t size, int alignment);
 template uint8_t* MemPool::allocate<true>(int64_t size, int alignment);
 } // namespace starrocks
-
-#endif

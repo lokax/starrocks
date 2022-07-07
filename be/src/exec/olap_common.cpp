@@ -22,13 +22,12 @@
 #include "exec/olap_common.h"
 
 #include <boost/lexical_cast.hpp>
-#include <set>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "exec/olap_utils.h"
+#include "runtime/large_int_value.h"
 
 namespace starrocks {
 
@@ -40,34 +39,22 @@ std::string cast_to_string(__int128 value) {
 }
 
 template <>
-void ColumnValueRange<StringValue>::convert_to_fixed_value() {
-    return;
-}
+void ColumnValueRange<StringValue>::convert_to_fixed_value() {}
 
 template <>
-void ColumnValueRange<Slice>::convert_to_fixed_value() {
-    return;
-}
+void ColumnValueRange<Slice>::convert_to_fixed_value() {}
 
 template <>
-void ColumnValueRange<DecimalValue>::convert_to_fixed_value() {
-    return;
-}
+void ColumnValueRange<DecimalValue>::convert_to_fixed_value() {}
 
 template <>
-void ColumnValueRange<DecimalV2Value>::convert_to_fixed_value() {
-    return;
-}
+void ColumnValueRange<DecimalV2Value>::convert_to_fixed_value() {}
 
 template <>
-void ColumnValueRange<__int128>::convert_to_fixed_value() {
-    return;
-}
+void ColumnValueRange<__int128>::convert_to_fixed_value() {}
 
 template <>
-void ColumnValueRange<bool>::convert_to_fixed_value() {
-    return;
-}
+void ColumnValueRange<bool>::convert_to_fixed_value() {}
 
 Status OlapScanKeys::get_key_range(std::vector<std::unique_ptr<OlapScanRange>>* key_range) {
     key_range->clear();

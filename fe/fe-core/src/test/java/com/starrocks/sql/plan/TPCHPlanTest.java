@@ -1,9 +1,9 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.plan;
 
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.common.FeConstants;
+import com.starrocks.server.GlobalStateMgr;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -13,12 +13,13 @@ public class TPCHPlanTest extends PlanTestBase {
         PlanTestBase.beforeClass();
         FeConstants.runningUnitTest = true;
         connectContext.getSessionVariable().setNewPlanerAggStage(2);
+        connectContext.getSessionVariable().setCboCteReuse(false);
     }
 
     @Test
     public void testJoin() {
-        Catalog catalog = connectContext.getCatalog();
-        OlapTable table1 = (OlapTable) catalog.getDb("default_cluster:test").getTable("t0");
+        GlobalStateMgr globalStateMgr = connectContext.getGlobalStateMgr();
+        OlapTable table1 = (OlapTable) globalStateMgr.getDb("default_cluster:test").getTable("t0");
         setTableStatistics(table1, 10000);
         runFileUnitTest("optimized-plan/join");
         setTableStatistics(table1, 0);
@@ -61,7 +62,6 @@ public class TPCHPlanTest extends PlanTestBase {
 
     @Test
     public void testConstant() {
-        connectContext.getSessionVariable().enableNewPlanner();
         runFileUnitTest("optimized-plan/constant-query");
     }
 
@@ -115,7 +115,7 @@ public class TPCHPlanTest extends PlanTestBase {
         runFileUnitTest("tpch/q7");
     }
 
-    @Test
+    //@Test
     public void testTPCH8() {
         runFileUnitTest("tpch/q8");
     }

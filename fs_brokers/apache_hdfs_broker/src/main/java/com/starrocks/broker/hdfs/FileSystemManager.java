@@ -2,7 +2,7 @@
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master
 //                     /fs_brokers/apache_hdfs_broker/src/main/java
-//                     /org/apache/doris/broker/hdfs/FileSystemManager.java 
+//                     /org/apache/doris/broker/hdfs/FileSystemManager.java
 
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
@@ -74,6 +74,8 @@ public class FileSystemManager {
     private static final String S3A_SCHEME = "s3a";
     private static final String OSS_SCHEME = "oss";
     private static final String COS_SCHEME = "cosn";
+    private static final String KS3_SCHEME = "ks3";
+    private static final String OBS_SCHEME = "obs";
 
     private static final String USER_NAME_KEY = "username";
     private static final String PASSWORD_KEY = "password";
@@ -103,6 +105,15 @@ public class FileSystemManager {
     private static final String FS_S3A_ENDPOINT = "fs.s3a.endpoint";
     // This property is used like 'fs.hdfs.impl.disable.cache'
     private static final String FS_S3A_IMPL_DISABLE_CACHE = "fs.s3a.impl.disable.cache";
+    private static final String FS_S3A_CONNECTION_SSL_ENABLED = "fs.s3a.connection.ssl.enabled";
+
+    // arguments for ks3
+    private static final String FS_KS3_ACCESS_KEY = "fs.ks3.AccessKey";
+    private static final String FS_KS3_SECRET_KEY = "fs.ks3.AccessSecret";
+    private static final String FS_KS3_ENDPOINT = "fs.ks3.endpoint";
+    private static final String FS_KS3_IMPL = "fs.ks3.impl";
+    // This property is used like 'fs.ks3.impl.disable.cache'
+    private static final String FS_KS3_IMPL_DISABLE_CACHE = "fs.ks3.impl.disable.cache";
 
     //arguments for oss
     private static final String FS_OSS_ACCESS_KEY = "fs.oss.accessKeyId";
@@ -119,14 +130,22 @@ public class FileSystemManager {
     private static final String FS_COS_IMPL_DISABLE_CACHE = "fs.cosn.impl.disable.cache";
     private static final String FS_COS_IMPL = "fs.cosn.impl";
 
+    // arguments for obs
+    private static final String FS_OBS_ACCESS_KEY = "fs.obs.access.key";
+    private static final String FS_OBS_SECRET_KEY = "fs.obs.secret.key";
+    private static final String FS_OBS_ENDPOINT = "fs.obs.endpoint";
+    // This property is used like 'fs.hdfs.impl.disable.cache'
+    private static final String FS_OBS_IMPL_DISABLE_CACHE = "fs.obs.impl.disable.cache";
+    private static final String FS_OBS_IMPL = "fs.obs.impl";
+
     private ScheduledExecutorService handleManagementPool = Executors.newScheduledThreadPool(2);
-    
+
     private int readBufferSize = 128 << 10; // 128k
     private int writeBufferSize = 128 << 10; // 128k
-    
+
     private ConcurrentHashMap<FileSystemIdentity, BrokerFileSystem> cachedFileSystem;
     private ClientContextManager clientContextManager;
-    
+
     public FileSystemManager() {
         cachedFileSystem = new ConcurrentHashMap<>();
         clientContextManager = new ClientContextManager(handleManagementPool);
@@ -153,22 +172,22 @@ public class FileSystemManager {
 
         return finalPrincipal;
     }
-    
+
     /**
      * visible for test
-     * 
+     *
      * @param path
      * @param properties
      * @return BrokerFileSystem with different FileSystem based on scheme
-     * @throws URISyntaxException 
-     * @throws Exception 
+     * @throws URISyntaxException
+     * @throws Exception
      */
     public BrokerFileSystem getFileSystem(String path, Map<String, String> properties) {
         WildcardURI pathUri = new WildcardURI(path);
         String scheme = pathUri.getUri().getScheme();
         if (Strings.isNullOrEmpty(scheme)) {
             throw new BrokerException(TBrokerOperationStatusCode.INVALID_INPUT_FILE_PATH,
-                "invalid path. scheme is null");
+                    "invalid path. scheme is null");
         }
         BrokerFileSystem brokerFileSystem = null;
         if (scheme.equals(HDFS_SCHEME) || scheme.equals(VIEWFS_SCHEME)) {
@@ -179,20 +198,24 @@ public class FileSystemManager {
             brokerFileSystem = getOSSFileSystem(path, properties);
         } else if (scheme.equals(COS_SCHEME)) {
             brokerFileSystem = getCOSFileSystem(path, properties);
+        } else if (scheme.equals(KS3_SCHEME)) {
+            brokerFileSystem = getKS3FileSystem(path, properties);
+        } else if (scheme.equals(OBS_SCHEME)) {
+            brokerFileSystem = getOBSFileSystem(path, properties);
         } else {
             throw new BrokerException(TBrokerOperationStatusCode.INVALID_INPUT_FILE_PATH,
-                "invalid path. scheme is not supported");
+                    "invalid path. scheme is not supported");
         }
         return brokerFileSystem;
     }
 
     /**
      * visible for test
-     *
+     * <p>
      * file system handle is cached, the identity is host + username_password
      * it will have safety problem if only hostname is used because one user may specify username and password
      * and then access hdfs, another user may not specify username and password but could also access data
-     *
+     * <p>
      * Configs related to viewfs in core-site.xml and hdfs-site.xml should be copied to the broker conf directory.
      *
      * @param path
@@ -210,7 +233,7 @@ public class FileSystemManager {
                 logger.info("no schema and authority in path. use fs.defaultFs");
             } else {
                 logger.warn("invalid hdfs path. authority is null,path:" + path);
-                throw  new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
+                throw new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
                         "invalid hdfs path. authority is null");
             }
         }
@@ -218,12 +241,12 @@ public class FileSystemManager {
         String password = properties.getOrDefault(PASSWORD_KEY, "");
         String dfsNameServices = properties.getOrDefault(DFS_NAMESERVICES_KEY, "");
         String authentication = properties.getOrDefault(CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHENTICATION,
-            AUTHENTICATION_SIMPLE);
+                AUTHENTICATION_SIMPLE);
         if (Strings.isNullOrEmpty(authentication) || (!authentication.equals(AUTHENTICATION_SIMPLE)
-            && !authentication.equals(AUTHENTICATION_KERBEROS))) {
+                && !authentication.equals(AUTHENTICATION_KERBEROS))) {
             logger.warn("invalid authentication:" + authentication);
             throw new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
-                "invalid authentication:" + authentication);
+                    "invalid authentication:" + authentication);
         }
         String hdfsUgi = username + "," + password;
         FileSystemIdentity fileSystemIdentity = null;
@@ -238,11 +261,11 @@ public class FileSystemManager {
             } else if (properties.containsKey(KERBEROS_KEYTAB_CONTENT)) {
                 kerberosContent = properties.get(KERBEROS_KEYTAB_CONTENT);
             } else {
-                throw  new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
+                throw new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
                         "keytab is required for kerberos authentication");
             }
             if (!properties.containsKey(KERBEROS_PRINCIPAL)) {
-                throw  new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
+                throw new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
                         "principal is required for kerberos authentication");
             } else {
                 kerberosContent = kerberosContent + properties.get(KERBEROS_PRINCIPAL);
@@ -253,7 +276,7 @@ public class FileSystemManager {
                 String kerberosUgi = new String(result);
                 fileSystemIdentity = new FileSystemIdentity(host, kerberosUgi);
             } catch (NoSuchAlgorithmException e) {
-                throw  new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
+                throw new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
                         e.getMessage());
             }
         }
@@ -277,7 +300,7 @@ public class FileSystemManager {
                 // TODO get this param from properties
                 // conf.set("dfs.replication", "2");
                 String tmpFilePath = null;
-                if (authentication.equals(AUTHENTICATION_KERBEROS)){
+                if (authentication.equals(AUTHENTICATION_KERBEROS)) {
                     conf.set(CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHENTICATION,
                             AUTHENTICATION_KERBEROS);
 
@@ -300,7 +323,7 @@ public class FileSystemManager {
                         fileOutputStream.close();
                         keytab = tmpFilePath;
                     } else {
-                        throw  new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
+                        throw new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
                                 "keytab is required for kerberos authentication");
                     }
                     UserGroupInformation.setConfiguration(conf);
@@ -308,11 +331,11 @@ public class FileSystemManager {
                     if (properties.containsKey(KERBEROS_KEYTAB_CONTENT)) {
                         try {
                             File file = new File(tmpFilePath);
-                            if(!file.delete()){
-                                logger.warn("delete tmp file:" +  tmpFilePath + " failed");
+                            if (!file.delete()) {
+                                logger.warn("delete tmp file:" + tmpFilePath + " failed");
                             }
                         } catch (Exception e) {
-                            throw new  BrokerException(TBrokerOperationStatusCode.FILE_NOT_FOUND,
+                            throw new BrokerException(TBrokerOperationStatusCode.FILE_NOT_FOUND,
                                     e.getMessage());
                         }
                     }
@@ -321,15 +344,15 @@ public class FileSystemManager {
                     // ha hdfs arguments
                     final String dfsHaNameNodesKey = DFS_HA_NAMENODES_PREFIX + dfsNameServices;
                     if (!properties.containsKey(dfsHaNameNodesKey)) {
-                        throw  new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
+                        throw new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
                                 "load request missed necessary arguments for ha mode");
                     }
-                    String dfsHaNameNodes =  properties.get(dfsHaNameNodesKey);
+                    String dfsHaNameNodes = properties.get(dfsHaNameNodesKey);
                     conf.set(DFS_NAMESERVICES_KEY, dfsNameServices);
                     conf.set(dfsHaNameNodesKey, dfsHaNameNodes);
                     String[] nameNodes = dfsHaNameNodes.split(",");
                     if (nameNodes == null) {
-                        throw  new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
+                        throw new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
                                 "invalid " + dfsHaNameNodesKey + " configuration");
                     } else {
                         for (String nameNode : nameNodes) {
@@ -337,7 +360,7 @@ public class FileSystemManager {
                             String nameNodeRpcAddress =
                                     DFS_HA_NAMENODE_RPC_ADDRESS_PREFIX + dfsNameServices + "." + nameNode;
                             if (!properties.containsKey(nameNodeRpcAddress)) {
-                                throw  new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
+                                throw new BrokerException(TBrokerOperationStatusCode.INVALID_ARGUMENT,
                                         "missed " + nameNodeRpcAddress + " configuration");
                             } else {
                                 conf.set(nameNodeRpcAddress, properties.get(nameNodeRpcAddress));
@@ -359,14 +382,14 @@ public class FileSystemManager {
                     }
                     if (properties.containsKey(DFS_HA_NAMENODE_KERBEROS_PRINCIPAL_PATTERN)) {
                         conf.set(DFS_HA_NAMENODE_KERBEROS_PRINCIPAL_PATTERN,
-                            properties.get(DFS_HA_NAMENODE_KERBEROS_PRINCIPAL_PATTERN));
+                                properties.get(DFS_HA_NAMENODE_KERBEROS_PRINCIPAL_PATTERN));
                     }
                 }
 
                 conf.set(FS_HDFS_IMPL_DISABLE_CACHE, "true");
                 FileSystem dfsFileSystem = null;
                 if (authentication.equals(AUTHENTICATION_SIMPLE) &&
-                    properties.containsKey(USER_NAME_KEY) && !Strings.isNullOrEmpty(username)) {
+                        properties.containsKey(USER_NAME_KEY) && !Strings.isNullOrEmpty(username)) {
                     // Use the specified 'username' as the login name
                     UserGroupInformation ugi = UserGroupInformation.createRemoteUser(username);
                     dfsFileSystem = ugi.doAs(new PrivilegedExceptionAction<FileSystem>() {
@@ -391,8 +414,9 @@ public class FileSystemManager {
 
     /**
      * visible for test
-     *
+     * <p>
      * file system handle is cached, the identity is endpoint + bucket + accessKey_secretKey
+     *
      * @param path
      * @param properties
      * @return
@@ -404,6 +428,8 @@ public class FileSystemManager {
         String accessKey = properties.getOrDefault(FS_S3A_ACCESS_KEY, "");
         String secretKey = properties.getOrDefault(FS_S3A_SECRET_KEY, "");
         String endpoint = properties.getOrDefault(FS_S3A_ENDPOINT, "");
+        String disableCache = properties.getOrDefault(FS_S3A_IMPL_DISABLE_CACHE, "true");
+        String connectionSSLEnabled = properties.getOrDefault(FS_S3A_CONNECTION_SSL_ENABLED, "true");
         // endpoint is the server host, pathUri.getUri().getHost() is the bucket
         // we should use these two params as the host identity, because FileSystem will cache both.
         String host = S3A_SCHEME + "://" + endpoint + "/" + pathUri.getUri().getHost();
@@ -430,7 +456,8 @@ public class FileSystemManager {
                 conf.set(FS_S3A_ACCESS_KEY, accessKey);
                 conf.set(FS_S3A_SECRET_KEY, secretKey);
                 conf.set(FS_S3A_ENDPOINT, endpoint);
-                conf.set(FS_S3A_IMPL_DISABLE_CACHE, "true");
+                conf.set(FS_S3A_IMPL_DISABLE_CACHE, disableCache);
+                conf.set(FS_S3A_CONNECTION_SSL_ENABLED, connectionSSLEnabled);
                 FileSystem s3AFileSystem = FileSystem.get(pathUri.getUri(), conf);
                 fileSystem.setFileSystem(s3AFileSystem);
             }
@@ -445,8 +472,126 @@ public class FileSystemManager {
 
     /**
      * visible for test
-     *
+     * <p>
      * file system handle is cached, the identity is endpoint + bucket + accessKey_secretKey
+     *
+     * @param path
+     * @param properties
+     * @return
+     * @throws URISyntaxException
+     * @throws Exception
+     */
+    public BrokerFileSystem getKS3FileSystem(String path, Map<String, String> properties) {
+        WildcardURI pathUri = new WildcardURI(path);
+        String accessKey = properties.getOrDefault(FS_KS3_ACCESS_KEY, "");
+        String secretKey = properties.getOrDefault(FS_KS3_SECRET_KEY, "");
+        String endpoint = properties.getOrDefault(FS_KS3_ENDPOINT, "");
+        String disableCache = properties.getOrDefault(FS_KS3_IMPL_DISABLE_CACHE, "true");
+        // endpoint is the server host, pathUri.getUri().getHost() is the bucket
+        // we should use these two params as the host identity, because FileSystem will cache both.
+        String host = KS3_SCHEME + "://" + endpoint + "/" + pathUri.getUri().getHost();
+        String ks3aUgi = accessKey + "," + secretKey;
+        FileSystemIdentity fileSystemIdentity = new FileSystemIdentity(host, ks3aUgi);
+        BrokerFileSystem fileSystem = null;
+        cachedFileSystem.putIfAbsent(fileSystemIdentity, new BrokerFileSystem(fileSystemIdentity));
+        fileSystem = cachedFileSystem.get(fileSystemIdentity);
+        if (fileSystem == null) {
+            // it means it is removed concurrently by checker thread
+            return null;
+        }
+        fileSystem.getLock().lock();
+        try {
+            if (!cachedFileSystem.containsKey(fileSystemIdentity)) {
+                // this means the file system is closed by file system checker thread
+                // it is a corner case
+                return null;
+            }
+            if (fileSystem.getDFSFileSystem() == null) {
+                logger.info("could not find file system for path " + path + " create a new one");
+                // create a new filesystem
+                Configuration conf = new Configuration();
+                conf.set(FS_KS3_ACCESS_KEY, accessKey);
+                conf.set(FS_KS3_SECRET_KEY, secretKey);
+                conf.set(FS_KS3_ENDPOINT, endpoint);
+                conf.set(FS_KS3_IMPL, "com.ksyun.kmr.hadoop.fs.ks3.Ks3FileSystem");
+                conf.set(FS_KS3_IMPL_DISABLE_CACHE, disableCache);
+                FileSystem ks3FileSystem = FileSystem.get(pathUri.getUri(), conf);
+                fileSystem.setFileSystem(ks3FileSystem);
+            }
+            return fileSystem;
+        } catch (Exception e) {
+            logger.error("errors while connect to " + path, e);
+            throw new BrokerException(TBrokerOperationStatusCode.NOT_AUTHORIZED, e);
+        } finally {
+            fileSystem.getLock().unlock();
+        }
+    }
+
+    /**
+     * visible for test
+     * <p>
+     * file system handle is cached, the identity is endpoint + bucket + accessKey_secretKey
+     *
+     * @param path
+     * @param properties
+     * @return
+     * @throws URISyntaxException
+     * @throws Exception
+     */
+    public BrokerFileSystem getOBSFileSystem(String path, Map<String, String> properties) {
+        WildcardURI pathUri = new WildcardURI(path);
+        String accessKey = properties.getOrDefault(FS_OBS_ACCESS_KEY, "");
+        String secretKey = properties.getOrDefault(FS_OBS_SECRET_KEY, "");
+        String endpoint = properties.getOrDefault(FS_OBS_ENDPOINT, "");
+        String disableCache = properties.getOrDefault(FS_OBS_IMPL_DISABLE_CACHE, "true");
+
+        // endpoint is the server host, pathUri.getUri().getHost() is the bucket
+        // we should use these two params as the host identity, because FileSystem will cache both.
+        String host = OBS_SCHEME + "://" + endpoint + "/" + pathUri.getUri().getHost();
+        String obsUgi = accessKey + "," + secretKey;
+
+        FileSystemIdentity fileSystemIdentity = new FileSystemIdentity(host, obsUgi);
+        cachedFileSystem.putIfAbsent(fileSystemIdentity, new BrokerFileSystem(fileSystemIdentity));
+        BrokerFileSystem fileSystem = cachedFileSystem.get(fileSystemIdentity);
+
+        if (fileSystem == null) {
+            // it means it is removed concurrently by checker thread
+            return null;
+        }
+        fileSystem.getLock().lock();
+        try {
+            if (!cachedFileSystem.containsKey(fileSystemIdentity)) {
+                // this means the file system is closed by file system checker thread
+                // it is a corner case
+                return null;
+            }
+
+            if (fileSystem.getDFSFileSystem() == null) {
+                logger.info("could not find file system for path " + path + " create a new one");
+                // create a new filesystem
+                Configuration conf = new Configuration();
+                conf.set(FS_OBS_ACCESS_KEY, accessKey);
+                conf.set(FS_OBS_SECRET_KEY, secretKey);
+                conf.set(FS_OBS_ENDPOINT, endpoint);
+                conf.set(FS_OBS_IMPL, "org.apache.hadoop.fs.obs.OBSFileSystem");
+                conf.set(FS_OBS_IMPL_DISABLE_CACHE, disableCache);
+                FileSystem obsFileSystem = FileSystem.get(pathUri.getUri(), conf);
+                fileSystem.setFileSystem(obsFileSystem);
+            }
+            return fileSystem;
+        } catch (Exception e) {
+            logger.error("errors while connect to " + path, e);
+            throw new BrokerException(TBrokerOperationStatusCode.NOT_AUTHORIZED, e);
+        } finally {
+            fileSystem.getLock().unlock();
+        }
+    }
+
+    /**
+     * visible for test
+     * <p>
+     * file system handle is cached, the identity is endpoint + bucket + accessKey_secretKey
+     *
      * @param path
      * @param properties
      * @return
@@ -458,6 +603,7 @@ public class FileSystemManager {
         String accessKey = properties.getOrDefault(FS_OSS_ACCESS_KEY, "");
         String secretKey = properties.getOrDefault(FS_OSS_SECRET_KEY, "");
         String endpoint = properties.getOrDefault(FS_OSS_ENDPOINT, "");
+        String disableCache = properties.getOrDefault(FS_OSS_IMPL_DISABLE_CACHE, "true");
         // endpoint is the server host, pathUri.getUri().getHost() is the bucket
         // we should use these two params as the host identity, because FileSystem will cache both.
         String host = OSS_SCHEME + "://" + endpoint + "/" + pathUri.getUri().getHost();
@@ -485,7 +631,7 @@ public class FileSystemManager {
                 conf.set(FS_OSS_SECRET_KEY, secretKey);
                 conf.set(FS_OSS_ENDPOINT, endpoint);
                 conf.set(FS_OSS_IMPL, "org.apache.hadoop.fs.aliyun.oss.AliyunOSSFileSystem");
-                conf.set(FS_OSS_IMPL_DISABLE_CACHE, "true");
+                conf.set(FS_OSS_IMPL_DISABLE_CACHE, disableCache);
                 FileSystem ossFileSystem = FileSystem.get(pathUri.getUri(), conf);
                 fileSystem.setFileSystem(ossFileSystem);
             }
@@ -507,6 +653,7 @@ public class FileSystemManager {
         String accessKey = properties.getOrDefault(FS_COS_ACCESS_KEY, "");
         String secretKey = properties.getOrDefault(FS_COS_SECRET_KEY, "");
         String endpoint = properties.getOrDefault(FS_COS_ENDPOINT, "");
+        String disableCache = properties.getOrDefault(FS_COS_IMPL_DISABLE_CACHE, "true");
         // endpoint is the server host, pathUri.getUri().getHost() is the bucket
         // we should use these two params as the host identity, because FileSystem will cache both.
         String host = COS_SCHEME + "://" + endpoint + "/" + pathUri.getUri().getHost();
@@ -534,7 +681,7 @@ public class FileSystemManager {
                 conf.set(FS_COS_SECRET_KEY, secretKey);
                 conf.set(FS_COS_ENDPOINT, endpoint);
                 conf.set(FS_COS_IMPL, "org.apache.hadoop.fs.CosFileSystem");
-                conf.set(FS_COS_IMPL_DISABLE_CACHE, "true");
+                conf.set(FS_COS_IMPL_DISABLE_CACHE, disableCache);
                 FileSystem cosFileSystem = FileSystem.get(pathUri.getUri(), conf);
                 fileSystem.setFileSystem(cosFileSystem);
             }
@@ -585,12 +732,12 @@ public class FileSystemManager {
         } catch (Exception e) {
             logger.error("errors while get file status ", e);
             fileSystem.closeFileSystem();
-            throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR, 
+            throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR,
                     e, "unknown error when get file status");
         }
         return resultFileStatus;
     }
-    
+
     public void deletePath(String path, Map<String, String> properties) {
         WildcardURI pathUri = new WildcardURI(path);
         BrokerFileSystem fileSystem = getFileSystem(path, properties);
@@ -600,16 +747,16 @@ public class FileSystemManager {
         } catch (IOException e) {
             logger.error("errors while delete path " + path);
             fileSystem.closeFileSystem();
-            throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR, 
+            throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR,
                     e, "delete path {} error", path);
         }
     }
-    
+
     public void renamePath(String srcPath, String destPath, Map<String, String> properties) {
         WildcardURI srcPathUri = new WildcardURI(srcPath);
         WildcardURI destPathUri = new WildcardURI(destPath);
         if (!srcPathUri.getAuthority().trim().equals(destPathUri.getAuthority().trim())) {
-            throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR, 
+            throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR,
                     "only allow rename in same file system");
         }
         BrokerFileSystem fileSystem = getFileSystem(srcPath, properties);
@@ -618,17 +765,17 @@ public class FileSystemManager {
         try {
             boolean isRenameSuccess = fileSystem.getDFSFileSystem().rename(srcfilePath, destfilePath);
             if (!isRenameSuccess) {
-                throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR, 
-                        "failed to rename path from {} to {}", srcPath, destPath); 
+                throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR,
+                        "failed to rename path from {} to {}", srcPath, destPath);
             }
         } catch (IOException e) {
             logger.error("errors while rename path from " + srcPath + " to " + destPath);
             fileSystem.closeFileSystem();
-            throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR, 
+            throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR,
                     e, "errors while rename {} to {}", srcPath, destPath);
         }
     }
-    
+
     public boolean checkPathExist(String path, Map<String, String> properties) {
         WildcardURI pathUri = new WildcardURI(path);
         BrokerFileSystem fileSystem = getFileSystem(path, properties);
@@ -639,11 +786,11 @@ public class FileSystemManager {
         } catch (IOException e) {
             logger.error("errors while check path exist: " + path);
             fileSystem.closeFileSystem();
-            throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR, 
+            throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR,
                     e, "errors while check if path {} exist", path);
         }
     }
-    
+
     public TBrokerFD openReader(String clientId, String path, long startOffset, Map<String, String> properties) {
         WildcardURI pathUri = new WildcardURI(path);
         Path inputFilePath = new Path(pathUri.getPath());
@@ -658,11 +805,11 @@ public class FileSystemManager {
         } catch (IOException e) {
             logger.error("errors while open path", e);
             fileSystem.closeFileSystem();
-            throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR, 
+            throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR,
                     e, "could not open file {}", path);
         }
     }
-    
+
     public ByteBuffer pread(TBrokerFD fd, long offset, long length) {
         FSDataInputStream fsDataInputStream = clientContextManager.getFsDataInputStream(fd);
         synchronized (fsDataInputStream) {
@@ -691,7 +838,7 @@ public class FileSystemManager {
             if (length > readBufferSize) {
                 buf = new byte[readBufferSize];
             } else {
-                buf = new byte[(int)length];
+                buf = new byte[(int) length];
             }
             try {
                 int readLength = readByteArrayFully(fsDataInputStream, buf);
@@ -710,12 +857,12 @@ public class FileSystemManager {
             }
         }
     }
-    
+
     public void seek(TBrokerFD fd, long offset) {
-        throw new BrokerException(TBrokerOperationStatusCode.OPERATION_NOT_SUPPORTED, 
+        throw new BrokerException(TBrokerOperationStatusCode.OPERATION_NOT_SUPPORTED,
                 "seek this method is not supported");
     }
-    
+
     public void closeReader(TBrokerFD fd) {
         FSDataInputStream fsDataInputStream = clientContextManager.getFsDataInputStream(fd);
         synchronized (fsDataInputStream) {
@@ -730,13 +877,13 @@ public class FileSystemManager {
             }
         }
     }
-    
+
     public TBrokerFD openWriter(String clientId, String path, Map<String, String> properties) {
         WildcardURI pathUri = new WildcardURI(path);
         Path inputFilePath = new Path(pathUri.getPath());
         BrokerFileSystem fileSystem = getFileSystem(path, properties);
         try {
-            FSDataOutputStream fsDataOutputStream = fileSystem.getDFSFileSystem().create(inputFilePath, 
+            FSDataOutputStream fsDataOutputStream = fileSystem.getDFSFileSystem().create(inputFilePath,
                     true, writeBufferSize);
             UUID uuid = UUID.randomUUID();
             TBrokerFD fd = parseUUIDToFD(uuid);
@@ -745,22 +892,15 @@ public class FileSystemManager {
         } catch (IOException e) {
             logger.error("errors while open path", e);
             fileSystem.closeFileSystem();
-            throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR, 
+            throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR,
                     e, "could not open file {}", path);
         }
     }
-    
+
     public void pwrite(TBrokerFD fd, long offset, byte[] data) {
         FSDataOutputStream fsDataOutputStream = clientContextManager.getFsDataOutputStream(fd);
         synchronized (fsDataOutputStream) {
-            long currentStreamOffset;
-            try {
-                currentStreamOffset = fsDataOutputStream.getPos();
-            } catch (IOException e) {
-                logger.error("errors while get file pos from output stream", e);
-                throw new BrokerException(TBrokerOperationStatusCode.TARGET_STORAGE_SERVICE_ERROR,
-                        "errors while get file pos from output stream");
-            }
+            long currentStreamOffset = fsDataOutputStream.getPos();
             if (currentStreamOffset != offset) {
                 throw new BrokerException(TBrokerOperationStatusCode.INVALID_INPUT_OFFSET,
                         "current outputstream offset is {} not equal to request {}",
@@ -775,7 +915,7 @@ public class FileSystemManager {
             }
         }
     }
-    
+
     public void closeWriter(TBrokerFD fd) {
         FSDataOutputStream fsDataOutputStream = clientContextManager.getFsDataOutputStream(fd);
         synchronized (fsDataOutputStream) {
@@ -791,11 +931,11 @@ public class FileSystemManager {
             }
         }
     }
-    
+
     public void ping(String clientId) {
         clientContextManager.onPing(clientId);
     }
-    
+
     private static TBrokerFD parseUUIDToFD(UUID uuid) {
         return new TBrokerFD(uuid.getMostSignificantBits(), uuid.getLeastSignificantBits());
     }
@@ -803,7 +943,7 @@ public class FileSystemManager {
     private int readByteArrayFully(FSDataInputStream is, byte[] dest) throws IOException {
         int readLength = 0;
         while (readLength < dest.length) {
-            int n = is.read(dest , readLength, dest.length - readLength);
+            int n = is.read(dest, readLength, dest.length - readLength);
             if (n <= 0) {
                 break;
             }
@@ -811,7 +951,7 @@ public class FileSystemManager {
         }
         return readLength;
     }
-    
+
     class FileSystemExpirationChecker implements Runnable {
         @Override
         public void run() {
@@ -834,6 +974,6 @@ public class FileSystemManager {
                 FileSystemManager.this.handleManagementPool.schedule(this, 60, TimeUnit.SECONDS);
             }
         }
-        
+
     }
 }

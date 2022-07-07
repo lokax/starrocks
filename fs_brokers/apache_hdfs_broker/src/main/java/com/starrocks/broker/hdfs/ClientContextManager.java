@@ -1,9 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master
-//                     /fs_brokers/apache_hdfs_broker/src/main/java
-//                     /org/apache/doris/broker/hdfs/ClientContextManager.java 
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -64,6 +58,7 @@ public class ClientContextManager {
             clientContexts.putIfAbsent(clientId, new ClientResourceContext(clientId));
         }
         ClientResourceContext clientContext = clientContexts.get(clientId);
+        clientContext.updateClientLastPingTime();
         clientContext.putOutputStream(fd, fsDataOutputStream, brokerFileSystem);
         fdToClientMap.putIfAbsent(fd, clientId);
     }
@@ -74,6 +69,7 @@ public class ClientContextManager {
             clientContexts.putIfAbsent(clientId, new ClientResourceContext(clientId));
         }
         ClientResourceContext clientContext = clientContexts.get(clientId);
+        clientContext.updateClientLastPingTime();
         clientContext.putInputStream(fd, fsDataInputStream, brokerFileSystem);
         fdToClientMap.putIfAbsent(fd, clientId);
     }
@@ -85,6 +81,7 @@ public class ClientContextManager {
                     "the fd is not owned by client {}", clientId);
         }
         ClientResourceContext clientContext = clientContexts.get(clientId);
+        clientContext.updateClientLastPingTime();
         FSDataInputStream fsDataInputStream = clientContext.getInputStream(fd);
         return fsDataInputStream;
     }
@@ -96,6 +93,7 @@ public class ClientContextManager {
                     "the fd is not owned by client {}", clientId);
         }
         ClientResourceContext clientContext = clientContexts.get(clientId);
+        clientContext.updateClientLastPingTime();
         FSDataOutputStream fsDataOutputStream = clientContext.getOutputStream(fd);
         return fsDataOutputStream;
     }
@@ -234,6 +232,10 @@ public class ClientContextManager {
                 return brokerOutputStream.getOutputStream();
             }
             return null;
+        }
+
+        public void updateClientLastPingTime() {
+            this.lastPingTimestamp = System.currentTimeMillis();
         }
         
         public void updateLastPingTime() {

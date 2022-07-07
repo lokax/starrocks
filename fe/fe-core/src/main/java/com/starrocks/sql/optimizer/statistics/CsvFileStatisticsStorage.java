@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.statistics;
 
@@ -14,6 +14,7 @@ import com.starrocks.common.AnalysisException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.Pair;
+import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.mortbay.log.Log;
@@ -139,12 +140,19 @@ public class CsvFileStatisticsStorage implements StatisticStorage {
     }
 
     @Override
-    public void expireColumnStatistics(Table table, List<String> columns) {
+    public void addColumnStatistic(Table table, String column, ColumnStatistic columnStatistic) {
     }
 
     @Override
-    public void addColumnStatistic(Table table, String column, ColumnStatistic columnStatistic) {
+    public Map<ColumnRefOperator, Histogram> getHistogramStatistics(Table table, List<ColumnRefOperator> columns) {
+        return Maps.newHashMap();
     }
+
+    @Override
+    public void expireHistogramStatistics(Long tableId, List<String> columns) {
+
+    }
+
 
     private class StatisticsEntry {
         public String tableId;
@@ -162,7 +170,7 @@ public class CsvFileStatisticsStorage implements StatisticStorage {
 
         public void setValue(String[] row) {
             if (row.length != 12) {
-                Log.warn("row miss some filed");
+                Log.warn("row miss some field");
                 return;
             }
             this.tableId = row[0];

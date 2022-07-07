@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 package com.starrocks.sql.optimizer.operator.logical;
 
 import com.starrocks.sql.optimizer.ExpressionContext;
@@ -6,35 +6,90 @@ import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptExpressionVisitor;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.operator.OperatorType;
+import com.starrocks.sql.optimizer.operator.OperatorVisitor;
 
-import java.util.Objects;
+import java.util.ArrayList;
 
 public class LogicalLimitOperator extends LogicalOperator {
-    private final long offset;
-
-    public LogicalLimitOperator(long limit) {
-        super(OperatorType.LOGICAL_LIMIT);
-        this.limit = limit;
-        offset = -1;
+    public enum Phase {
+        INIT, // Init will split to LOCAL/GLOBAL
+        LOCAL,  // Only push down LOCAL limit
+        GLOBAL, // GLOBAL limit will gather child
     }
 
-    public LogicalLimitOperator(long limit, long offset) {
+    private final long offset;
+
+    private final Phase phase;
+
+    public LogicalLimitOperator(long limit, long offset, Phase phase) {
         super(OperatorType.LOGICAL_LIMIT);
         this.limit = limit;
         this.offset = offset;
+        this.phase = phase;
+    }
+
+    public static LogicalLimitOperator init(long limit) {
+        return new LogicalLimitOperator(limit, DEFAULT_OFFSET, Phase.INIT);
+    }
+
+    public static LogicalLimitOperator init(long limit, long offset) {
+        return new LogicalLimitOperator(limit, offset, Phase.INIT);
+    }
+
+    public static LogicalLimitOperator global(long limit) {
+        return global(limit, DEFAULT_OFFSET);
+    }
+
+    public static LogicalLimitOperator global(long limit, long offset) {
+        return new LogicalLimitOperator(limit, offset, Phase.GLOBAL);
+    }
+
+    public static LogicalLimitOperator local(long limit) {
+        return local(limit, DEFAULT_OFFSET);
+    }
+
+    public static LogicalLimitOperator local(long limit, long offset) {
+        return new LogicalLimitOperator(limit, offset, Phase.LOCAL);
+    }
+
+    private LogicalLimitOperator(Builder builder) {
+        super(OperatorType.LOGICAL_LIMIT, builder.getLimit(), builder.getPredicate(), builder.getProjection());
+        this.limit = builder.getLimit();
+        this.offset = builder.offset;
+        this.phase = builder.phase;
     }
 
     public boolean hasOffset() {
-        return offset > 0;
+        return offset > DEFAULT_OFFSET;
     }
 
     public long getOffset() {
         return offset;
     }
 
+    public Phase getPhase() {
+        return phase;
+    }
+
+    public boolean isInit() {
+        return phase == Phase.INIT;
+    }
+
+    public boolean isLocal() {
+        return phase == Phase.LOCAL;
+    }
+
+    public boolean isGlobal() {
+        return phase == Phase.GLOBAL;
+    }
+
     @Override
     public ColumnRefSet getOutputColumns(ExpressionContext expressionContext) {
-        return expressionContext.getChildLogicalProperty(0).getOutputColumns();
+        if (projection != null) {
+            return new ColumnRefSet(new ArrayList<>(projection.getColumnRefMap().keySet()));
+        } else {
+            return expressionContext.getChildLogicalProperty(0).getOutputColumns();
+        }
     }
 
     public <R, C> R accept(OptExpressionVisitor<R, C> visitor, OptExpression optExpression, C context) {
@@ -42,22 +97,45 @@ public class LogicalLimitOperator extends LogicalOperator {
     }
 
     @Override
+    public <R, C> R accept(OperatorVisitor<R, C> visitor, C context) {
+        return visitor.visitLogicalLimit(this, context);
+    }
+
+    @Override
     public boolean equals(Object o) {
-        if (this == o) {
-            return true;
-        }
-        if (o == null || getClass() != o.getClass()) {
-            return false;
-        }
-        if (!super.equals(o)) {
-            return false;
-        }
-        LogicalLimitOperator that = (LogicalLimitOperator) o;
-        return offset == that.offset;
+        return this == o;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode(), offset);
+        return System.identityHashCode(this);
+    }
+
+    public static class Builder extends LogicalOperator.Builder<LogicalLimitOperator, LogicalLimitOperator.Builder> {
+        private long offset = DEFAULT_OFFSET;
+
+        private Phase phase = Phase.INIT;
+
+        @Override
+        public LogicalLimitOperator build() {
+            return new LogicalLimitOperator(this);
+        }
+
+        @Override
+        public LogicalLimitOperator.Builder withOperator(LogicalLimitOperator operator) {
+            super.withOperator(operator);
+            this.offset = operator.offset;
+            this.phase = operator.phase;
+            return this;
+        }
+
+        public void setPhase(Phase phase) {
+            this.phase = phase;
+        }
+
+        public Builder setOffset(long offset) {
+            this.offset = offset;
+            return this;
+        }
     }
 }

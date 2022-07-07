@@ -38,6 +38,7 @@ public class OperationType {
     public static final short OP_ADD_PARTITION = 12;
     public static final short OP_DROP_PARTITION = 13;
     public static final short OP_MODIFY_PARTITION = 14;
+    @Deprecated
     public static final short OP_ERASE_TABLE = 15;
     public static final short OP_ERASE_PARTITION = 16;
     public static final short OP_RECOVER_TABLE = 17;
@@ -52,12 +53,18 @@ public class OperationType {
     public static final short OP_BATCH_MODIFY_PARTITION = 211;
 
     // 20~29 120~129 220~229 ...
+    @Deprecated
     public static final short OP_START_ROLLUP = 20;
+    @Deprecated
     public static final short OP_FINISH_ROLLUP = 21;
+    @Deprecated
     public static final short OP_CANCEL_ROLLUP = 23;
     public static final short OP_DROP_ROLLUP = 24;
+    @Deprecated
     public static final short OP_START_SCHEMA_CHANGE = 25;
+    @Deprecated
     public static final short OP_FINISH_SCHEMA_CHANGE = 26;
+    @Deprecated
     public static final short OP_CANCEL_SCHEMA_CHANGE = 27;
     public static final short OP_CLEAR_ROLLUP_INFO = 28;
     public static final short OP_FINISH_CONSISTENCY_CHECK = 29;
@@ -111,14 +118,6 @@ public class OperationType {
     public static final short OP_GLOBAL_VARIABLE = 73;
 
     public static final short OP_CREATE_CLUSTER = 74;
-    public static final short OP_DROP_CLUSTER = 75;
-    public static final short OP_EXPAND_CLUSTER = 76;
-    public static final short OP_MIGRATE_CLUSTER = 77;
-    public static final short OP_LINK_CLUSTER = 78;
-    public static final short OP_ENTER_CLUSTER = 79;
-    public static final short OP_SHOW_CLUSTERS = 80;
-    public static final short OP_UPDATE_DB = 82;
-    public static final short OP_DROP_LINKDB = 83;
     public static final short OP_GLOBAL_VARIABLE_V2 = 84;
 
     public static final short OP_ADD_BROKER = 85;
@@ -139,7 +138,9 @@ public class OperationType {
     //real time load 100 -108
     public static final short OP_UPSERT_TRANSACTION_STATE = 100;
     public static final short OP_DELETE_TRANSACTION_STATE = 101;
+    @Deprecated
     public static final short OP_FINISHING_ROLLUP = 102;
+    @Deprecated
     public static final short OP_FINISHING_SCHEMA_CHANGE = 103;
     public static final short OP_SAVE_TRANSACTION_ID = 104;
 
@@ -170,10 +171,13 @@ public class OperationType {
     // dynamic partition 261~265
     public static final short OP_DYNAMIC_PARTITION = 261;
 
-    // set table replicatin_num config 266
+    // set table replication_num config 266
     public static final short OP_MODIFY_REPLICATION_NUM = 266;
     // set table in memory
     public static final short OP_MODIFY_IN_MEMORY = 267;
+
+    // global dict
+    public static final short OP_SET_FORBIT_GLOBAL_DICT = 268;
 
     // plugin 270~275
     public static final short OP_INSTALL_PLUGIN = 270;
@@ -190,8 +194,53 @@ public class OperationType {
     public static final short OP_SWAP_TABLE = 10001;
     public static final short OP_ADD_PARTITIONS = 10002;
     public static final short OP_FINISH_MULTI_DELETE = 10003;
+    public static final short OP_ERASE_MULTI_TABLES = 10004;
+    public static final short OP_MODIFY_ENABLE_PERSISTENT_INDEX = 10005;
 
     // statistic 10010 ~ 10020
     public static final short OP_ADD_ANALYZER_JOB = 10010;
     public static final short OP_REMOVE_ANALYZER_JOB = 10011;
+    public static final short OP_ADD_ANALYZE_STATUS = 10012;
+    public static final short OP_ADD_BASIC_STATS_META = 10013;
+    public static final short OP_ADD_HISTOGRAM_STATS_META = 10014;
+
+    // workgroup 10021 ~ 10030
+    public static final short OP_WORKGROUP = 10021;
+
+    // external hive table column change
+    public static final short OP_MODIFY_HIVE_TABLE_COLUMN = 10031;
+
+    // New version of heartbeat
+    public static final short OP_HEARTBEAT_V2 = 10041; // V2 version of heartbeat
+
+    // create external catalog
+    public static final short OP_CREATE_CATALOG = 10051;
+
+    // drop catalog
+    public static final short OP_DROP_CATALOG = 10061;
+    // grant & revoke impersonate
+    public static final short OP_GRANT_IMPERSONATE = 10062;
+    public static final short OP_REVOKE_IMPERSONATE = 10063;
+
+    // task 10071 ~ 10090
+    public static final short OP_CREATE_TASK = 10071;
+    public static final short OP_DROP_TASKS = 10072;
+    public static final short OP_CREATE_TASK_RUN = 10081;
+    public static final short OP_UPDATE_TASK_RUN = 10082;
+    public static final short OP_DROP_TASK_RUNS = 10083;
+
+    // materialized view
+    public static final short OP_RENAME_MATERIALIZED_VIEW = 10091;
+    public static final short OP_CHANGE_MATERIALIZED_VIEW_REFRESH_SCHEME = 10092;
+
+    public static final short OP_CREATE_MATERIALIZED_VIEW = 10094;
+    public static final short OP_CREATE_INSERT_OVERWRITE = 10095;
+    public static final short OP_INSERT_OVERWRITE_STATE_CHANGE = 10096;
+
+    // manage system node info 10100 ~ 10120
+    public static final short OP_UPDATE_FRONTEND = 10101;
+
+    // manage compute node 10201 ~ 10220
+    public static final short OP_ADD_COMPUTE_NODE = 10201;
+    public static final short OP_DROP_COMPUTE_NODE = 10202;
 }

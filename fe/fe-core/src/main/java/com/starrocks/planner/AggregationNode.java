@@ -37,17 +37,10 @@ import com.starrocks.thrift.TExpr;
 import com.starrocks.thrift.TPlanNode;
 import com.starrocks.thrift.TPlanNodeType;
 import com.starrocks.thrift.TStreamingPreaggregationMode;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
-import java.util.ArrayList;
 import java.util.List;
 
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public class AggregationNode extends PlanNode {
-    private static final Logger LOG = LogManager.getLogger(AggregationNode.class);
     private final AggregateInfo aggInfo;
 
     // Set to true if this aggregation node needs to run the Finalize step. This
@@ -71,18 +64,6 @@ public class AggregationNode extends PlanNode {
         updateplanNodeName();
     }
 
-    /**
-     * Copy c'tor used in clone().
-     */
-    private AggregationNode(PlanNodeId id, AggregationNode src) {
-        super(id, src, "AGGREGATE");
-        aggInfo = src.aggInfo;
-        needsFinalize = src.needsFinalize;
-    }
-
-    public AggregateInfo getAggInfo() {
-        return aggInfo;
-    }
 
     // Unsets this node as requiring finalize. Only valid to call this if it is
     // currently marked as needing finalize.
@@ -96,8 +77,8 @@ public class AggregationNode extends PlanNode {
      * Sets this node as a preaggregation. Only valid to call this if it is not marked
      * as a preaggregation
      */
-    public void setIsPreagg(PlannerContext ctx_) {
-        useStreamingPreagg = aggInfo.getGroupingExprs().size() > 0;
+    public void setIsPreagg(boolean canUseStreamingPreAgg) {
+        useStreamingPreagg = canUseStreamingPreAgg && aggInfo.getGroupingExprs().size() > 0;
     }
 
     /**
@@ -113,55 +94,6 @@ public class AggregationNode extends PlanNode {
 
     @Override
     public void init(Analyzer analyzer) throws UserException {
-        // Assign predicates to the top-most agg in the single-node plan that can evaluate
-        // them, as follows: For non-distinct aggs place them in the 1st phase agg node. For
-        // distinct aggs place them in the 2nd phase agg node. The conjuncts are
-        // transferred to the proper place in the multi-node plan via transferConjuncts().
-        if (tupleIds.get(0).equals(aggInfo.getResultTupleId()) && !aggInfo.isMerge()) {
-            // Ignore predicates bound by a grouping slot produced by a SlotRef grouping expr.
-            // Those predicates are already evaluated below this agg node (e.g., in a scan),
-            // because the grouping slot must be in the same equivalence class as another slot
-            // below this agg node. We must not ignore other grouping slots in order to retain
-            // conjuncts bound by those grouping slots in createEquivConjuncts() (IMPALA-2089).
-            // Those conjuncts cannot be redundant because our equivalence classes do not
-            // capture dependencies with non-SlotRef exprs.
-            // Set<SlotId> groupBySlots = Sets.newHashSet();
-            // for (int i = 0; i < aggInfo.getGroupingExprs().size(); ++i) {
-            //    if (aggInfo.getGroupingExprs().get(i).unwrapSlotRef(true) == null) continue;
-            //    groupBySlots.add(aggInfo.getOutputTupleDesc().getSlots().get(i).getId());
-            // }
-            // ArrayList<Expr> bindingPredicates =
-            //         analyzer.getBoundPredicates(tupleIds.get(0), groupBySlots, true);
-            ArrayList<Expr> bindingPredicates = Lists.newArrayList();
-            conjuncts.addAll(bindingPredicates);
-
-            // also add remaining unassigned conjuncts_
-            assignConjuncts(analyzer);
-
-            // TODO(zc)
-            // analyzer.createEquivConjuncts(tupleIds_.get(0), conjuncts_, groupBySlots);
-        }
-        // TODO(zc)
-        // conjuncts_ = orderConjunctsByCost(conjuncts_);
-
-        // Compute the mem layout for both tuples here for simplicity.
-        aggInfo.getOutputTupleDesc().computeMemLayout();
-        aggInfo.getIntermediateTupleDesc().computeMemLayout();
-
-        // do this at the end so it can take all conjuncts into account
-        computeStats(analyzer);
-
-        // don't call createDefaultSMap(), it would point our conjuncts (= Having clause)
-        // to our input; our conjuncts don't get substituted because they already
-        // refer to our output
-        outputSmap = getCombinedChildSmap();
-        aggInfo.substitute(outputSmap, analyzer);
-
-        // assert consistent aggregate expr and slot materialization
-        // aggInfo.checkConsistency();
-
-        hasNullableGenerateChild = checkHasNullableGenerateChild();
-        streamingPreaggregationMode = analyzer.getContext().getSessionVariable().getStreamingPreaggregationMode();
     }
 
     public void setStreamingPreaggregationMode(String mode) {
@@ -170,41 +102,6 @@ public class AggregationNode extends PlanNode {
 
     @Override
     public void computeStats(Analyzer analyzer) {
-        super.computeStats(analyzer);
-        List<Expr> groupingExprs = aggInfo.getGroupingExprs();
-        cardinality = 1;
-        // cardinality: product of # of distinct values produced by grouping exprs
-        for (Expr groupingExpr : groupingExprs) {
-            long numDistinct = groupingExpr.getNumDistinctValues();
-            // TODO: remove these before 1.0
-            LOG.debug("grouping expr: " + groupingExpr.toSql() + " #distinct=" + Long.toString(
-                    numDistinct));
-            if (numDistinct == -1) {
-                cardinality = -1;
-                break;
-            }
-            // This is prone to overflow, because we keep multiplying cardinalities,
-            // even if the grouping exprs are functionally dependent (example:
-            // group by the primary key of a table plus a number of other columns from that
-            // same table)
-            // TODO: try to recognize functional dependencies
-            // TODO: as a shortcut, instead of recognizing functional dependencies,
-            // limit the contribution of a single table to the number of rows
-            // of that table (so that when we're grouping by the primary key col plus
-            // some others, the estimate doesn't overshoot dramatically)
-            cardinality *= numDistinct;
-        }
-        // take HAVING predicate into account
-        LOG.debug("Agg: cardinality=" + Long.toString(cardinality));
-        if (cardinality > 0) {
-            cardinality = Math.round((double) cardinality * computeSelectivity());
-            LOG.debug("sel=" + Double.toString(computeSelectivity()));
-        }
-        // if we ended up with an overflow, the estimate is certain to be wrong
-        if (cardinality < 0) {
-            cardinality = -1;
-        }
-        LOG.debug("stats Agg: cardinality=" + Long.toString(cardinality));
     }
 
     private void updateplanNodeName() {
@@ -278,6 +175,7 @@ public class AggregationNode extends PlanNode {
         } else {
             msg.agg_node.setStreaming_preaggregation_mode(TStreamingPreaggregationMode.AUTO);
         }
+        msg.agg_node.setAgg_func_set_version(3);
     }
 
     protected String getDisplayLabelDetail() {
@@ -341,72 +239,17 @@ public class AggregationNode extends PlanNode {
         return children.get(0).getNumInstances();
     }
 
-    public boolean hasOuterJoinChild() {
-        return hasNullableGenerateChild;
-    }
-
-    public void setHasOuterJoinChild(boolean hasOuterJoinChild) {
-        this.hasNullableGenerateChild = hasOuterJoinChild;
-    }
-
-    @Override
-    public boolean isVectorized() {
-        for (PlanNode node : getChildren()) {
-            if (!node.isVectorized()) {
-                return false;
-            }
-        }
-
-        for (Expr expr : aggInfo.getAggregateExprs()) {
-            if (!expr.isVectorized()) {
-                return false;
-            }
-        }
-
-        for (Expr expr : aggInfo.getGroupingExprs()) {
-            if (!expr.isVectorized()) {
-                return false;
-            }
-        }
-
-        for (Expr expr : conjuncts) {
-            if (!expr.isVectorized()) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    @Override
-    public void setUseVectorized(boolean flag) {
-        this.useVectorized = flag;
-        for (Expr expr : conjuncts) {
-            expr.setUseVectorized(flag);
-        }
-
-        for (Expr expr : aggInfo.getAggregateExprs()) {
-            expr.setUseVectorized(flag);
-        }
-
-        for (Expr expr : aggInfo.getGroupingExprs()) {
-            expr.setUseVectorized(flag);
-        }
-
-        for (PlanNode node : getChildren()) {
-            node.setUseVectorized(flag);
-        }
-    }
-
     @Override
     public boolean pushDownRuntimeFilters(RuntimeFilterDescription description, Expr probeExpr) {
+        if (!canPushDownRuntimeFilter()) {
+            return false;
+        }
         if (probeExpr.isBoundByTupleIds(getTupleIds())) {
             if (probeExpr instanceof SlotRef) {
                 for (Expr gexpr : aggInfo.getGroupingExprs()) {
                     // push down only when both of them are slot ref and slot id match.
                     if ((gexpr instanceof SlotRef) &&
                             (((SlotRef) gexpr).getSlotId().asInt() == ((SlotRef) probeExpr).getSlotId().asInt())) {
-                        gexpr.setUseVectorized(gexpr.isVectorized());
                         if (children.get(0).pushDownRuntimeFilters(description, gexpr)) {
                             return true;
                         }

@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rule.implementation;
 
@@ -8,13 +8,18 @@ import com.google.common.collect.Lists;
 import com.starrocks.catalog.AggregateType;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.FunctionSet;
+import com.starrocks.catalog.OlapTable;
+import com.starrocks.sql.optimizer.JoinHelper;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptExpressionVisitor;
 import com.starrocks.sql.optimizer.Utils;
+import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.operator.OperatorType;
+import com.starrocks.sql.optimizer.operator.Projection;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalHashAggregateOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalJoinOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalOlapScanOperator;
-import com.starrocks.sql.optimizer.operator.physical.PhysicalProjectOperator;
+import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CaseWhenOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CastOperator;
@@ -25,8 +30,18 @@ import com.starrocks.sql.optimizer.rewrite.ReplaceColumnRefRewriter;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
+/**
+ * This rule will turn on PreAggregation if conditions are met,
+ * and turning on PreAggregation will help optimize the storage layer merge on read.
+ * This rule traverses the query plan from the top down, and the Olap Scan node determines
+ * whether preAggregation can be turned on or not based on the information recorded by the PreAggregationContext.
+ * <p>
+ * A cross join cannot turn on PreAggregation, and other types of joins can only be turn on on one side.
+ * If both sides are opened, many-to-many join results will appear, leading to errors in the upper aggregation results
+ */
 public class PreAggregateTurnOnRule {
     private static final PreAggregateVisitor VISITOR = new PreAggregateVisitor();
 
@@ -36,25 +51,41 @@ public class PreAggregateTurnOnRule {
 
     private static class PreAggregateVisitor extends OptExpressionVisitor<Void, PreAggregationContext> {
         private static final List<String> AGGREGATE_ONLY_KEY = ImmutableList.<String>builder()
-                .add("NDV")
-                .add("MULTI_DISTINCT_COUNT")
-                .add("APPROX_COUNT_DISTINCT")
+                .add(FunctionSet.NDV)
+                .add(FunctionSet.MULTI_DISTINCT_COUNT)
+                .add(FunctionSet.APPROX_COUNT_DISTINCT)
                 .add(FunctionSet.BITMAP_UNION_INT.toUpperCase()).build();
 
         @Override
-        public Void visit(OptExpression optExpression, PreAggregationContext context) {
-            // Avoid left child modify context will effect right child
-            if (optExpression.getInputs().size() <= 1) {
-                for (OptExpression opt : optExpression.getInputs()) {
-                    opt.getOp().accept(this, opt, context);
-                }
-            } else {
-                for (OptExpression opt : optExpression.getInputs()) {
-                    opt.getOp().accept(this, opt, context.clone());
-                }
+        public Void visit(OptExpression opt, PreAggregationContext context) {
+            opt.getInputs().forEach(o -> process(o, context.clone()));
+            return null;
+        }
+
+        public Void process(OptExpression opt, PreAggregationContext context) {
+            if (opt.getOp().getProjection() != null) {
+                rewriteProject(opt, context);
             }
 
+            opt.getOp().accept(this, opt, context.clone());
             return null;
+        }
+
+        void rewriteProject(OptExpression opt, PreAggregationContext context) {
+            Projection projection = opt.getOp().getProjection();
+            ReplaceColumnRefRewriter rewriter = new ReplaceColumnRefRewriter(projection.getColumnRefMap());
+
+            context.aggregations = context.aggregations.stream()
+                    .map(rewriter::rewrite)
+                    .collect(Collectors.toList());
+
+            context.groupings = context.groupings.stream()
+                    .map(rewriter::rewrite)
+                    .collect(Collectors.toList());
+
+            context.joinPredicates = context.joinPredicates.stream().filter(Objects::nonNull)
+                    .map(rewriter::rewrite)
+                    .collect(Collectors.toList());
         }
 
         @Override
@@ -65,27 +96,9 @@ public class PreAggregateTurnOnRule {
                     aggregate.getAggregations().values().stream().map(CallOperator::clone).collect(Collectors.toList());
             context.groupings =
                     aggregate.getGroupBys().stream().map(ScalarOperator::clone).collect(Collectors.toList());
-            context.hasJoin = false;
+            context.notPreAggregationJoin = false;
 
-            return visit(optExpression, context);
-        }
-
-        @Override
-        public Void visitPhysicalProject(OptExpression optExpression, PreAggregationContext context) {
-            PhysicalProjectOperator project = (PhysicalProjectOperator) optExpression.getOp();
-            ReplaceColumnRefRewriter rewriter = new ReplaceColumnRefRewriter(project.getColumnRefMap());
-            ReplaceColumnRefRewriter subRewriter =
-                    new ReplaceColumnRefRewriter(project.getCommonSubOperatorMap(), true);
-
-            context.aggregations = context.aggregations.stream()
-                    .map(d -> d.accept(rewriter, null).accept(subRewriter, null))
-                    .collect(Collectors.toList());
-
-            context.groupings = context.groupings.stream()
-                    .map(d -> d.accept(rewriter, null).accept(subRewriter, null))
-                    .collect(Collectors.toList());
-
-            return visit(optExpression, context);
+            return process(optExpression.inputAt(0), context);
         }
 
         @Override
@@ -96,14 +109,14 @@ public class PreAggregateTurnOnRule {
             scan.setPreAggregation(false);
 
             // Duplicate table
-            if (!scan.getTable().getKeysType().isAggregationFamily()) {
+            if (!((OlapTable) scan.getTable()).getKeysType().isAggregationFamily()) {
                 scan.setPreAggregation(true);
                 scan.setTurnOffReason("");
                 return null;
             }
 
-            if (context.hasJoin) {
-                scan.setTurnOffReason("Has Join");
+            if (context.notPreAggregationJoin) {
+                scan.setTurnOffReason("Has can not pre-aggregation Join");
                 return null;
             }
 
@@ -111,10 +124,11 @@ public class PreAggregateTurnOnRule {
                 scan.setTurnOffReason("None aggregate function");
                 return null;
             }
-
             // check has value conjunct
             boolean allKeyConjunct =
-                    Utils.extractColumnRef(scan.getPredicate()).stream().map(ref -> scan.getColumnRefMap().get(ref))
+                    Utils.extractColumnRef(
+                                    Utils.compoundAnd(scan.getPredicate(), Utils.compoundAnd(context.joinPredicates))).stream()
+                            .map(ref -> scan.getColRefToColumnMetaMap().get(ref)).filter(Objects::nonNull)
                             .allMatch(Column::isKey);
             if (!allKeyConjunct) {
                 scan.setTurnOffReason("Predicates include the value column");
@@ -137,7 +151,7 @@ public class PreAggregateTurnOnRule {
         }
 
         private boolean checkGroupings(PreAggregationContext context, PhysicalOlapScanOperator scan) {
-            Map<ColumnRefOperator, Column> refColumnMap = scan.getColumnRefMap();
+            Map<ColumnRefOperator, Column> refColumnMap = scan.getColRefToColumnMetaMap();
 
             List<ColumnRefOperator> groups = Lists.newArrayList();
             context.groupings.stream().map(Utils::extractColumnRef).forEach(groups::addAll);
@@ -155,7 +169,7 @@ public class PreAggregateTurnOnRule {
         }
 
         private boolean checkAggregations(PreAggregationContext context, PhysicalOlapScanOperator scan) {
-            Map<ColumnRefOperator, Column> refColumnMap = scan.getColumnRefMap();
+            Map<ColumnRefOperator, Column> refColumnMap = scan.getColRefToColumnMetaMap();
 
             for (final ScalarOperator so : context.aggregations) {
                 Preconditions.checkState(OperatorType.CALL.equals(so.getOpType()));
@@ -167,6 +181,12 @@ public class PreAggregateTurnOnRule {
                 }
 
                 ScalarOperator child = call.getChild(0);
+
+                if (child instanceof CallOperator &&
+                        FunctionSet.IF.equalsIgnoreCase(((CallOperator) child).getFnName())) {
+                    child = new CaseWhenOperator(child.getType(), null, child.getChild(2),
+                            Lists.newArrayList(child.getChild(0), child.getChild(1)));
+                }
 
                 List<ColumnRefOperator> returns = Lists.newArrayList();
                 List<ColumnRefOperator> conditions = Lists.newArrayList();
@@ -181,11 +201,11 @@ public class PreAggregateTurnOnRule {
                         scan.setTurnOffReason("The parameter of aggregate function isn't numeric type");
                         return true;
                     }
-                } else if (call.getChild(0) instanceof CaseWhenOperator) {
-                    CaseWhenOperator cwo = (CaseWhenOperator) call.getChild(0);
+                } else if (child instanceof CaseWhenOperator) {
+                    CaseWhenOperator cwo = (CaseWhenOperator) child;
 
                     for (int i = 0; i < cwo.getWhenClauseSize(); i++) {
-                        if (!OperatorType.VARIABLE.equals(cwo.getThenClause(i).getOpType())) {
+                        if (!cwo.getThenClause(i).isColumnRef()) {
                             scan.setTurnOffReason("The result of THEN isn't value column");
                             return true;
                         }
@@ -237,8 +257,9 @@ public class PreAggregateTurnOnRule {
                     Column column = refColumnMap.get(ref);
                     // key column
                     if (column.isKey()) {
-                        if (!"MAX|MIN".contains(call.getFnName().toUpperCase()) &&
-                                !AGGREGATE_ONLY_KEY.contains(call.getFnName().toUpperCase())) {
+                        if (!FunctionSet.MAX.equalsIgnoreCase(call.getFnName()) &&
+                                !FunctionSet.MIN.equalsIgnoreCase(call.getFnName()) &&
+                                !AGGREGATE_ONLY_KEY.contains(call.getFnName().toLowerCase())) {
                             scan.setTurnOffReason("The key column don't support aggregate function: "
                                     + call.getFnName().toUpperCase());
                             return true;
@@ -247,9 +268,10 @@ public class PreAggregateTurnOnRule {
                     }
 
                     // value column
-                    if ("HLL_UNION_AGG|HLL_RAW_AGG".contains(call.getFnName().toUpperCase())) {
+                    if (FunctionSet.HLL_UNION_AGG.equalsIgnoreCase(call.getFnName()) ||
+                            FunctionSet.HLL_RAW_AGG.equalsIgnoreCase(call.getFnName())) {
                         // skip
-                    } else if (AGGREGATE_ONLY_KEY.contains(call.getFnName().toUpperCase())) {
+                    } else if (AGGREGATE_ONLY_KEY.contains(call.getFnName().toLowerCase())) {
                         scan.setTurnOffReason(
                                 "Aggregation function " + call.getFnName().toUpperCase() + " just work on key column");
                         return true;
@@ -272,17 +294,89 @@ public class PreAggregateTurnOnRule {
 
         @Override
         public Void visitPhysicalHashJoin(OptExpression optExpression, PreAggregationContext context) {
-            context.hasJoin = true;
-            context.groupings.clear();
-            context.aggregations.clear();
-            return visit(optExpression, context);
+            return visitPhysicalJoin(optExpression, context);
+        }
+
+        @Override
+        public Void visitPhysicalMergeJoin(OptExpression optExpression, PreAggregationContext context) {
+            return visitPhysicalJoin(optExpression, context);
+        }
+
+        public Void visitPhysicalJoin(OptExpression optExpression, PreAggregationContext context) {
+            PhysicalJoinOperator joinOperator = (PhysicalJoinOperator) optExpression.getOp();
+            OptExpression leftChild = optExpression.getInputs().get(0);
+            OptExpression rightChild = optExpression.getInputs().get(1);
+
+            ColumnRefSet leftOutputColumns = optExpression.getInputs().get(0).getOutputColumns();
+            ColumnRefSet rightOutputColumns = optExpression.getInputs().get(1).getOutputColumns();
+
+            List<BinaryPredicateOperator> eqOnPredicates = JoinHelper.getEqualsPredicate(leftOutputColumns,
+                    rightOutputColumns, Utils.extractConjuncts(joinOperator.getOnPredicate()));
+            // cross join can not do pre-aggregation
+            if (joinOperator.getJoinType().isCrossJoin() || eqOnPredicates.isEmpty()) {
+                context.notPreAggregationJoin = true;
+                context.groupings.clear();
+                context.aggregations.clear();
+                process(optExpression.inputAt(0), context);
+                // Avoid left child modify context will effect right child
+                process(optExpression.inputAt(1), context.clone());
+                return null;
+            }
+
+            // For other types of joins, only one side can turn on pre aggregation which side has aggregation.
+            // The columns used by the aggregate functions can only be the columns of one of the children,
+            // the olap scan node will turn off pre aggregation if aggregation function used both sides columns,
+            // this can be guaranteed by checkAggregations in visitPhysicalOlapScan.
+            ColumnRefSet aggregationColumns = new ColumnRefSet();
+            List<ScalarOperator> leftGroupOperator = Lists.newArrayList();
+            List<ScalarOperator> rightGroupOperator = Lists.newArrayList();
+
+            context.groupings.forEach(g -> {
+                if (g.getUsedColumns().isIntersect(leftOutputColumns)) {
+                    leftGroupOperator.add(g);
+                }
+            });
+            context.groupings.forEach(g -> {
+                if (g.getUsedColumns().isIntersect(rightOutputColumns)) {
+                    rightGroupOperator.add(g);
+                }
+            });
+            context.aggregations.forEach(a -> aggregationColumns.union(a.getUsedColumns()));
+            boolean checkLeft = leftOutputColumns.containsAll(aggregationColumns);
+            boolean checkRight = rightOutputColumns.containsAll(aggregationColumns);
+            // Add join on predicate and predicate to context
+            if (joinOperator.getOnPredicate() != null) {
+                context.joinPredicates.add(joinOperator.getOnPredicate().clone());
+            }
+            if (joinOperator.getPredicate() != null) {
+                context.joinPredicates.add(joinOperator.getPredicate().clone());
+            }
+
+            PreAggregationContext disableContext = new PreAggregationContext();
+            disableContext.notPreAggregationJoin = true;
+
+            if (checkLeft) {
+                context.groupings = leftGroupOperator;
+                process(leftChild, context);
+                process(rightChild, disableContext);
+            } else if (checkRight) {
+                context.groupings = rightGroupOperator;
+                process(rightChild, context);
+                process(leftChild, disableContext);
+            } else {
+                process(leftChild, disableContext);
+                process(rightChild, disableContext);
+            }
+            return null;
         }
     }
 
     public static class PreAggregationContext implements Cloneable {
-        public boolean hasJoin = false;
+        // Indicates that a pre-aggregation can not be turned on below the join
+        public boolean notPreAggregationJoin = false;
         public List<ScalarOperator> aggregations = Lists.newArrayList();
         public List<ScalarOperator> groupings = Lists.newArrayList();
+        public List<ScalarOperator> joinPredicates = Lists.newArrayList();
 
         @Override
         public PreAggregationContext clone() {
@@ -291,6 +385,7 @@ public class PreAggregateTurnOnRule {
                 // Just shallow copy
                 context.aggregations = Lists.newArrayList(aggregations);
                 context.groupings = Lists.newArrayList(groupings);
+                context.joinPredicates = Lists.newArrayList(joinPredicates);
                 return context;
             } catch (CloneNotSupportedException ignored) {
             }

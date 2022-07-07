@@ -23,6 +23,7 @@ package com.starrocks.analysis;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.cluster.ClusterNamespace;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.CaseSensibility;
@@ -44,22 +45,26 @@ import java.io.IOException;
 // cmy@192.168.%
 // cmy@[domain.name]
 public class UserIdentity implements Writable {
+    @SerializedName("user")
     private String user;
+    @SerializedName("host")
     private String host;
+    @SerializedName("isDomain")
     private boolean isDomain;
+    @SerializedName("isAnalyzed")
     private boolean isAnalyzed = false;
 
     public static final UserIdentity ROOT;
-    public static final UserIdentity ADMIN;
 
     static {
         ROOT = new UserIdentity(Auth.ROOT_USER, "%");
         ROOT.setIsAnalyzed();
-        ADMIN = new UserIdentity(Auth.ADMIN_USER, "%");
-        ADMIN.setIsAnalyzed();
     }
 
-    private UserIdentity() {
+    /**
+     * Allow empty construction for gson
+     */
+    public UserIdentity() {
     }
 
     public UserIdentity(String user, String host) {
@@ -120,7 +125,7 @@ public class UserIdentity implements Writable {
 
         FeNameFormat.checkUserName(user);
         if (!user.equals(Auth.ROOT_USER) && !user.equals(Auth.ADMIN_USER)) {
-            user = ClusterNamespace.getFullName(clusterName, user);
+            user = ClusterNamespace.getFullName(user);
         }
 
         // reuse createMysqlPattern to validate host pattern

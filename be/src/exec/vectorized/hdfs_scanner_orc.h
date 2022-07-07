@@ -1,11 +1,11 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 #pragma once
 
 #include <orc/OrcFile.hh>
 
 #include "exec/vectorized/hdfs_scanner.h"
-#include "exec/vectorized/orc_scanner_adapter.h"
+#include "formats/orc/orc_chunk_reader.h"
 
 namespace starrocks::vectorized {
 
@@ -14,11 +14,10 @@ class OrcRowReaderFilter;
 class HdfsOrcScanner final : public HdfsScanner {
 public:
     HdfsOrcScanner() = default;
-    virtual ~HdfsOrcScanner() = default;
+    ~HdfsOrcScanner() override { fianlize(); }
 
-    void update_counter();
     Status do_open(RuntimeState* runtime_state) override;
-    Status do_close(RuntimeState* runtime_state) override;
+    void do_close(RuntimeState* runtime_state) noexcept override;
     Status do_get_next(RuntimeState* runtime_state, ChunkPtr* chunk) override;
     Status do_init(RuntimeState* runtime_state, const HdfsScannerParams& scanner_params) override;
 
@@ -35,8 +34,11 @@ private:
     // writing unittest of customized filter
     bool _use_orc_sargs;
     std::vector<SlotDescriptor*> _src_slot_descriptors;
-    std::unique_ptr<OrcScannerAdapter> _orc_adapter;
+    OrcChunkReader::LazyLoadContext _lazy_load_ctx;
+    std::unique_ptr<OrcChunkReader> _orc_reader;
     std::shared_ptr<OrcRowReaderFilter> _orc_row_reader_filter;
+    Filter _dict_filter;
+    Filter _chunk_filter;
 };
 
 } // namespace starrocks::vectorized

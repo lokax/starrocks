@@ -1,7 +1,8 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptimizerContext;
@@ -13,7 +14,6 @@ import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.rule.RuleType;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -21,8 +21,7 @@ public class PruneProjectColumnsRule extends TransformationRule {
 
     public PruneProjectColumnsRule() {
         super(RuleType.TF_PRUNE_PROJECT_COLUMNS, Pattern.create(OperatorType.LOGICAL_PROJECT).
-                addChildren(Pattern.create(OperatorType.PATTERN_LEAF).
-                        addChildren(Pattern.create(OperatorType.PATTERN_MULTI_LEAF))));
+                addChildren(Pattern.create(OperatorType.PATTERN_LEAF, OperatorType.PATTERN_MULTI_LEAF)));
     }
 
     @Override
@@ -30,7 +29,7 @@ public class PruneProjectColumnsRule extends TransformationRule {
         LogicalProjectOperator projectOperator = (LogicalProjectOperator) input.getOp();
 
         ColumnRefSet requiredInputColumns = new ColumnRefSet();
-        ColumnRefSet requiredOutputColumns = context.getTaskContext().get(0).getRequiredColumns();
+        ColumnRefSet requiredOutputColumns = context.getTaskContext().getRequiredColumns();
 
         Map<ColumnRefOperator, ScalarOperator> newMap = Maps.newHashMap();
         projectOperator.getColumnRefMap().forEach(((columnRefOperator, operator) -> {
@@ -40,16 +39,9 @@ public class PruneProjectColumnsRule extends TransformationRule {
             }
         }));
 
-        // If all columns have been pruned, remove this project node
-        if (newMap.isEmpty()) {
-            return input.getInputs();
-        }
-
-        projectOperator.setColumnRefMap(newMap);
-
         // Change the requiredOutputColumns in context
         requiredOutputColumns.union(requiredInputColumns);
 
-        return Collections.emptyList();
+        return Lists.newArrayList(OptExpression.create(new LogicalProjectOperator(newMap), input.getInputs()));
     }
 }

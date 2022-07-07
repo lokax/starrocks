@@ -2,8 +2,7 @@
 // This file is based on code available under the Apache license here:
 //   https://github.com/greg7mdp/parallel-hashmap/blob/master/parallel_hashmap/phmap_bits.h
 
-#if !defined(phmap_bits_h_guard_)
-#define phmap_bits_h_guard_
+#pragma once
 
 // ---------------------------------------------------------------------------
 // Copyright (c) 2019, Gregory Popovitch - greg7mdp@gmail.com
@@ -50,9 +49,8 @@
 #include <byteswap.h> // IWYU pragma: export
 #endif
 
-#include <string.h>
-
 #include <cstdint>
+#include <cstring>
 
 #include "phmap_config.h"
 
@@ -739,5 +737,3 @@ inline void Store64(void* p, uint64_t v) {
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
-
-#endif // phmap_bits_h_guard_

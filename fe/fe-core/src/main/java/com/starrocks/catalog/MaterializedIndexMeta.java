@@ -21,26 +21,25 @@
 
 package com.starrocks.catalog;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.analysis.CreateMaterializedViewStmt;
 import com.starrocks.analysis.Expr;
-import com.starrocks.analysis.SqlParser;
-import com.starrocks.analysis.SqlScanner;
+import com.starrocks.analysis.StatementBase;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
-import com.starrocks.common.util.SqlParserUtils;
 import com.starrocks.persist.gson.GsonPostProcessable;
 import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.qe.OriginStatement;
 import com.starrocks.qe.SqlModeHelper;
+import com.starrocks.sql.parser.SqlParser;
 import com.starrocks.thrift.TStorageType;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.io.StringReader;
 import java.util.List;
 import java.util.Map;
 
@@ -119,10 +118,12 @@ public class MaterializedIndexMeta implements Writable, GsonPostProcessable {
         }
     }
 
-    private void setColumnsDefineExpr(Map<String, Expr> columnNameToDefineExpr) {
+    // The column names of the materialized view are all lowercase, but the column names may be uppercase
+    @VisibleForTesting
+    public void setColumnsDefineExpr(Map<String, Expr> columnNameToDefineExpr) {
         for (Map.Entry<String, Expr> entry : columnNameToDefineExpr.entrySet()) {
             for (Column column : schema) {
-                if (column.getName().equals(entry.getKey())) {
+                if (column.getName().equalsIgnoreCase(entry.getKey())) {
                     column.setDefineExpr(entry.getValue());
                     break;
                 }
@@ -185,16 +186,15 @@ public class MaterializedIndexMeta implements Writable, GsonPostProcessable {
         if (defineStmt == null) {
             return;
         }
-        // parse the define stmt to schema
-        SqlParser parser = new SqlParser(new SqlScanner(new StringReader(defineStmt.originStmt),
-                SqlModeHelper.MODE_DEFAULT));
         CreateMaterializedViewStmt stmt;
         try {
-            stmt = (CreateMaterializedViewStmt) SqlParserUtils.getStmt(parser, defineStmt.idx);
-            Map<String, Expr> columnNameToDefineExpr = stmt.parseDefineExprWithoutAnalyze();
+            List<StatementBase> stmts = SqlParser.parse(defineStmt.originStmt, SqlModeHelper.MODE_DEFAULT);
+            stmt = (CreateMaterializedViewStmt) stmts.get(defineStmt.idx);
+            stmt.setIsReplay(true);
+            Map<String, Expr> columnNameToDefineExpr = stmt.parseDefineExprWithoutAnalyze(defineStmt.originStmt);
             setColumnsDefineExpr(columnNameToDefineExpr);
         } catch (Exception e) {
-            throw new IOException("error happens when parsing create materialized view stmt: " + defineStmt, e);
+            throw new IOException("error happens when parsing create materialized view stmt: " + defineStmt.originStmt, e);
         }
     }
 

@@ -19,11 +19,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_QUERY_EXEC_MYSQL_SCANNER_H
-#define STARROCKS_BE_SRC_QUERY_EXEC_MYSQL_SCANNER_H
+#pragma once
 
-#include <stdlib.h>
-
+#include <cstdlib>
+#include <list>
 #include <string>
 #include <vector>
 
@@ -38,15 +37,14 @@
 #endif
 
 namespace starrocks {
-
 struct MysqlScannerParam {
     std::string host;
     std::string port;
     std::string user;
     std::string passwd;
     std::string db;
-    unsigned long client_flag;
-    MysqlScannerParam() : client_flag(0) {}
+    unsigned long client_flag{0};
+    MysqlScannerParam() {}
 };
 
 // Mysql Scanner for scan data from mysql
@@ -60,7 +58,9 @@ public:
 
     // query for STARROCKS
     Status query(const std::string& table, const std::vector<std::string>& fields,
-                 const std::vector<std::string>& filters);
+                 const std::vector<std::string>& filters,
+                 const std::unordered_map<std::string, std::vector<std::string>>& filters_in,
+                 std::unordered_map<std::string, bool>& filters_null_in_set, int64_t limit);
     Status get_next_row(char*** buf, unsigned long** lengths, bool* eos);
 
     int field_num() const { return _field_num; }
@@ -77,5 +77,3 @@ private:
 };
 
 } // namespace starrocks
-
-#endif

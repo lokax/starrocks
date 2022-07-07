@@ -1,4 +1,4 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
 
 package com.starrocks.planner;
 
@@ -15,12 +15,12 @@ public class RuntimeFilterId extends Id<RuntimeFilterId> {
         return new IdGenerator<RuntimeFilterId>() {
             @Override
             public RuntimeFilterId getNextId() {
-                return new RuntimeFilterId(nextId_++);
+                return new RuntimeFilterId(nextId++);
             }
 
             @Override
             public RuntimeFilterId getMaxId() {
-                return new RuntimeFilterId(nextId_ - 1);
+                return new RuntimeFilterId(nextId - 1);
             }
         };
     }

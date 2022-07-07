@@ -25,7 +25,7 @@ import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.BinaryPredicate.Operator;
-import com.starrocks.catalog.Catalog;
+import com.starrocks.catalog.CatalogUtils;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Replica.ReplicaStatus;
 import com.starrocks.catalog.ScalarType;
@@ -37,6 +37,8 @@ import com.starrocks.common.UserException;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.ShowResultSetMetaData;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.AstVisitor;
 
 import java.util.List;
 
@@ -44,7 +46,7 @@ public class AdminShowReplicaStatusStmt extends ShowStmt {
     public static final ImmutableList<String> TITLE_NAMES = new ImmutableList.Builder<String>()
             .add("TabletId").add("ReplicaId").add("BackendId").add("Version").add("LastFailedVersion")
             .add("LastSuccessVersion").add("CommittedVersion").add("SchemaHash").add("VersionNum")
-            .add("IsBad").add("State").add("Status")
+            .add("IsBad").add("IsSetBadForce").add("State").add("Status")
             .build();
 
     private TableRef tblRef;
@@ -64,7 +66,7 @@ public class AdminShowReplicaStatusStmt extends ShowStmt {
         super.analyze(analyzer);
 
         // check auth
-        if (!Catalog.getCurrentCatalog().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
+        if (!GlobalStateMgr.getCurrentState().getAuth().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "ADMIN");
         }
 
@@ -75,10 +77,12 @@ public class AdminShowReplicaStatusStmt extends ShowStmt {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
             }
         } else {
-            dbName = ClusterNamespace.getFullName(getClusterName(), tblRef.getName().getDb());
+            dbName = ClusterNamespace.getFullName(tblRef.getName().getDb());
         }
 
         tblRef.getName().setDb(dbName);
+
+        CatalogUtils.checkOlapTableHasStarOSPartition(dbName, tblRef.getName().getTbl());
 
         PartitionNames partitionNames = tblRef.getPartitionNames();
         if (partitionNames != null) {
@@ -138,8 +142,16 @@ public class AdminShowReplicaStatusStmt extends ShowStmt {
         return true;
     }
 
+    public TableRef getTblRef() {
+        return tblRef;
+    }
+
     public String getDbName() {
         return tblRef.getName().getDb();
+    }
+
+    public void setDbName(String dbName) {
+        this.tblRef.getName().setDb(dbName);
     }
 
     public String getTblName() {
@@ -150,12 +162,28 @@ public class AdminShowReplicaStatusStmt extends ShowStmt {
         return partitions;
     }
 
+    public void setPartitions(List<String> partitions) {
+        this.partitions = partitions;
+    }
+
     public Operator getOp() {
         return op;
     }
 
+    public void setOp(Operator op) {
+        this.op = op;
+    }
+
     public ReplicaStatus getStatusFilter() {
         return statusFilter;
+    }
+
+    public void setStatusFilter(ReplicaStatus statusFilter) {
+        this.statusFilter = statusFilter;
+    }
+
+    public Expr getWhere() {
+        return where;
     }
 
     @Override
@@ -174,5 +202,15 @@ public class AdminShowReplicaStatusStmt extends ShowStmt {
         } else {
             return RedirectStatus.NO_FORWARD;
         }
+    }
+
+    @Override
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
+        return visitor.visitAdminShowReplicaStatusStatement(this, context);
+    }
+
+    @Override
+    public boolean isSupportNewPlanner() {
+        return true;
     }
 }

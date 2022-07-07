@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/util/path_trie.hpp
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -24,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace starrocks {
@@ -34,8 +31,8 @@ class PathTrie {
 public:
     PathTrie() :
             _root("/", "*"),
-            _root_value(nullptr),
-            _separator('/') {
+            _root_value(nullptr)
+            {
     };
 
     ~PathTrie() {
@@ -47,17 +44,17 @@ public:
 
     class TrieNode {
     public:
-        TrieNode(const std::string& key, const std::string& wildcard) :
+        TrieNode(const std::string& key, std::string  wildcard) :
                 _value(nullptr), 
-                _wildcard(wildcard) {
+                _wildcard(std::move(wildcard)) {
             if (is_named_wildcard(key)) {
                 _named_wildcard = extract_template(key);
             }
         }
 
-        TrieNode(const std::string& key, const T& value, const std::string& wildcard) :
+        TrieNode(const std::string& key, const T& value, std::string  wildcard) :
                 _value(nullptr),
-                _wildcard(wildcard) {
+                _wildcard(std::move(wildcard)) {
             _value = _allocator.allocate(1);
             _allocator.construct(_value, value);
             if (is_named_wildcard(key)) {
@@ -284,7 +281,7 @@ private:
 
     TrieNode _root;
     T* _root_value;
-    char _separator;
+    char _separator{'/'};
     std::allocator<T> _allocator;
 };
 

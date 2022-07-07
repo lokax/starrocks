@@ -20,9 +20,9 @@
 // under the License.
 package com.starrocks.load.routineload;
 
-import com.starrocks.catalog.Catalog;
 import com.starrocks.common.Config;
 import com.starrocks.common.InternalErrorCode;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.SystemInfoService;
 
 /**
@@ -31,9 +31,9 @@ import com.starrocks.system.SystemInfoService;
 public class ScheduleRule {
 
     private static int deadBeCount(String clusterName) {
-        SystemInfoService systemInfoService = Catalog.getCurrentSystemInfo();
-        int total = systemInfoService.getClusterBackendIds(clusterName, false).size();
-        int alive = systemInfoService.getClusterBackendIds(clusterName, true).size();
+        SystemInfoService systemInfoService = GlobalStateMgr.getCurrentSystemInfo();
+        int total = systemInfoService.getBackendIds(false).size();
+        int alive = systemInfoService.getBackendIds(true).size();
         return total - alive;
     }
 
@@ -69,13 +69,13 @@ public class ScheduleRule {
                 long current = System.currentTimeMillis();
                 if (current - jobRoutine.firstResumeTimestamp < Config.period_of_auto_resume_min * 60000) {
                     if (jobRoutine.autoResumeCount >= 3) {
-                        jobRoutine.autoResumeLock = true;// locked Auto Resume RoutineLoadJob
+                        jobRoutine.autoResumeLock = true; // locked Auto Resume RoutineLoadJob
                         return false;
                     }
                     jobRoutine.autoResumeCount++;
                     return true;
                 } else {
-                    /**
+                    /*
                      * for example:
                      *       the first resume time at 10:01
                      *       the second resume time at 10:03
